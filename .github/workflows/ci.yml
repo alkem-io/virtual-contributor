@@ -6,16 +6,19 @@ on:
   pull_request:
     branches: [develop, main]
 
+env:
+  AGENT_TOOLSDIRECTORY: /Users/m1/actions-tool-cache
+
 jobs:
   lint:
     runs-on: [self-hosted, macOS, ARM64, apple-silicon, m4]
     steps:
       - uses: actions/checkout@v4
-      - name: Set up Python
-        run: |
-          brew install python@3.12 2>/dev/null || true
-          /opt/homebrew/bin/python3.12 -m venv .venv
-          echo "$PWD/.venv/bin" >> $GITHUB_PATH
+      - name: Ensure tool cache exists
+        run: mkdir -p "$AGENT_TOOLSDIRECTORY"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - name: Install dependencies
         run: |
           pip install --upgrade pip poetry
@@ -32,11 +35,11 @@ jobs:
         plugin: [expert, generic, guidance, openai-assistant, ingest-website, ingest-space]
     steps:
       - uses: actions/checkout@v4
-      - name: Set up Python
-        run: |
-          brew install python@3.12 2>/dev/null || true
-          /opt/homebrew/bin/python3.12 -m venv .venv
-          echo "$PWD/.venv/bin" >> $GITHUB_PATH
+      - name: Ensure tool cache exists
+        run: mkdir -p "$AGENT_TOOLSDIRECTORY"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - name: Install dependencies
         run: |
           pip install --upgrade pip poetry
