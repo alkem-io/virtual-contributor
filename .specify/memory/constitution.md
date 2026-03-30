@@ -119,11 +119,10 @@ Feedback loops MUST be maximal, optimised, and **local-first**:
 
 CI/CD builds MUST use the **best infrastructure available** in the
 Alkemio organisation to maximise automated feedback loop speed. The
-specific runner type, instance class, or hardware generation is an
-implementation detail that changes over time (currently M4 self-hosted
-runners). When superior infrastructure becomes available, builds MUST
-migrate promptly. Build performance is a first-class concern — slow
-builds degrade the feedback loop and violate Principle 4.
+specific runner type or instance class is an implementation detail that
+changes over time. When superior infrastructure becomes available,
+builds MUST migrate promptly. Build performance is a first-class
+concern — slow builds degrade the feedback loop and violate Principle 4.
 
 ### 6. Spec-Driven Development (SDD)
 
