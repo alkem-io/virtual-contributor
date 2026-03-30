@@ -38,6 +38,11 @@ httpx = "^0.27.2"
 beautifulsoup4 = "^4.14"
 requests = "^2.32"
 
+# File parsers (ingest-space)
+pypdf = "^5.0"
+python-docx = "^1.1"
+openpyxl = "^3.1"
+
 [tool.poetry.group.dev.dependencies]
 flake8 = "^7.3.0"
 pyright = "^1.1.406"
@@ -47,6 +52,16 @@ pytest-asyncio = "^1.3"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+
+[tool.coverage.run]
+omit = [
+    "core/adapters/*",
+    "core/config.py",
+    "core/health.py",
+    "core/logging.py",
+    "main.py",
+    "plugins/ingest_space/graphql_client.py",
+]
 
 [build-system]
 requires = ["poetry-core"]

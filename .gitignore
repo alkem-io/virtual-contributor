@@ -29,5 +29,8 @@ app.log
 vectordb/
 ingestion_output.txt
 
+# Poetry
+poetry.lock
+
 # Specify
 .specify/specs/

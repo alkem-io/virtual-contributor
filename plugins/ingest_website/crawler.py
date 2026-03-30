@@ -1,0 +1,108 @@
+"""Recursive web crawler with domain boundary enforcement."""
+
+from __future__ import annotations
+
+import logging
+from urllib.parse import urljoin, urlparse
+
+import httpx
+from bs4 import BeautifulSoup
+
+logger = logging.getLogger(__name__)
+
+# File extensions to skip (65+ extensions)
+SKIP_EXTENSIONS = {
+    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+    ".zip", ".tar", ".gz", ".rar", ".7z",
+    ".jpg", ".jpeg", ".png", ".gif", ".svg", ".bmp", ".webp", ".ico",
+    ".mp3", ".mp4", ".avi", ".mov", ".wmv", ".flv", ".wav",
+    ".exe", ".msi", ".dmg", ".deb", ".rpm",
+    ".css", ".js", ".json", ".xml", ".csv",
+    ".woff", ".woff2", ".ttf", ".eot",
+    ".iso", ".img", ".bin",
+    ".odt", ".ods", ".odp", ".rtf", ".txt",
+    ".apk", ".ipa",
+    ".sql", ".db", ".sqlite",
+    ".log", ".bak", ".tmp",
+    ".yml", ".yaml", ".toml", ".ini", ".cfg", ".conf",
+    ".sh", ".bash", ".ps1", ".bat", ".cmd",
+    ".py", ".rb", ".java", ".c", ".cpp", ".h", ".go", ".rs",
+}
+
+
+def _normalize_url(url: str) -> str:
+    """Normalize URL by removing fragments and trailing slashes."""
+    parsed = urlparse(url)
+    normalized = parsed._replace(fragment="")
+    path = normalized.path.rstrip("/") or "/"
+    return normalized._replace(path=path).geturl()
+
+
+def _is_same_domain(base_url: str, url: str) -> bool:
+    """Check if URL belongs to the same domain as base."""
+    return urlparse(base_url).netloc == urlparse(url).netloc
+
+
+def _should_skip_url(url: str) -> bool:
+    """Check if URL points to a file that should be skipped."""
+    path = urlparse(url).path.lower()
+    return any(path.endswith(ext) for ext in SKIP_EXTENSIONS)
+
+
+async def crawl(
+    base_url: str,
+    page_limit: int = 20,
+) -> list[dict]:
+    """Crawl a website recursively within domain boundaries.
+
+    Returns list of {"url": str, "html": str} dicts.
+    """
+    visited: set[str] = set()
+    results: list[dict] = []
+    queue = [_normalize_url(base_url)]
+
+    async with httpx.AsyncClient(
+        timeout=30.0,
+        follow_redirects=True,
+        headers={"User-Agent": "AlkemioBot/1.0"},
+    ) as client:
+        while queue and len(results) < page_limit:
+            url = queue.pop(0)
+            normalized = _normalize_url(url)
+
+            if normalized in visited:
+                continue
+            if _should_skip_url(normalized):
+                continue
+            if not _is_same_domain(base_url, normalized):
+                continue
+
+            visited.add(normalized)
+
+            try:
+                response = await client.get(normalized)
+                content_type = response.headers.get("content-type", "")
+                if "text/html" not in content_type:
+                    continue
+
+                html = response.text
+                results.append({"url": normalized, "html": html})
+
+                # Extract links
+                soup = BeautifulSoup(html, "html.parser")
+                for link in soup.find_all("a", href=True):
+                    href = link["href"]
+                    full_url = urljoin(normalized, href)
+                    full_normalized = _normalize_url(full_url)
+                    if (
+                        full_normalized not in visited
+                        and _is_same_domain(base_url, full_normalized)
+                        and not _should_skip_url(full_normalized)
+                    ):
+                        queue.append(full_normalized)
+
+            except Exception as exc:
+                logger.warning("Failed to crawl %s: %s", normalized, exc)
+
+    logger.info("Crawled %d pages from %s", len(results), base_url)
+    return results
