@@ -27,11 +27,12 @@ class Router:
     def parse_event(self, body: dict[str, Any]) -> Input | IngestWebsite | IngestBodyOfKnowledge:
         """Parse a raw message body into the appropriate event model."""
         try:
-            if body.get("eventType") == "IngestWebsite":
-                return IngestWebsite.model_validate(body)
-
+            # Route by plugin_type first to prevent cross-plugin misclassification
             if self._plugin_type == "ingest-space":
                 return IngestBodyOfKnowledge.model_validate(body)
+
+            if body.get("eventType") == "IngestWebsite":
+                return IngestWebsite.model_validate(body)
 
             input_data = body.get("input")
             if input_data is None:

@@ -72,7 +72,7 @@ class ChromaDBAdapter:
 
     @staticmethod
     async def _retry(fn, max_retries: int = MAX_RETRIES) -> Any:
-        last_exc = None
+        last_exc: Exception | None = None
         for attempt in range(max_retries):
             try:
                 return await asyncio.to_thread(fn)
@@ -82,7 +82,9 @@ class ChromaDBAdapter:
                     delay = BASE_DELAY * (2 ** attempt)
                     logger.warning("ChromaDB attempt %d failed, retrying: %s", attempt + 1, exc)
                     await asyncio.sleep(delay)
-        raise last_exc
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("Retry called with max_retries=0")
 
     @staticmethod
     def combine_query_results(*results: QueryResult) -> QueryResult:
