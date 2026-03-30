@@ -1,0 +1,9 @@
+{
+  "include": ["core", "plugins"],
+  "exclude": ["tests", "**/__pycache__"],
+  "typeCheckingMode": "basic",
+  "reportAttributeAccessIssue": "warning",
+  "reportArgumentType": "warning",
+  "reportCallIssue": "warning",
+  "reportGeneralTypeIssues": "warning"
+}

@@ -4,7 +4,7 @@ import asyncio
 import logging
 from typing import AsyncIterator
 
-from langchain_mistralai import ChatMistral
+from langchain_mistralai import ChatMistralAI
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, AIMessage
 
 logger = logging.getLogger(__name__)
@@ -32,7 +32,7 @@ class MistralAdapter:
     """LLM adapter for Mistral models via langchain-mistralai."""
 
     def __init__(self, api_key: str, model_name: str = "mistral-small-latest") -> None:
-        self._llm = ChatMistral(
+        self._llm = ChatMistralAI(
             api_key=api_key,
             model=model_name,
         )
@@ -53,7 +53,7 @@ class MistralAdapter:
                         attempt + 1, delay, exc,
                     )
                     await asyncio.sleep(delay)
-        raise last_exc  # type: ignore[misc]
+        raise last_exc  # type: ignore[misc]  # noqa: guaranteed non-None after loop
 
     async def stream(self, messages: list[dict]) -> AsyncIterator[str]:
         lc_messages = _to_langchain_messages(messages)
