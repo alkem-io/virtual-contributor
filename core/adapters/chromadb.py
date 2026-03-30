@@ -66,8 +66,8 @@ class ChromaDBAdapter:
             self._client.delete_collection(collection)
 
         try:
-            await asyncio.to_thread(_delete)
-        except Exception:
+            await self._retry(_delete)
+        except ValueError:
             logger.warning("Collection %s not found for deletion", collection)
 
     @staticmethod

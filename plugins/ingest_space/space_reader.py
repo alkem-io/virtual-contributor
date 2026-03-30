@@ -68,7 +68,7 @@ query SpaceTree($spaceId: UUID!) {
 async def read_space_tree(graphql_client, space_id: str) -> list[Document]:
     """Read the full space tree and convert to Documents."""
     data = await graphql_client.query(SPACE_TREE_QUERY, {"spaceId": space_id})
-    space = data.get("lookup", {}).get("space")
+    space = (data.get("lookup") or {}).get("space")
     if not space:
         return []
 
@@ -79,7 +79,7 @@ async def read_space_tree(graphql_client, space_id: str) -> list[Document]:
 
 def _process_space(space: dict, documents: list[Document], depth: int) -> None:
     """Process a space node and its children recursively."""
-    profile = space.get("profile", {})
+    profile = space.get("profile") or {}
     space_name = profile.get("displayName", "")
     description = profile.get("description", "")
 
@@ -96,18 +96,18 @@ def _process_space(space: dict, documents: list[Document], depth: int) -> None:
         ))
 
     # Process callouts
-    collaboration = space.get("collaboration", {})
-    for callout in collaboration.get("callouts", []):
+    collaboration = space.get("collaboration") or {}
+    for callout in collaboration.get("callouts") or []:
         _process_callout(callout, documents)
 
     # Recurse into subspaces
-    for subspace in space.get("subspaces", []):
+    for subspace in space.get("subspaces") or []:
         _process_space(subspace, documents, depth + 1)
 
 
 def _process_callout(callout: dict, documents: list[Document]) -> None:
     """Process a callout and its contributions."""
-    framing = callout.get("framing", {}).get("profile", {})
+    framing = (callout.get("framing") or {}).get("profile") or {}
     callout_name = framing.get("displayName", "")
     callout_desc = framing.get("description", "")
 
@@ -122,11 +122,11 @@ def _process_callout(callout: dict, documents: list[Document]) -> None:
             ),
         ))
 
-    for contrib in callout.get("contributions", []):
+    for contrib in callout.get("contributions") or []:
         # Posts
         post = contrib.get("post")
         if post:
-            post_profile = post.get("profile", {})
+            post_profile = post.get("profile") or {}
             content = post_profile.get("description", "")
             if content:
                 documents.append(Document(
@@ -150,7 +150,7 @@ def _process_callout(callout: dict, documents: list[Document]) -> None:
                         document_id=whiteboard["id"],
                         source=f"whiteboard:{whiteboard['id']}",
                         type=DocumentType.WHITEBOARD.value,
-                        title=whiteboard.get("profile", {}).get("displayName", ""),
+                        title=(whiteboard.get("profile") or {}).get("displayName", ""),
                     ),
                 ))
 
@@ -165,6 +165,6 @@ def _process_callout(callout: dict, documents: list[Document]) -> None:
                         document_id=link["id"],
                         source=f"link:{link['id']}",
                         type=DocumentType.LINK.value,
-                        title=link.get("profile", {}).get("displayName", ""),
+                        title=(link.get("profile") or {}).get("displayName", ""),
                     ),
                 ))
