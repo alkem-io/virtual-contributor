@@ -59,24 +59,22 @@ class RabbitMQAdapter:
         """Start consuming messages from a queue.
 
         The callback receives the parsed JSON body as a dict.
-        It should return a response dict or None.
+        Exceptions from the callback escape the process() context so
+        aio-pika rejects/requeues the message (dead-letter on repeated failure).
         """
-        if self._channel is None:
+        if self._channel is None or self._exchange is None:
             raise RuntimeError("Not connected to RabbitMQ")
 
         q = await self._channel.declare_queue(
             queue, durable=True, auto_delete=False,
         )
+        await q.bind(self._exchange, routing_key=queue)
 
         async def on_message(message: aio_pika.abc.AbstractIncomingMessage) -> None:
             async with message.process(requeue=True):
-                try:
-                    body = json.loads(message.body.decode("utf-8"))
-                    logger.info("Received message on queue %s", queue)
-                    await callback(body)
-                except Exception:
-                    logger.exception("Error processing message from queue %s", queue)
-                    # Message will be requeued due to requeue=True context manager
+                body = json.loads(message.body.decode("utf-8"))
+                logger.info("Received message on queue %s", queue)
+                await callback(body)
 
         await q.consume(on_message)
         logger.info("Consuming from queue: %s", queue)
@@ -86,15 +84,16 @@ class RabbitMQAdapter:
         if self._channel is None:
             raise RuntimeError("Not connected to RabbitMQ")
 
-        # Ensure result queue exists and is bound
-        await self._channel.declare_queue(
-            routing_key, durable=True, auto_delete=False,
-        )
-
         if self._exchange is None:
             self._exchange = await self._channel.declare_exchange(
                 exchange, ExchangeType.DIRECT, durable=True,
             )
+
+        # Ensure result queue exists and is bound to the exchange
+        result_queue = await self._channel.declare_queue(
+            routing_key, durable=True, auto_delete=False,
+        )
+        await result_queue.bind(self._exchange, routing_key=routing_key)
 
         msg = Message(
             body=message,

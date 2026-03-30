@@ -98,7 +98,7 @@ async def _run(config: BaseConfig) -> None:
 
     # Message handler
     async def on_message(body: dict) -> None:
-        correlation_id = body.get("correlationId", "")
+        event = None
         try:
             event = router.parse_event(body)
             response = await plugin.handle(event)
@@ -113,7 +113,7 @@ async def _run(config: BaseConfig) -> None:
             from core.events.response import Response
 
             error_response = Response(result=f"Error: {exc}")
-            envelope = {"response": error_response.model_dump()}
+            envelope = router.build_response_envelope(error_response, event) if event else {"response": error_response.model_dump()}
             await transport.publish(
                 config.rabbitmq_exchange,
                 config.rabbitmq_result_routing_key,

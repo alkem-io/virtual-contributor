@@ -53,7 +53,7 @@ class MistralAdapter:
                         attempt + 1, delay, exc,
                     )
                     await asyncio.sleep(delay)
-        raise last_exc  # type: ignore[misc]  # noqa: guaranteed non-None after loop
+        raise last_exc  # type: ignore[misc]
 
     async def stream(self, messages: list[dict]) -> AsyncIterator[str]:
         lc_messages = _to_langchain_messages(messages)

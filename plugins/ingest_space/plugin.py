@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 from core.domain.ingest_pipeline import run_ingest_pipeline
 from core.events.ingest_space import (
@@ -28,11 +29,12 @@ class IngestSpacePlugin:
         llm: LLMPort,
         embeddings: EmbeddingsPort,
         knowledge_store: KnowledgeStorePort,
+        graphql_client: Any = None,
     ) -> None:
         self._llm = llm
         self._embeddings = embeddings
         self._knowledge_store = knowledge_store
-        self._graphql_client = None  # Injected at startup from config
+        self._graphql_client = graphql_client
 
     async def startup(self) -> None:
         logger.info("IngestSpacePlugin started")
@@ -40,19 +42,12 @@ class IngestSpacePlugin:
     async def shutdown(self) -> None:
         logger.info("IngestSpacePlugin stopped")
 
-    def set_graphql_client(self, client) -> None:
-        """Set the GraphQL client (configured externally)."""
-        self._graphql_client = client
-
     async def handle(self, event: IngestBodyOfKnowledge, **ports) -> IngestBodyOfKnowledgeResult:
         try:
             bok_id = event.body_of_knowledge_id
             collection_name = f"{bok_id}-{event.purpose}"
 
-            # Delete existing collection for re-ingestion
-            await self._knowledge_store.delete_collection(collection_name)
-
-            # Fetch space tree
+            # Fetch space tree BEFORE deleting the old collection
             if self._graphql_client is None:
                 raise RuntimeError("GraphQL client not configured")
 
@@ -67,6 +62,9 @@ class IngestSpacePlugin:
                     persona_id=event.persona_id,
                     result="success",
                 )
+
+            # Delete existing collection only after successful fetch
+            await self._knowledge_store.delete_collection(collection_name)
 
             # Run ingest pipeline with ingest-space specific settings
             result = await run_ingest_pipeline(

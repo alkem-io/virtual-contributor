@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import ipaddress
 import logging
+import socket
 from urllib.parse import urljoin, urlparse
 
 import httpx
@@ -49,6 +51,37 @@ def _should_skip_url(url: str) -> bool:
     return any(path.endswith(ext) for ext in SKIP_EXTENSIONS)
 
 
+def _is_safe_url(url: str) -> bool:
+    """Block private/reserved network targets to prevent SSRF.
+
+    Only allows http/https schemes and rejects URLs that resolve
+    to loopback, RFC1918, link-local, or cloud metadata addresses.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        return False
+
+    hostname = parsed.hostname
+    if not hostname:
+        return False
+
+    try:
+        addr = ipaddress.ip_address(hostname)
+    except ValueError:
+        # Hostname, not an IP — resolve it
+        try:
+            resolved = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+            for _, _, _, _, sockaddr in resolved:
+                addr = ipaddress.ip_address(sockaddr[0])
+                if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved:
+                    return False
+            return True
+        except socket.gaierror:
+            return False
+    else:
+        return not (addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved)
+
+
 async def crawl(
     base_url: str,
     page_limit: int = 20,
@@ -57,6 +90,10 @@ async def crawl(
 
     Returns list of {"url": str, "html": str} dicts.
     """
+    if not _is_safe_url(base_url):
+        logger.warning("Blocked unsafe base URL: %s", base_url)
+        return []
+
     visited: set[str] = set()
     results: list[dict] = []
     queue = [_normalize_url(base_url)]
