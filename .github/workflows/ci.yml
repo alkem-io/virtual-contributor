@@ -8,6 +8,7 @@ on:
 
 env:
   AGENT_TOOLSDIRECTORY: /Users/m1/actions-tool-cache
+  RUNNER_TOOL_CACHE: /Users/m1/actions-tool-cache
 
 jobs:
   lint:
