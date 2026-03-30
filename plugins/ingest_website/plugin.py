@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from urllib.parse import urlparse
 
-from core.domain.ingest_pipeline import Document, DocumentMetadata, IngestResult, run_ingest_pipeline
+from core.domain.ingest_pipeline import Document, DocumentMetadata, run_ingest_pipeline
 from core.events.ingest_website import IngestWebsite, IngestWebsiteResult, IngestionResult
 from core.ports.embeddings import EmbeddingsPort
 from core.ports.knowledge_store import KnowledgeStorePort

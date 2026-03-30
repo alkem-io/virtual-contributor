@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import pytest
 
-from core.events.input import Input, HistoryItem, MessageSenderRole
 from core.events.response import Response
 from plugins.generic.plugin import GenericPlugin
 from tests.conftest import MockLLMPort, make_input

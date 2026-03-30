@@ -7,18 +7,10 @@ from typing import AsyncIterator
 import pytest
 
 from core.events import (
-    ExternalConfig,
-    ExternalMetadata,
-    HistoryItem,
     IngestBodyOfKnowledge,
     IngestWebsite,
     Input,
-    MessageSenderRole,
     Response,
-    ResultHandler,
-    ResultHandlerAction,
-    RoomDetails,
-    Source,
 )
 from core.ports.knowledge_store import QueryResult
 

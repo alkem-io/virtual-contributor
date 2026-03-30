@@ -2,16 +2,14 @@
 
 from __future__ import annotations
 
-import pytest
 
 from core.domain.ingest_pipeline import (
     Document,
     DocumentMetadata,
-    DocumentType,
     IngestResult,
     run_ingest_pipeline,
 )
-from tests.conftest import MockEmbeddingsPort, MockKnowledgeStorePort, MockLLMPort
+from tests.conftest import MockEmbeddingsPort, MockKnowledgeStorePort
 
 
 def _make_doc(content: str = "Test content " * 100, doc_id: str = "doc-1") -> Document:

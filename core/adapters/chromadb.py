@@ -6,7 +6,7 @@ from typing import Any
 
 import chromadb
 
-from core.ports.knowledge_store import KnowledgeStorePort, QueryResult
+from core.ports.knowledge_store import QueryResult
 
 logger = logging.getLogger(__name__)
 

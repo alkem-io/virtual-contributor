@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
-from typing import Any, Callable
+from typing import Callable
 
 import aio_pika
 from aio_pika import ExchangeType, Message
@@ -88,7 +87,7 @@ class RabbitMQAdapter:
             raise RuntimeError("Not connected to RabbitMQ")
 
         # Ensure result queue exists and is bound
-        result_queue = await self._channel.declare_queue(
+        await self._channel.declare_queue(
             routing_key, durable=True, auto_delete=False,
         )
 

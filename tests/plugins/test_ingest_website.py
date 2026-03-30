@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import httpx
 import pytest
 
-from core.events.ingest_website import IngestWebsiteResult, IngestionResult
+from core.events.ingest_website import IngestWebsiteResult
 from plugins.ingest_website.crawler import _is_same_domain, _normalize_url, _should_skip_url, crawl
 from plugins.ingest_website.html_parser import extract_text, extract_title
 from plugins.ingest_website.plugin import IngestWebsitePlugin

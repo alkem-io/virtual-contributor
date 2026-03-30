@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
 
 from core.domain.summarize_graph import summarize_document, summarize_body_of_knowledge
 

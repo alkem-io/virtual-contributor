@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
 
-import pytest
 
 from core.events.response import Response
 from core.registry import PluginRegistry

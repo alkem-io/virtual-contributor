@@ -45,6 +45,7 @@ openpyxl = "^3.1"
 
 [tool.poetry.group.dev.dependencies]
 flake8 = "^7.3.0"
+ruff = "^0.11.4"
 pyright = "^1.1.406"
 pytest = "^9.0"
 pytest-cov = "^7.1"

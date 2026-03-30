@@ -4,12 +4,9 @@ from __future__ import annotations
 
 import json
 
-import pytest
 
 from core.events import (
     ErrorDetail,
-    ExternalConfig,
-    ExternalMetadata,
     HistoryItem,
     IngestBodyOfKnowledge,
     IngestBodyOfKnowledgeResult,
@@ -20,7 +17,6 @@ from core.events import (
     InvocationOperation,
     MessageSenderRole,
     Response,
-    ResultHandler,
     ResultHandlerAction,
     RoomDetails,
     Source,

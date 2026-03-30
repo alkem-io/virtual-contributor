@@ -7,7 +7,6 @@ import pytest
 from core.events.ingest_space import IngestBodyOfKnowledge
 from core.events.ingest_website import IngestWebsite
 from core.events.input import Input
-from core.events.response import Response
 from core.router import Router, RouterError
 from tests.conftest import make_input, make_ingest_website, make_response
 
