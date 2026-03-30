@@ -11,9 +11,10 @@ jobs:
     runs-on: [self-hosted, macOS, ARM64, apple-silicon, m4]
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+      - name: Set up Python
+        run: |
+          python3 -m venv .venv
+          echo "$PWD/.venv/bin" >> $GITHUB_PATH
       - name: Install dependencies
         run: |
           pip install poetry
@@ -30,9 +31,10 @@ jobs:
         plugin: [expert, generic, guidance, openai-assistant, ingest-website, ingest-space]
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+      - name: Set up Python
+        run: |
+          python3 -m venv .venv
+          echo "$PWD/.venv/bin" >> $GITHUB_PATH
       - name: Install dependencies
         run: |
           pip install poetry
