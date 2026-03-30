@@ -8,7 +8,7 @@ on:
 
 jobs:
   lint:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, macOS, ARM64, apple-silicon, m4]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -24,7 +24,7 @@ jobs:
         run: poetry run pyright core/ plugins/
 
   test:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, macOS, ARM64, apple-silicon, m4]
     strategy:
       matrix:
         plugin: [expert, generic, guidance, openai-assistant, ingest-website, ingest-space]
