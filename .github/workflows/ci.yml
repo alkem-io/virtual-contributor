@@ -6,23 +6,17 @@ on:
   pull_request:
     branches: [develop, main]
 
-env:
-  AGENT_TOOLSDIRECTORY: /Users/m1/actions-tool-cache
-  RUNNER_TOOL_CACHE: /Users/m1/actions-tool-cache
-
 jobs:
   lint:
-    runs-on: [self-hosted, macOS, ARM64, apple-silicon, m4]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Ensure tool cache exists
-        run: mkdir -p "$AGENT_TOOLSDIRECTORY"
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - name: Install dependencies
         run: |
-          pip install --upgrade pip poetry
+          pip install poetry
           poetry install --no-interaction
       - name: Ruff lint
         run: poetry run ruff check core/ plugins/ tests/
@@ -30,20 +24,18 @@ jobs:
         run: poetry run pyright core/ plugins/
 
   test:
-    runs-on: [self-hosted, macOS, ARM64, apple-silicon, m4]
+    runs-on: ubuntu-latest
     strategy:
       matrix:
         plugin: [expert, generic, guidance, openai-assistant, ingest-website, ingest-space]
     steps:
       - uses: actions/checkout@v4
-      - name: Ensure tool cache exists
-        run: mkdir -p "$AGENT_TOOLSDIRECTORY"
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - name: Install dependencies
         run: |
-          pip install --upgrade pip poetry
+          pip install poetry
           poetry install --no-interaction
       - name: Run tests
         run: |
