@@ -6,7 +6,6 @@ import asyncio
 import json
 import logging
 import signal
-import sys
 
 from core.config import BaseConfig
 from core.container import Container

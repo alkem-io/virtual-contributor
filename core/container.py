@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import logging
 from typing import Any, get_type_hints
 
@@ -37,18 +38,21 @@ class Container:
 
         Introspects type-hints on *plugin_class.__init__* and returns a
         ``dict[param_name, adapter_instance]`` suitable for ``**kwargs``
-        construction of the plugin.
+        construction of the plugin. Parameters with default values are
+        skipped if no adapter is registered for their type.
         """
         hints = get_type_hints(plugin_class.__init__)
+        sig = inspect.signature(plugin_class.__init__)
         resolved: dict[str, Any] = {}
         for param_name, param_type in hints.items():
             if param_name in ("self", "return"):
                 continue
             adapter = self._bindings.get(param_type)
-            if adapter is None:
+            if adapter is not None:
+                resolved[param_name] = adapter
+            elif sig.parameters[param_name].default is inspect.Parameter.empty:
                 raise ContainerError(
                     f"Plugin {getattr(plugin_class, 'name', plugin_class.__name__)} "
                     f"requires port {param_type.__name__} but no adapter is registered"
                 )
-            resolved[param_name] = adapter
         return resolved
