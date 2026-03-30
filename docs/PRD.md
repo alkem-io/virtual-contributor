@@ -2,7 +2,7 @@
 
 **Status:** Draft
 **Date:** 2026-03-30
-**Authors:** Vladimir Aleksiev, Claude (AI-assisted analysis)
+**Authors:** Valentin Yanakiev, Claude (AI-assisted analysis)
 
 ---
 
