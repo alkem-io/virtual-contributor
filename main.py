@@ -60,6 +60,11 @@ def _create_adapters(config: BaseConfig, container: Container) -> None:
             ),
         )
 
+    # OpenAI Assistants (always available — per-request API keys)
+    from core.adapters.openai_assistant import OpenAIAssistantAdapter
+
+    container.register(OpenAIAssistantAdapter, OpenAIAssistantAdapter())
+
 
 async def _run(config: BaseConfig) -> None:
     """Main async entrypoint."""
