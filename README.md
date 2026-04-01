@@ -13,8 +13,7 @@ virtual-contributor/
 │   │   ├── knowledge_store.py     # KnowledgeStorePort — vector DB
 │   │   └── transport.py           # TransportPort — message bus
 │   ├── adapters/                  # Concrete implementations
-│   │   ├── mistral.py             # Mistral LLM (langchain-mistralai)
-│   │   ├── openai_llm.py          # OpenAI ChatCompletion (langchain-openai)
+│   │   ├── langchain_llm.py       # Unified LLM adapter (any LangChain provider)
 │   │   ├── openai_assistant.py    # OpenAI Assistants API (threads/runs)
 │   │   ├── chromadb.py            # ChromaDB vector store
 │   │   ├── rabbitmq.py            # RabbitMQ transport (aio-pika)

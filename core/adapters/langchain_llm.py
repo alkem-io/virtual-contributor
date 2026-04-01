@@ -1,11 +1,17 @@
+"""Unified LangChain LLM adapter — wraps any BaseChatModel, implements LLMPort."""
+
 from __future__ import annotations
 
 import asyncio
 import logging
 from typing import AsyncIterator
 
-from langchain_openai import ChatOpenAI
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, AIMessage
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -15,11 +21,11 @@ BASE_DELAY = 1.0
 
 def _to_langchain_messages(messages: list[dict]) -> list[BaseMessage]:
     """Convert dict messages to LangChain message objects."""
-    result = []
+    result: list[BaseMessage] = []
     for msg in messages:
         role = msg.get("role", "human")
         content = msg.get("content", "")
-        if role in ("system",):
+        if role == "system":
             result.append(SystemMessage(content=content))
         elif role in ("assistant", "ai"):
             result.append(AIMessage(content=content))
@@ -28,29 +34,38 @@ def _to_langchain_messages(messages: list[dict]) -> list[BaseMessage]:
     return result
 
 
-class OpenAILLMAdapter:
-    """LLM adapter for OpenAI models via langchain-openai."""
+class LangChainLLMAdapter:
+    """Unified LLM adapter wrapping any LangChain BaseChatModel.
 
-    def __init__(self, api_key: str, model_name: str = "gpt-4o") -> None:
-        self._llm = ChatOpenAI(
-            api_key=api_key,
-            model=model_name,
-        )
+    Implements LLMPort with retry logic (3 attempts, exponential backoff)
+    for invoke and streaming support via astream.
+    """
+
+    def __init__(self, llm) -> None:
+        self._llm = llm
 
     async def invoke(self, messages: list[dict]) -> str:
         lc_messages = _to_langchain_messages(messages)
-        last_exc = None
+        last_exc: Exception | None = None
         for attempt in range(MAX_RETRIES):
             try:
                 result = await self._llm.ainvoke(lc_messages)
                 return str(result.content)
+            except (ConnectionError, OSError) as exc:
+                # Connection errors to local endpoints — fail fast with clear message
+                raise ConnectionError(
+                    f"Failed to connect to LLM endpoint: {exc}. "
+                    "If using a local model, ensure the server is running."
+                ) from exc
             except Exception as exc:
                 last_exc = exc
                 if attempt < MAX_RETRIES - 1:
-                    delay = BASE_DELAY * (2 ** attempt)
+                    delay = BASE_DELAY * (2**attempt)
                     logger.warning(
-                        "OpenAI invoke attempt %d failed, retrying in %.1fs: %s",
-                        attempt + 1, delay, exc,
+                        "LLM invoke attempt %d failed, retrying in %.1fs: %s",
+                        attempt + 1,
+                        delay,
+                        exc,
                     )
                     await asyncio.sleep(delay)
         raise last_exc  # type: ignore[misc]
