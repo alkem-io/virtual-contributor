@@ -254,8 +254,8 @@ Router
 ```
 
 **Routing logic** (verified from base engine `invoke_handler`):
+- If `PLUGIN_TYPE == "ingest-space"`: construct `IngestBodyOfKnowledge(**body)`, route to ingest-space plugin (note: checked first to prevent ingest-space messages with an `eventType` field from being misrouted to the ingest-website plugin)
 - If `body.get("eventType") == "IngestWebsite"`: construct `IngestWebsite(**body)`, route to ingest-website plugin
-- If `PLUGIN_TYPE == "ingest-space"`: construct `IngestBodyOfKnowledge(**body)`, route to ingest-space plugin (note: ingest-space messages have no `eventType` field — routing is by plugin type, not message content)
 - Else: construct `Input(**body["input"])`, route by plugin name (from `PLUGIN_TYPE` config)
 
 **Published result format**:

@@ -33,7 +33,7 @@
 | `auto_delete` | `false` |
 | `durable` | `true` |
 
-Result queues are bound to the exchange via their respective routing keys.
+All queues (both input and result) are explicitly bound to the DIRECT exchange via `q.bind()` with their respective routing keys.
 
 ### Connection Parameters
 
@@ -48,6 +48,7 @@ Result queues are bound to the exchange via their respective routing keys.
 
 - **Prefetch count**: 1 (sequential processing per plugin)
 - **Acknowledgment**: Manual ACK after successful processing (Python services). Note: ingest-space (TypeScript) uses `noAck: true` — the Python port should switch to manual ACK for consistency with at-least-once delivery semantics.
+- **Exception propagation**: Exceptions raised by message callbacks propagate out of `message.process()`, causing the message to be NACKed and requeued/dead-lettered rather than silently acknowledged
 - **Dead-letter**: Messages NACKed after repeated failures route to dead-letter queue
 - **Serialization**: JSON with UTF-8 encoding
 
