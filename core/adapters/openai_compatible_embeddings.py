@@ -11,10 +11,14 @@ MAX_RETRIES = 3
 BASE_DELAY = 1.0
 
 
-class ScalewayEmbeddingsAdapter:
-    """Scaleway embeddings adapter behind EmbeddingsPort."""
+class OpenAICompatibleEmbeddingsAdapter:
+    """OpenAI-compatible embeddings adapter behind EmbeddingsPort.
 
-    def __init__(self, api_key: str, endpoint: str, model_name: str = "qwen3-embedding-8b") -> None:
+    Works with any provider exposing the ``/embeddings`` endpoint in the
+    OpenAI format (Scaleway, Together AI, vLLM, Ollama, etc.).
+    """
+
+    def __init__(self, api_key: str, endpoint: str, model_name: str) -> None:
         self._api_key = api_key
         self._endpoint = endpoint.rstrip("/")
         self._model_name = model_name
@@ -42,6 +46,6 @@ class ScalewayEmbeddingsAdapter:
                 last_exc = exc
                 if attempt < MAX_RETRIES - 1:
                     delay = BASE_DELAY * (2 ** attempt)
-                    logger.warning("Scaleway embed attempt %d failed, retrying: %s", attempt + 1, exc)
+                    logger.warning("Embeddings attempt %d failed, retrying: %s", attempt + 1, exc)
                     await asyncio.sleep(delay)
         raise last_exc

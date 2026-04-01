@@ -17,7 +17,7 @@ virtual-contributor/
 │   │   ├── openai_assistant.py    # OpenAI Assistants API (threads/runs)
 │   │   ├── chromadb.py            # ChromaDB vector store
 │   │   ├── rabbitmq.py            # RabbitMQ transport (aio-pika)
-│   │   ├── scaleway_embeddings.py # Scaleway embeddings (httpx)
+│   │   ├── openai_compatible_embeddings.py # OpenAI-compatible embeddings (httpx)
 │   │   └── openai_embeddings.py   # OpenAI embeddings
 │   ├── domain/                    # Shared domain logic
 │   │   ├── prompt_graph.py        # LangGraph-based workflow engine

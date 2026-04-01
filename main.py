@@ -77,11 +77,11 @@ def _create_adapters(config: BaseConfig, container: Container) -> None:
 
     # Embeddings adapters
     if config.embeddings_api_key and config.embeddings_endpoint:
-        from core.adapters.scaleway_embeddings import ScalewayEmbeddingsAdapter
+        from core.adapters.openai_compatible_embeddings import OpenAICompatibleEmbeddingsAdapter
 
         container.register(
             EmbeddingsPort,
-            ScalewayEmbeddingsAdapter(
+            OpenAICompatibleEmbeddingsAdapter(
                 api_key=config.embeddings_api_key,
                 endpoint=config.embeddings_endpoint,
                 model_name=config.embeddings_model_name or "qwen3-embedding-8b",
