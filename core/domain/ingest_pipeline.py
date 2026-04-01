@@ -160,11 +160,15 @@ async def run_ingest_pipeline(
                 f"{c.metadata.document_id}-{c.chunk_index}"
                 for c in batch
             ]
+            batch_embeddings = [
+                c.embedding for c in batch if c.embedding is not None
+            ]
             await knowledge_store_port.ingest(
                 collection=collection_name,
                 documents=docs,
                 metadatas=metadatas,
                 ids=ids,
+                embeddings=batch_embeddings if len(batch_embeddings) == len(batch) else None,
             )
             chunks_stored += len(batch)
         except Exception as exc:

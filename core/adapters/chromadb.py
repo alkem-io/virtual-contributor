@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any
+from typing import Any, Protocol
 
 import chromadb
 
@@ -14,10 +14,21 @@ MAX_RETRIES = 3
 BASE_DELAY = 1.0
 
 
+class EmbedFn(Protocol):
+    """Minimal protocol for an async embed function."""
+    async def embed(self, texts: list[str]) -> list[list[float]]: ...
+
+
 class ChromaDBAdapter:
     """ChromaDB knowledge store adapter behind KnowledgeStorePort."""
 
-    def __init__(self, host: str, port: int = 8765, credentials: str | None = None) -> None:
+    def __init__(
+        self,
+        host: str,
+        port: int = 8765,
+        credentials: str | None = None,
+        embeddings: EmbedFn | None = None,
+    ) -> None:
         settings = chromadb.config.Settings()
         if credentials:
             settings = chromadb.config.Settings(
@@ -29,6 +40,7 @@ class ChromaDBAdapter:
             port=port,
             settings=settings,
         )
+        self._embeddings = embeddings
 
     async def query(
         self,
@@ -36,9 +48,23 @@ class ChromaDBAdapter:
         query_texts: list[str],
         n_results: int = 10,
     ) -> QueryResult:
+        # Compute query embeddings externally to avoid onnxruntime dependency
+        query_embeddings = None
+        if self._embeddings:
+            query_embeddings = await self._embeddings.embed(query_texts)
+
         def _query():
-            col = self._client.get_or_create_collection(collection)
-            results = col.query(query_texts=query_texts, n_results=n_results)
+            col = self._client.get_or_create_collection(
+                collection, embedding_function=None
+            )
+            if query_embeddings is not None:
+                results = col.query(
+                    query_embeddings=query_embeddings, n_results=n_results
+                )
+            else:
+                results = col.query(
+                    query_texts=query_texts, n_results=n_results
+                )
             return QueryResult(
                 documents=results.get("documents", []),
                 metadatas=results.get("metadatas", []),
@@ -54,10 +80,16 @@ class ChromaDBAdapter:
         documents: list[str],
         metadatas: list[dict],
         ids: list[str],
+        embeddings: list[list[float]] | None = None,
     ) -> None:
         def _ingest():
-            col = self._client.get_or_create_collection(collection)
-            col.upsert(documents=documents, metadatas=metadatas, ids=ids)
+            col = self._client.get_or_create_collection(
+                collection, embedding_function=None
+            )
+            kwargs: dict = dict(documents=documents, metadatas=metadatas, ids=ids)
+            if embeddings is not None:
+                kwargs["embeddings"] = embeddings
+            col.upsert(**kwargs)
 
         await self._retry(_ingest)
 
@@ -67,8 +99,11 @@ class ChromaDBAdapter:
 
         try:
             await self._retry(_delete)
-        except ValueError:
-            logger.warning("Collection %s not found for deletion", collection)
+        except (ValueError, Exception) as exc:
+            if "not found" in str(exc).lower() or "does not exist" in str(exc).lower():
+                logger.warning("Collection %s not found for deletion, skipping", collection)
+            else:
+                raise
 
     @staticmethod
     async def _retry(fn, max_retries: int = MAX_RETRIES) -> Any:
