@@ -88,7 +88,6 @@ class ChromaDBAdapter:
             col = self._client.get_or_create_collection(
                 collection, embedding_function=None
             )
-<<<<<<< HEAD
             col.upsert(
                 documents=documents,
                 metadatas=metadatas,
