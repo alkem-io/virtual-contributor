@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 
 from core.events.input import Input
 from core.events.response import Response, Source
@@ -110,8 +111,11 @@ class GuidancePlugin:
 
     @staticmethod
     def _parse_json_sources(text: str) -> dict | None:
-        """Try to parse LLM response as JSON."""
+        """Try to parse LLM response as JSON, stripping markdown code fences if present."""
+        if not isinstance(text, str):
+            return None
         try:
-            return json.loads(text)
+            cleaned = re.sub(r'^```(?:json)?\s*\n?|\n?```\s*$', '', text.strip())
+            return json.loads(cleaned)
         except (json.JSONDecodeError, TypeError):
             return None

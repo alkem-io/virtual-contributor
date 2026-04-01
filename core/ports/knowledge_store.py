@@ -33,6 +33,7 @@ class KnowledgeStorePort(Protocol):
         documents: list[str],
         metadatas: list[dict],
         ids: list[str],
+        embeddings: list[list[float]] | None = None,
     ) -> None:
         """Ingest documents into a collection."""
         ...

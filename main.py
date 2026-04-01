@@ -51,14 +51,21 @@ def _create_adapters(config: BaseConfig, container: Container) -> None:
     if config.vector_db_host:
         from core.adapters.chromadb import ChromaDBAdapter
 
+        embeddings_adapter = container._bindings.get(EmbeddingsPort)
         container.register(
             KnowledgeStorePort,
             ChromaDBAdapter(
                 host=config.vector_db_host,
                 port=config.vector_db_port,
                 credentials=config.vector_db_credentials,
+                embeddings=embeddings_adapter,
             ),
         )
+
+    # OpenAI Assistants (always available — per-request API keys)
+    from core.adapters.openai_assistant import OpenAIAssistantAdapter
+
+    container.register(OpenAIAssistantAdapter, OpenAIAssistantAdapter())
 
 
 async def _run(config: BaseConfig) -> None:

@@ -77,6 +77,7 @@ class MockKnowledgeStorePort:
         documents: list[str],
         metadatas: list[dict],
         ids: list[str],
+        embeddings: list[list[float]] | None = None,
     ) -> None:
         self.collections.setdefault(collection, [])
         for doc, meta, doc_id in zip(documents, metadatas, ids):
