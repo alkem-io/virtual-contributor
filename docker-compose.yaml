@@ -1,0 +1,111 @@
+services:
+  # Infrastructure
+  rabbitmq:
+    image: rabbitmq:3-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: alkemio-admin
+      RABBITMQ_DEFAULT_PASS: alkemio!
+
+  chromadb:
+    image: chromadb/chroma:latest
+    ports:
+      - "8765:8000"
+
+  # Engine plugins — same image, different PLUGIN_TYPE
+  expert:
+    build: .
+    depends_on: [rabbitmq, chromadb]
+    environment:
+      PLUGIN_TYPE: expert
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_QUEUE: virtual-contributor-engine-expert
+      RABBITMQ_RESULT_QUEUE: virtual-contributor-invoke-engine-result
+      RABBITMQ_RESULT_ROUTING_KEY: invoke-engine-result
+      RABBITMQ_EVENT_BUS_EXCHANGE: event-bus
+      VECTOR_DB_HOST: chromadb
+      VECTOR_DB_PORT: 8000
+      MISTRAL_API_KEY: ${MISTRAL_API_KEY:-}
+      MISTRAL_SMALL_MODEL_NAME: mistral-small-latest
+      EMBEDDINGS_API_KEY: ${EMBEDDINGS_API_KEY:-}
+      EMBEDDINGS_ENDPOINT: ${EMBEDDINGS_ENDPOINT:-}
+      EMBEDDINGS_MODEL_NAME: ${EMBEDDINGS_MODEL_NAME:-}
+
+  generic:
+    build: .
+    depends_on: [rabbitmq]
+    environment:
+      PLUGIN_TYPE: generic
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_QUEUE: virtual-contributor-engine-generic
+      RABBITMQ_RESULT_QUEUE: virtual-contributor-invoke-engine-result
+      RABBITMQ_RESULT_ROUTING_KEY: invoke-engine-result
+      RABBITMQ_EVENT_BUS_EXCHANGE: event-bus
+      MISTRAL_API_KEY: ${MISTRAL_API_KEY:-}
+      MISTRAL_SMALL_MODEL_NAME: mistral-small-latest
+
+  guidance:
+    build: .
+    depends_on: [rabbitmq, chromadb]
+    environment:
+      PLUGIN_TYPE: guidance
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_QUEUE: virtual-contributor-engine-guidance
+      RABBITMQ_RESULT_QUEUE: virtual-contributor-invoke-engine-result
+      RABBITMQ_RESULT_ROUTING_KEY: invoke-engine-result
+      RABBITMQ_EVENT_BUS_EXCHANGE: event-bus
+      VECTOR_DB_HOST: chromadb
+      VECTOR_DB_PORT: 8000
+      MISTRAL_API_KEY: ${MISTRAL_API_KEY:-}
+      MISTRAL_SMALL_MODEL_NAME: mistral-small-latest
+
+  openai-assistant:
+    build: .
+    depends_on: [rabbitmq]
+    environment:
+      PLUGIN_TYPE: openai-assistant
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_QUEUE: virtual-contributor-engine-openai-assistant
+      RABBITMQ_RESULT_QUEUE: virtual-contributor-invoke-engine-result
+      RABBITMQ_RESULT_ROUTING_KEY: invoke-engine-result
+      RABBITMQ_EVENT_BUS_EXCHANGE: event-bus
+
+  ingest-website:
+    build: .
+    depends_on: [rabbitmq, chromadb]
+    environment:
+      PLUGIN_TYPE: ingest-website
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_QUEUE: virtual-contributor-ingest-website
+      RABBITMQ_RESULT_QUEUE: virtual-contributor-ingest-website-result
+      RABBITMQ_RESULT_ROUTING_KEY: ingest-website-result
+      RABBITMQ_EVENT_BUS_EXCHANGE: event-bus
+      VECTOR_DB_HOST: chromadb
+      VECTOR_DB_PORT: 8000
+      MISTRAL_API_KEY: ${MISTRAL_API_KEY:-}
+      EMBEDDINGS_API_KEY: ${EMBEDDINGS_API_KEY:-}
+      EMBEDDINGS_ENDPOINT: ${EMBEDDINGS_ENDPOINT:-}
+      EMBEDDINGS_MODEL_NAME: ${EMBEDDINGS_MODEL_NAME:-}
+
+  ingest-space:
+    build: .
+    depends_on: [rabbitmq, chromadb]
+    environment:
+      PLUGIN_TYPE: ingest-space
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_QUEUE: virtual-contributor-ingest-body-of-knowledge
+      RABBITMQ_RESULT_QUEUE: virtual-contributor-ingest-body-of-knowledge-result
+      RABBITMQ_RESULT_ROUTING_KEY: IngestSpaceResult
+      RABBITMQ_EVENT_BUS_EXCHANGE: event-bus
+      VECTOR_DB_HOST: chromadb
+      VECTOR_DB_PORT: 8000
+      MISTRAL_API_KEY: ${MISTRAL_API_KEY:-}
+      EMBEDDINGS_API_KEY: ${EMBEDDINGS_API_KEY:-}
+      EMBEDDINGS_ENDPOINT: ${EMBEDDINGS_ENDPOINT:-}
+      EMBEDDINGS_MODEL_NAME: ${EMBEDDINGS_MODEL_NAME:-}
+      API_ENDPOINT_PRIVATE_GRAPHQL: ${API_ENDPOINT_PRIVATE_GRAPHQL:-}
+      AUTH_ORY_KRATOS_PUBLIC_BASE_URL: ${AUTH_ORY_KRATOS_PUBLIC_BASE_URL:-}
+      AUTH_ADMIN_EMAIL: ${AUTH_ADMIN_EMAIL:-}
+      AUTH_ADMIN_PASSWORD: ${AUTH_ADMIN_PASSWORD:-}

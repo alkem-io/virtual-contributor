@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [develop, main]
+  pull_request:
+    branches: [develop, main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          pip install poetry
+          poetry install --no-interaction
+      - name: Ruff lint
+        run: poetry run ruff check core/ plugins/ tests/
+      - name: Pyright type check
+        run: poetry run pyright core/ plugins/
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        plugin: [expert, generic, guidance, openai-assistant, ingest-website, ingest-space]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          pip install poetry
+          poetry install --no-interaction
+      - name: Run tests
+        run: |
+          poetry run pytest tests/ \
+            --cov=core --cov=plugins \
+            --cov-report=term-missing \
+            --cov-fail-under=80 \
+            -v

@@ -1,0 +1,21 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.11.4
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+
+  - repo: https://github.com/RobertCraiworki/pyright-python
+    rev: v1.1.406
+    hooks:
+      - id: pyright
+
+  - repo: local
+    hooks:
+      - id: pytest
+        name: pytest
+        entry: poetry run pytest --tb=short -q
+        language: system
+        types: [python]
+        pass_filenames: false
+        always_run: true

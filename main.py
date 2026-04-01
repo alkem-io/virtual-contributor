@@ -1,0 +1,166 @@
+"""Application entry point — bootstrap, wire, run."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import signal
+
+from core.config import BaseConfig
+from core.container import Container
+from core.health import HealthServer
+from core.logging import setup_logging
+from core.ports.llm import LLMPort
+from core.ports.embeddings import EmbeddingsPort
+from core.ports.knowledge_store import KnowledgeStorePort
+from core.registry import PluginRegistry
+from core.router import Router
+
+logger = logging.getLogger(__name__)
+
+
+def _create_adapters(config: BaseConfig, container: Container) -> None:
+    """Wire adapter instances into the container based on config."""
+    # LLM adapters
+    if config.mistral_api_key:
+        from core.adapters.mistral import MistralAdapter
+
+        container.register(
+            LLMPort,
+            MistralAdapter(
+                api_key=config.mistral_api_key,
+                model_name=config.mistral_model_name or "mistral-small-latest",
+            ),
+        )
+
+    # Embeddings adapters
+    if config.embeddings_api_key and config.embeddings_endpoint:
+        from core.adapters.scaleway_embeddings import ScalewayEmbeddingsAdapter
+
+        container.register(
+            EmbeddingsPort,
+            ScalewayEmbeddingsAdapter(
+                api_key=config.embeddings_api_key,
+                endpoint=config.embeddings_endpoint,
+                model_name=config.embeddings_model_name or "qwen3-embedding-8b",
+            ),
+        )
+
+    # Knowledge store
+    if config.vector_db_host:
+        from core.adapters.chromadb import ChromaDBAdapter
+
+        container.register(
+            KnowledgeStorePort,
+            ChromaDBAdapter(
+                host=config.vector_db_host,
+                port=config.vector_db_port,
+                credentials=config.vector_db_credentials,
+            ),
+        )
+
+
+async def _run(config: BaseConfig) -> None:
+    """Main async entrypoint."""
+    from core.adapters.rabbitmq import RabbitMQAdapter
+
+    # Discover plugin
+    registry = PluginRegistry()
+    plugin_class = registry.discover(config.plugin_type)
+    logger.info("Discovered plugin: %s", plugin_class.name)
+
+    # Wire adapters
+    container = Container()
+    _create_adapters(config, container)
+
+    # Construct plugin with dependencies
+    deps = container.resolve_for_plugin(plugin_class)
+    plugin = plugin_class(**deps)
+
+    # Plugin lifecycle: startup
+    await plugin.startup()
+    logger.info("Plugin %s started", plugin.name)
+
+    # Transport
+    transport = RabbitMQAdapter(
+        host=config.rabbitmq_host,
+        port=config.rabbitmq_port,
+        user=config.rabbitmq_user,
+        password=config.rabbitmq_password,
+        exchange_name=config.rabbitmq_exchange,
+    )
+    await transport.connect()
+
+    # Router
+    router = Router(plugin_type=config.plugin_type)
+
+    # Message handler
+    async def on_message(body: dict) -> None:
+        event = None
+        try:
+            event = router.parse_event(body)
+            response = await plugin.handle(event)
+            envelope = router.build_response_envelope(response, event)
+            await transport.publish(
+                config.rabbitmq_exchange,
+                config.rabbitmq_result_routing_key,
+                json.dumps(envelope).encode("utf-8"),
+            )
+        except Exception as exc:
+            logger.exception("Error handling message: %s", exc)
+            from core.events.response import Response
+
+            error_response = Response(result=f"Error: {exc}")
+            envelope = router.build_response_envelope(error_response, event) if event else {"response": error_response.model_dump()}
+            await transport.publish(
+                config.rabbitmq_exchange,
+                config.rabbitmq_result_routing_key,
+                json.dumps(envelope).encode("utf-8"),
+            )
+
+    # Start consuming
+    await transport.consume(config.rabbitmq_input_queue, on_message)
+
+    # Health server
+    health = HealthServer(port=config.health_port)
+    health.add_check("rabbitmq", transport.is_connected)
+    health.add_check("plugin", lambda: True)
+    await health.start()
+
+    logger.info("Engine ready — consuming from %s", config.rabbitmq_input_queue)
+
+    # Shutdown handling
+    stop_event = asyncio.Event()
+
+    def _signal_handler() -> None:
+        logger.info("Shutdown signal received")
+        stop_event.set()
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, _signal_handler)
+
+    await stop_event.wait()
+
+    # Graceful shutdown
+    logger.info("Shutting down...")
+    await health.stop()
+    await plugin.shutdown()
+    await transport.close()
+    logger.info("Shutdown complete")
+
+
+def main() -> None:
+    config = BaseConfig()
+    setup_logging(level=config.log_level, plugin_type=config.plugin_type)
+    logger.info("Starting virtual-contributor engine with plugin: %s", config.plugin_type)
+
+    try:
+        asyncio.run(_run(config))
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()
