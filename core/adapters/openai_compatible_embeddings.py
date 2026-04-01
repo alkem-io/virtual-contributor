@@ -25,9 +25,9 @@ class OpenAICompatibleEmbeddingsAdapter:
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
         last_exc = None
-        for attempt in range(MAX_RETRIES):
-            try:
-                async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            for attempt in range(MAX_RETRIES):
+                try:
                     response = await client.post(
                         f"{self._endpoint}/embeddings",
                         headers={
@@ -42,10 +42,10 @@ class OpenAICompatibleEmbeddingsAdapter:
                     response.raise_for_status()
                     data = response.json()
                     return [item["embedding"] for item in data["data"]]
-            except Exception as exc:
-                last_exc = exc
-                if attempt < MAX_RETRIES - 1:
-                    delay = BASE_DELAY * (2 ** attempt)
-                    logger.warning("Embeddings attempt %d failed, retrying: %s", attempt + 1, exc)
-                    await asyncio.sleep(delay)
+                except Exception as exc:
+                    last_exc = exc
+                    if attempt < MAX_RETRIES - 1:
+                        delay = BASE_DELAY * (2 ** attempt)
+                        logger.warning("Embeddings attempt %d failed, retrying: %s", attempt + 1, exc)
+                        await asyncio.sleep(delay)
         raise last_exc

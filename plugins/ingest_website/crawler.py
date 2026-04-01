@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import logging
 import socket
@@ -51,7 +52,7 @@ def _should_skip_url(url: str) -> bool:
     return any(path.endswith(ext) for ext in SKIP_EXTENSIONS)
 
 
-def _is_safe_url(url: str) -> bool:
+async def _is_safe_url(url: str) -> bool:
     """Block private/reserved network targets to prevent SSRF.
 
     Only allows http/https schemes and rejects URLs that resolve
@@ -68,9 +69,11 @@ def _is_safe_url(url: str) -> bool:
     try:
         addr = ipaddress.ip_address(hostname)
     except ValueError:
-        # Hostname, not an IP — resolve it
+        # Hostname, not an IP — resolve without blocking the event loop
         try:
-            resolved = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+            resolved = await asyncio.to_thread(
+                socket.getaddrinfo, hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM
+            )
             for _, _, _, _, sockaddr in resolved:
                 addr = ipaddress.ip_address(sockaddr[0])
                 if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved:
@@ -90,7 +93,7 @@ async def crawl(
 
     Returns list of {"url": str, "html": str} dicts.
     """
-    if not _is_safe_url(base_url):
+    if not await _is_safe_url(base_url):
         logger.warning("Blocked unsafe base URL: %s", base_url)
         return []
 

@@ -61,9 +61,9 @@ class GraphQLClient:
             await self.authenticate()
 
         last_exc = None
-        for attempt in range(MAX_RETRIES):
-            try:
-                async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            for attempt in range(MAX_RETRIES):
+                try:
                     resp = await client.post(
                         self._graphql_endpoint,
                         headers={
@@ -77,10 +77,10 @@ class GraphQLClient:
                     if "errors" in data:
                         raise RuntimeError(f"GraphQL errors: {data['errors']}")
                     return data.get("data", {})
-            except Exception as exc:
-                last_exc = exc
-                if attempt < MAX_RETRIES - 1:
-                    delay = BASE_DELAY * (2 ** attempt)
-                    logger.warning("GraphQL query attempt %d failed: %s", attempt + 1, exc)
-                    await asyncio.sleep(delay)
+                except Exception as exc:
+                    last_exc = exc
+                    if attempt < MAX_RETRIES - 1:
+                        delay = BASE_DELAY * (2 ** attempt)
+                        logger.warning("GraphQL query attempt %d failed: %s", attempt + 1, exc)
+                        await asyncio.sleep(delay)
         raise last_exc

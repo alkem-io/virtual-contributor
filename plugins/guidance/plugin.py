@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -59,10 +60,9 @@ class GuidancePlugin:
             }])
             question = condensed
 
-        # Query multiple collections
-        all_docs = []
-        all_sources = []
-        for collection in DEFAULT_COLLECTIONS:
+        # Query multiple collections in parallel
+        async def _query_collection(collection: str):
+            docs, sources = [], []
             try:
                 result = await self._knowledge_store.query(
                     collection=collection, query_texts=[question], n_results=5,
@@ -72,9 +72,9 @@ class GuidancePlugin:
                         distance = result.distances[0][i] if result.distances else 1.0
                         score = 1.0 - distance
                         if score >= 0.3:  # relevance filter
-                            all_docs.append(doc)
+                            docs.append(doc)
                             meta = result.metadatas[0][i] if result.metadatas else {}
-                            all_sources.append(Source(
+                            sources.append(Source(
                                 source=meta.get("source", collection),
                                 title=meta.get("title"),
                                 uri=meta.get("uri"),
@@ -82,6 +82,16 @@ class GuidancePlugin:
                             ))
             except Exception:
                 logger.warning("Failed to query collection %s", collection)
+            return docs, sources
+
+        query_results = await asyncio.gather(
+            *[_query_collection(c) for c in DEFAULT_COLLECTIONS]
+        )
+        all_docs = []
+        all_sources = []
+        for docs, sources in query_results:
+            all_docs.extend(docs)
+            all_sources.extend(sources)
 
         context = "\n\n".join(all_docs) if all_docs else "No relevant context found."
 
