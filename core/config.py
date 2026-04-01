@@ -1,7 +1,17 @@
 from __future__ import annotations
 
-from pydantic import Field
+from enum import Enum
+
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings
+
+
+class LLMProvider(str, Enum):
+    """Supported LLM provider backends."""
+
+    mistral = "mistral"
+    openai = "openai"
+    anthropic = "anthropic"
 
 
 class BaseConfig(BaseSettings):
@@ -11,7 +21,7 @@ class BaseConfig(BaseSettings):
     unless ``validation_alias`` provides an explicit override.
     """
 
-    model_config = {"env_file": ".env", "extra": "ignore"}
+    model_config = {"env_file": ".env", "extra": "ignore", "populate_by_name": True}
 
     plugin_type: str = ""
     log_level: str = "INFO"
@@ -33,11 +43,57 @@ class BaseConfig(BaseSettings):
     vector_db_port: int = 8765
     vector_db_credentials: str | None = None
 
-    # LLM
+    # LLM — provider-agnostic configuration
+    llm_provider: LLMProvider = LLMProvider.mistral
+    llm_api_key: str | None = None
+    llm_model: str | None = None
+    llm_base_url: str | None = None
+    llm_temperature: float | None = None
+    llm_max_tokens: int | None = None
+    llm_top_p: float | None = None
+    llm_timeout: int = 120
+
+    # LLM — backward compatibility aliases (FR-009)
     mistral_api_key: str | None = None
     mistral_model_name: str | None = Field(
         default=None, validation_alias="MISTRAL_SMALL_MODEL_NAME"
     )
+
+    @model_validator(mode="after")
+    def _resolve_backward_compat_and_validate(self) -> BaseConfig:
+        # Backward compatibility: fall back to legacy Mistral env vars
+        if self.llm_provider == LLMProvider.mistral:
+            if not self.llm_api_key and self.mistral_api_key:
+                self.llm_api_key = self.mistral_api_key
+            if not self.llm_model and self.mistral_model_name:
+                self.llm_model = self.mistral_model_name
+
+        # API key required unless base_url is set (local models)
+        if not self.llm_api_key and not self.llm_base_url:
+            raise ValueError(
+                f"LLM_API_KEY is required for provider '{self.llm_provider.value}'. "
+                "Set LLM_API_KEY or provide LLM_BASE_URL for local models."
+            )
+
+        # Validate generation parameters
+        if self.llm_temperature is not None and not (0.0 <= self.llm_temperature <= 2.0):
+            raise ValueError(
+                f"LLM_TEMPERATURE must be between 0.0 and 2.0, got {self.llm_temperature}"
+            )
+        if self.llm_max_tokens is not None and self.llm_max_tokens <= 0:
+            raise ValueError(
+                f"LLM_MAX_TOKENS must be greater than 0, got {self.llm_max_tokens}"
+            )
+        if self.llm_top_p is not None and not (0.0 <= self.llm_top_p <= 1.0):
+            raise ValueError(
+                f"LLM_TOP_P must be between 0.0 and 1.0, got {self.llm_top_p}"
+            )
+        if self.llm_timeout <= 0:
+            raise ValueError(
+                f"LLM_TIMEOUT must be greater than 0, got {self.llm_timeout}"
+            )
+
+        return self
 
     # Embeddings
     embeddings_api_key: str | None = None

@@ -20,19 +20,60 @@ from core.router import Router
 logger = logging.getLogger(__name__)
 
 
+def _resolve_plugin_llm_config(config: BaseConfig) -> BaseConfig:
+    """Check for per-plugin LLM overrides via {PLUGIN_NAME}_LLM_* env vars.
+
+    If plugin-specific env vars are set, they override global LLM_* values.
+    Falls back to global config for any unset plugin-specific vars.
+    """
+    import os
+
+    plugin_name = config.plugin_type.upper().replace("-", "_") if config.plugin_type else ""
+    if not plugin_name:
+        return config
+
+    overrides: dict[str, str] = {}
+    env_mappings = {
+        "LLM_PROVIDER": "llm_provider",
+        "LLM_API_KEY": "llm_api_key",
+        "LLM_MODEL": "llm_model",
+        "LLM_BASE_URL": "llm_base_url",
+        "LLM_TEMPERATURE": "llm_temperature",
+        "LLM_MAX_TOKENS": "llm_max_tokens",
+        "LLM_TOP_P": "llm_top_p",
+    }
+
+    has_overrides = False
+    for env_suffix, field_name in env_mappings.items():
+        env_var = f"{plugin_name}_{env_suffix}"
+        value = os.environ.get(env_var)
+        if value is not None:
+            overrides[field_name] = value
+            has_overrides = True
+
+    if not has_overrides:
+        return config
+
+    # Create a new config with overrides applied on top of global values
+    merged = config.model_dump()
+    merged.update(overrides)
+    return BaseConfig(**merged)
+
+
 def _create_adapters(config: BaseConfig, container: Container) -> None:
     """Wire adapter instances into the container based on config."""
-    # LLM adapters
-    if config.mistral_api_key:
-        from core.adapters.mistral import MistralAdapter
+    # LLM adapter — unified provider factory with per-plugin override support
+    from core.provider_factory import create_llm_adapter
 
-        container.register(
-            LLMPort,
-            MistralAdapter(
-                api_key=config.mistral_api_key,
-                model_name=config.mistral_model_name or "mistral-small-latest",
-            ),
-        )
+    effective_config = _resolve_plugin_llm_config(config)
+    llm_adapter = create_llm_adapter(effective_config)
+    container.register(LLMPort, llm_adapter)
+    logger.info(
+        "LLM provider: %s | model: %s | base_url: %s",
+        effective_config.llm_provider.value,
+        effective_config.llm_model or "default",
+        effective_config.llm_base_url or "default",
+    )
 
     # Embeddings adapters
     if config.embeddings_api_key and config.embeddings_endpoint:

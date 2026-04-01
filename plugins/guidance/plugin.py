@@ -103,6 +103,7 @@ class GuidancePlugin:
                 human_language=language,
             )
 
+        logger.warning("Structured JSON parsing failed, returning raw LLM text")
         return Response(
             result=answer,
             sources=all_sources,
@@ -111,11 +112,40 @@ class GuidancePlugin:
 
     @staticmethod
     def _parse_json_sources(text: str) -> dict | None:
-        """Try to parse LLM response as JSON, stripping markdown code fences if present."""
-        if not isinstance(text, str):
+        """Try to extract and parse JSON from LLM response.
+
+        Handles: fenced JSON (```json...```), preamble text before JSON,
+        trailing text after JSON, and bare JSON objects.
+        """
+        if not isinstance(text, str) or not text.strip():
             return None
-        try:
-            cleaned = re.sub(r'^```(?:json)?\s*\n?|\n?```\s*$', '', text.strip())
-            return json.loads(cleaned)
-        except (json.JSONDecodeError, TypeError):
-            return None
+
+        # 1. Try fenced JSON block (```json ... ``` or ``` ... ```)
+        fence_match = re.search(
+            r'```(?:json)?\s*\n(.*?)\n\s*```', text, re.DOTALL
+        )
+        if fence_match:
+            try:
+                return json.loads(fence_match.group(1).strip())
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        # 2. Try to find a bare JSON object ({...}) in the text
+        brace_start = text.find("{")
+        if brace_start != -1:
+            # Find the matching closing brace
+            depth = 0
+            for i in range(brace_start, len(text)):
+                if text[i] == "{":
+                    depth += 1
+                elif text[i] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        candidate = text[brace_start : i + 1]
+                        try:
+                            return json.loads(candidate)
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+                        break
+
+        return None
