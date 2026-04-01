@@ -163,12 +163,18 @@ async def run_ingest_pipeline(
             batch_embeddings = [
                 c.embedding for c in batch if c.embedding is not None
             ]
+            if len(batch_embeddings) != len(batch):
+                errors.append(
+                    f"Storage skipped for batch {i // batch_size}: "
+                    f"expected {len(batch)} embeddings, got {len(batch_embeddings)}"
+                )
+                continue
             await knowledge_store_port.ingest(
                 collection=collection_name,
                 documents=docs,
                 metadatas=metadatas,
                 ids=ids,
-                embeddings=batch_embeddings if len(batch_embeddings) == len(batch) else None,
+                embeddings=batch_embeddings,
             )
             chunks_stored += len(batch)
         except Exception as exc:

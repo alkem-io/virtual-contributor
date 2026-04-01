@@ -112,6 +112,8 @@ class GuidancePlugin:
     @staticmethod
     def _parse_json_sources(text: str) -> dict | None:
         """Try to parse LLM response as JSON, stripping markdown code fences if present."""
+        if not isinstance(text, str):
+            return None
         try:
             cleaned = re.sub(r'^```(?:json)?\s*\n?|\n?```\s*$', '', text.strip())
             return json.loads(cleaned)

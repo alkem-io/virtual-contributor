@@ -48,23 +48,20 @@ class ChromaDBAdapter:
         query_texts: list[str],
         n_results: int = 10,
     ) -> QueryResult:
-        # Compute query embeddings externally to avoid onnxruntime dependency
-        query_embeddings = None
-        if self._embeddings:
-            query_embeddings = await self._embeddings.embed(query_texts)
+        if self._embeddings is None:
+            raise ValueError(
+                "ChromaDBAdapter requires an embeddings provider when "
+                "embedding_function=None"
+            )
+        query_embeddings = await self._embeddings.embed(query_texts)
 
         def _query():
             col = self._client.get_or_create_collection(
                 collection, embedding_function=None
             )
-            if query_embeddings is not None:
-                results = col.query(
-                    query_embeddings=query_embeddings, n_results=n_results
-                )
-            else:
-                results = col.query(
-                    query_texts=query_texts, n_results=n_results
-                )
+            results = col.query(
+                query_embeddings=query_embeddings, n_results=n_results
+            )
             return QueryResult(
                 documents=results.get("documents", []),
                 metadatas=results.get("metadatas", []),
@@ -82,14 +79,21 @@ class ChromaDBAdapter:
         ids: list[str],
         embeddings: list[list[float]] | None = None,
     ) -> None:
+        if embeddings is None:
+            raise ValueError(
+                "Precomputed embeddings are required when embedding_function=None"
+            )
+
         def _ingest():
             col = self._client.get_or_create_collection(
                 collection, embedding_function=None
             )
-            kwargs: dict = dict(documents=documents, metadatas=metadatas, ids=ids)
-            if embeddings is not None:
-                kwargs["embeddings"] = embeddings
-            col.upsert(**kwargs)
+            col.upsert(
+                documents=documents,
+                metadatas=metadatas,
+                ids=ids,
+                embeddings=embeddings,
+            )
 
         await self._retry(_ingest)
 
