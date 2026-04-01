@@ -97,26 +97,26 @@ MISTRAL_API_KEY=existing-key
 MISTRAL_SMALL_MODEL_NAME=mistral-small-latest
 ```
 
-### Per-plugin override — guidance uses Mistral, expert uses Anthropic (Story 4)
+### Per-plugin override — use `{PLUGIN_NAME}_LLM_*` (Story 4)
 
-Since each plugin runs in its own container, per-plugin override is achieved by setting different `LLM_*` env vars per container:
+Per-plugin override is achieved with prefixed variables (falling back to global `LLM_*`):
 
 ```yaml
 # K8s deployment for guidance plugin
 env:
   - name: PLUGIN_TYPE
     value: guidance
-  - name: LLM_PROVIDER
+  - name: GUIDANCE_LLM_PROVIDER
     value: mistral
-  - name: LLM_API_KEY
+  - name: GUIDANCE_LLM_API_KEY
     value: ${MISTRAL_KEY}
 
 # K8s deployment for expert plugin
 env:
   - name: PLUGIN_TYPE
     value: expert
-  - name: LLM_PROVIDER
+  - name: EXPERT_LLM_PROVIDER
     value: anthropic
-  - name: LLM_API_KEY
+  - name: EXPERT_LLM_API_KEY
     value: ${ANTHROPIC_KEY}
 ```

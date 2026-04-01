@@ -100,15 +100,16 @@ class ChromaDBAdapter:
 
     async def delete_collection(self, collection: str) -> None:
         def _delete():
-            self._client.delete_collection(collection)
-
-        try:
-            await self._retry(_delete)
-        except (ValueError, Exception) as exc:
-            if "not found" in str(exc).lower() or "does not exist" in str(exc).lower():
-                logger.warning("Collection %s not found for deletion, skipping", collection)
-            else:
+            try:
+                self._client.delete_collection(collection)
+            except Exception as exc:
+                msg = str(exc).lower()
+                if "not found" in msg or "does not exist" in msg:
+                    logger.warning("Collection %s not found for deletion, skipping", collection)
+                    return
                 raise
+
+        await self._retry(_delete)
 
     @staticmethod
     async def _retry(fn, max_retries: int = MAX_RETRIES) -> Any:
