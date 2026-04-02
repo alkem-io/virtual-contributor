@@ -2,7 +2,7 @@
 
 **Feature Branch**: `003-async-perf-optimize`  
 **Created**: 2026-04-02  
-**Status**: Draft  
+**Status**: In Progress  
 **Input**: User description: "Performance optimizations across the codebase covering parallel code execution, connection reuse, algorithmic improvements, and non-blocking I/O."
 
 ## User Scenarios & Testing *(mandatory)*
@@ -17,9 +17,10 @@ As a platform operator ingesting a large knowledge base with many documents, the
 
 **Acceptance Scenarios**:
 
-1. **Given** a batch of 10 documents each exceeding the summary length threshold, **When** the ingest pipeline runs with summarization enabled, **Then** all document summarizations execute concurrently and total summarization time is bounded by the slowest single document rather than the sum of all documents.
+1. **Given** a batch of 10 multi-chunk documents, **When** the ingest pipeline runs with summarization enabled, **Then** document summarizations execute concurrently (bounded by a configurable concurrency limit, default 8) and total summarization time is significantly reduced compared to fully sequential processing.
 2. **Given** a batch of documents during ingestion, **When** one document's summarization fails, **Then** the error is captured and all other documents still complete summarization successfully.
 3. **Given** a batch of documents during ingestion, **When** chunks are looked up per document, **Then** the lookup completes in linear time regardless of the total number of chunks.
+4. **Given** a document with only a single chunk, **When** the ingest pipeline runs with summarization enabled, **Then** the document is skipped for summarization regardless of content length.
 
 ---
 
@@ -54,7 +55,22 @@ As a system handling embedding requests and GraphQL queries with retry logic, th
 
 ---
 
-### User Story 4 - Non-blocking Web Crawling (Priority: P3)
+### User Story 4 - Stable Connections to Local LLM Servers (Priority: P2)
+
+As the system using a custom/local LLM endpoint (e.g., vLLM, Ollama, or a self-hosted Mistral server), keep-alive connections are disabled to prevent stale connection errors that occur when the server closes idle connections before the client reuses them.
+
+**Why this priority**: Local LLM servers often have shorter idle timeouts than cloud-hosted APIs. Stale keep-alive connections cause intermittent failures that are hard to diagnose. Disabling keep-alive for custom endpoints eliminates this class of errors.
+
+**Independent Test**: Can be tested by configuring a custom `llm_base_url` and verifying the underlying httpx client is created with `max_keepalive_connections=0`.
+
+**Acceptance Scenarios**:
+
+1. **Given** the system is configured with a custom `llm_base_url`, **When** the LLM adapter is created, **Then** the underlying HTTP client has keep-alive disabled (`max_keepalive_connections=0`).
+2. **Given** the system is configured without a custom `llm_base_url` (using the provider's default endpoint), **When** the LLM adapter is created, **Then** the default connection behavior is unchanged.
+
+---
+
+### User Story 5 - Non-blocking Web Crawling (Priority: P3)
 
 As the system crawling external websites for ingestion, DNS resolution does not block the async event loop, preventing stalls that could affect other concurrent operations.
 
@@ -75,37 +91,41 @@ As the system crawling external websites for ingestion, DNS resolution does not 
 - What happens when all 3 knowledge collection queries fail simultaneously? The guidance plugin returns a response based on "No relevant context found."
 - What happens when an embedding batch fails? The pipeline skips storage for that specific batch and continues with remaining batches.
 - What happens when the network connection is dropped between retries? The connection context manager handles cleanup gracefully and the outer retry logic surfaces the error.
+- What happens when the LLM adapter has no `async_client` attribute? The keep-alive disabling logic checks `hasattr` and skips reconfiguration gracefully.
 
 ## Requirements *(mandatory)*
 
 ### Functional Requirements
 
-- **FR-001**: System MUST execute document summarizations concurrently across all qualifying documents in an ingestion batch.
+- **FR-001**: System MUST execute document summarizations concurrently across all multi-chunk documents in an ingestion batch, bounded by a configurable concurrency semaphore (`SUMMARIZE_CONCURRENCY`, default: 8) to avoid overwhelming the LLM server.
 - **FR-002**: System MUST use a pre-built index for chunk-to-document lookups, avoiding repeated scans of the full chunk list per document.
 - **FR-003**: System MUST perform embedding and storage in a single pass per batch, computing text representations once and reusing them for both operations.
 - **FR-004**: System MUST execute knowledge store collection queries concurrently across all configured collections in the guidance plugin.
 - **FR-005**: System MUST reuse network connections across retry attempts in the embedding adapter.
 - **FR-006**: System MUST reuse network connections across retry attempts in the GraphQL client.
-- **FR-007**: System MUST perform DNS resolution without blocking the async event loop during URL safety validation in the web crawler.
-- **FR-008**: System MUST preserve existing error isolation -- individual failures in concurrent operations must not prevent other operations from completing.
-- **FR-009**: System MUST maintain identical functional output (same results, same error messages) as before the optimizations.
+- **FR-007**: System MUST disable keep-alive connections when a custom `llm_base_url` is configured, preventing stale connection errors with local/self-hosted LLM servers.
+- **FR-008**: System MUST perform DNS resolution without blocking the async event loop during URL safety validation in the web crawler.
+- **FR-009**: System MUST preserve existing error isolation -- individual failures in concurrent operations must not prevent other operations from completing.
+- **FR-010**: System MUST maintain identical functional output (same results, same error messages) as before the optimizations.
 
 ## Success Criteria *(mandatory)*
 
 ### Measurable Outcomes
 
-- **SC-001**: Document ingestion with summarization for N documents completes in approximately 1/Nth of the previous sequential duration (bounded by the slowest single summarization).
+- **SC-001**: Document ingestion with summarization for N documents completes significantly faster than sequential processing, with concurrency bounded by a configurable semaphore (default 8) to protect the LLM server.
 - **SC-002**: Guidance plugin query phase completes in approximately 1/3 of the previous sequential duration (bounded by the slowest single collection query).
 - **SC-003**: Document chunk lookups during summarization scale linearly with the number of chunks, not quadratically.
 - **SC-004**: Embedding and storage phases iterate through chunks once instead of twice, eliminating redundant batch computation.
 - **SC-005**: Network retry scenarios complete without redundant connection setup overhead.
-- **SC-006**: All existing tests continue to pass with identical behavior.
+- **SC-006**: Systems using custom `llm_base_url` experience no stale connection errors from keep-alive reuse.
+- **SC-007**: All existing tests continue to pass with identical behavior.
 
 ## Assumptions
 
-- The LLM provider can handle concurrent summarization requests without rate-limiting issues for typical batch sizes.
+- The LLM provider can handle concurrent summarization requests up to the configured limit (default 8, via `SUMMARIZE_CONCURRENCY`) without rate-limiting issues.
 - The knowledge store can handle concurrent query requests across different collections.
 - The embedding provider's endpoint supports connection keep-alive for reuse across retries.
 - DNS resolution latency is generally low but may spike unpredictably; offloading to a thread pool is a defensive measure.
 - Cooperative concurrency ensures thread safety for shared mutable state (e.g., error lists) without explicit locking.
+- Local/self-hosted LLM servers may close idle connections sooner than cloud providers, making keep-alive connections unreliable for custom endpoints.
 - These optimizations are backward-compatible and require no changes to external interfaces, configuration, or deployment.

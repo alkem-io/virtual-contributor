@@ -73,6 +73,7 @@ async def run_ingest_pipeline(
     batch_size: int = 20,
     summary_length: int = 10000,
     summarize: bool = False,
+    summarize_concurrency: int = 8,
 ) -> IngestResult:
     """Execute the shared ingest pipeline.
 
@@ -123,7 +124,7 @@ async def run_ingest_pipeline(
 
         async def _summarize_doc(doc: Document) -> None:
             doc_chunks = chunks_by_doc_id.get(doc.metadata.document_id, [])
-            if len(doc_chunks) > 1 and len(doc.content) > summary_length:
+            if len(doc_chunks) > 1:
                 try:
                     summary = await summarize_document(
                         [c.content for c in doc_chunks],
@@ -135,7 +136,14 @@ async def run_ingest_pipeline(
                 except Exception as exc:
                     errors.append(f"Summarization failed for {doc.metadata.document_id}: {exc}")
 
-        await asyncio.gather(*[_summarize_doc(doc) for doc in documents])
+        # Limit concurrency to avoid overwhelming the LLM server
+        sem = asyncio.Semaphore(summarize_concurrency)
+
+        async def _bounded_summarize(doc: Document) -> None:
+            async with sem:
+                await _summarize_doc(doc)
+
+        await asyncio.gather(*[_bounded_summarize(doc) for doc in documents])
 
     # Steps 3-4: Embed and store per batch (single iteration)
     chunks_stored = 0

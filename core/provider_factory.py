@@ -59,4 +59,18 @@ def create_llm_adapter(config: BaseConfig) -> LangChainLLMAdapter:
         kwargs["top_p"] = config.llm_top_p
 
     llm = model_cls(**kwargs)
+
+    # Disable keep-alive to prevent stale connections to local LLM servers.
+    # Must be done post-construction since ChatMistralAI serializes constructor kwargs.
+    if config.llm_base_url:
+        import httpx
+        no_keepalive = httpx.Limits(max_keepalive_connections=0)
+        if hasattr(llm, "async_client") and llm.async_client:
+            llm.async_client = httpx.AsyncClient(
+                base_url=config.llm_base_url,
+                limits=no_keepalive,
+                timeout=config.llm_timeout,
+                headers=llm.async_client.headers,
+            )
+
     return LangChainLLMAdapter(llm)
