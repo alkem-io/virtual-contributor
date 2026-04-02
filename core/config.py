@@ -105,6 +105,7 @@ class BaseConfig(BaseSettings):
     chunk_overlap: int = 400
     batch_size: int = 20
     summary_length: int = 10000
+    summarize_concurrency: int = 8
 
     # Health
     health_port: int = 8080

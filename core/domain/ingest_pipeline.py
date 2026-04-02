@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from enum import Enum
@@ -72,6 +73,7 @@ async def run_ingest_pipeline(
     batch_size: int = 20,
     summary_length: int = 10000,
     summarize: bool = False,
+    summarize_concurrency: int = 8,
 ) -> IngestResult:
     """Execute the shared ingest pipeline.
 
@@ -111,12 +113,18 @@ async def run_ingest_pipeline(
             success=len(errors) == 0,
         )
 
-    # Step 2: Summarize (optional)
+    # Step 2: Summarize (optional) — parallel across documents
     if summarize and llm_port:
         from core.domain.summarize_graph import summarize_document
-        for doc in documents:
-            doc_chunks = [c for c in all_chunks if c.metadata.document_id == doc.metadata.document_id]
-            if len(doc_chunks) > 1 and len(doc.content) > summary_length:
+
+        # Pre-build lookup: O(n) instead of O(n²) per-document scan
+        chunks_by_doc_id: dict[str, list[Chunk]] = {}
+        for chunk in all_chunks:
+            chunks_by_doc_id.setdefault(chunk.metadata.document_id, []).append(chunk)
+
+        async def _summarize_doc(doc: Document) -> None:
+            doc_chunks = chunks_by_doc_id.get(doc.metadata.document_id, [])
+            if len(doc_chunks) > 1:
                 try:
                     summary = await summarize_document(
                         [c.content for c in doc_chunks],
@@ -128,23 +136,28 @@ async def run_ingest_pipeline(
                 except Exception as exc:
                     errors.append(f"Summarization failed for {doc.metadata.document_id}: {exc}")
 
-    # Step 3: Embed in batches
-    for i in range(0, len(all_chunks), batch_size):
-        batch = all_chunks[i:i + batch_size]
-        texts = [c.summary or c.content for c in batch]
-        try:
-            embeddings = await embeddings_port.embed(texts)
-            for chunk, embedding in zip(batch, embeddings):
-                chunk.embedding = embedding
-        except Exception as exc:
-            errors.append(f"Embedding failed for batch {i // batch_size}: {exc}")
+        # Limit concurrency to avoid overwhelming the LLM server
+        sem = asyncio.Semaphore(summarize_concurrency)
 
-    # Step 4: Store in batches
+        async def _bounded_summarize(doc: Document) -> None:
+            async with sem:
+                await _summarize_doc(doc)
+
+        await asyncio.gather(*[_bounded_summarize(doc) for doc in documents])
+
+    # Steps 3-4: Embed and store per batch (single iteration)
     chunks_stored = 0
     for i in range(0, len(all_chunks), batch_size):
         batch = all_chunks[i:i + batch_size]
+        texts = [c.summary or c.content for c in batch]
+
         try:
-            docs = [c.summary or c.content for c in batch]
+            batch_embeddings = await embeddings_port.embed(texts)
+        except Exception as exc:
+            errors.append(f"Embedding failed for batch {i // batch_size}: {exc}")
+            continue
+
+        try:
             metadatas = [
                 {
                     "documentId": c.metadata.document_id,
@@ -156,22 +169,10 @@ async def run_ingest_pipeline(
                 }
                 for c in batch
             ]
-            ids = [
-                f"{c.metadata.document_id}-{c.chunk_index}"
-                for c in batch
-            ]
-            batch_embeddings = [
-                c.embedding for c in batch if c.embedding is not None
-            ]
-            if len(batch_embeddings) != len(batch):
-                errors.append(
-                    f"Storage skipped for batch {i // batch_size}: "
-                    f"expected {len(batch)} embeddings, got {len(batch_embeddings)}"
-                )
-                continue
+            ids = [f"{c.metadata.document_id}-{c.chunk_index}" for c in batch]
             await knowledge_store_port.ingest(
                 collection=collection_name,
-                documents=docs,
+                documents=texts,
                 metadatas=metadatas,
                 ids=ids,
                 embeddings=batch_embeddings,
