@@ -73,10 +73,11 @@ class GuidancePlugin:
                         score = 1.0 - distance
                         docs.append(doc)
                         meta = result.metadatas[0][i] if result.metadatas else {}
+                        source_url = meta.get("source", collection)
                         sources.append(Source(
-                            source=meta.get("source", collection),
+                            source=source_url,
                             title=meta.get("title"),
-                            uri=meta.get("uri"),
+                            uri=source_url,
                             score=score,
                         ))
             except Exception:
@@ -86,11 +87,26 @@ class GuidancePlugin:
         query_results = await asyncio.gather(
             *[_query_collection(c) for c in DEFAULT_COLLECTIONS]
         )
-        all_docs = []
-        all_sources = []
+        all_pairs: list[tuple[str, Source]] = []
         for docs, sources in query_results:
-            all_docs.extend(docs)
-            all_sources.extend(sources)
+            all_pairs.extend(zip(docs, sources))
+
+        # Sort by relevance (highest score first)
+        all_pairs.sort(key=lambda p: p[1].score or 0, reverse=True)
+
+        # Deduplicate by source URL, keeping the highest-scoring chunk per page
+        seen_sources: set[str] = set()
+        deduped: list[tuple[str, Source]] = []
+        for doc, src in all_pairs:
+            key = src.source or ""
+            if key not in seen_sources:
+                seen_sources.add(key)
+                deduped.append((doc, src))
+
+        deduped = deduped[:5]
+
+        all_docs = [doc for doc, _ in deduped]
+        all_sources = [src for _, src in deduped]
 
         context = "\n\n".join(all_docs) if all_docs else "No relevant context found."
 

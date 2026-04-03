@@ -84,13 +84,15 @@ class IngestWebsitePlugin:
                 )
 
             # Run ingest pipeline
-            engine = IngestEngine(steps=[
-                ChunkStep(chunk_size=2000),
-                DocumentSummaryStep(llm_port=self._llm),
-                BodyOfKnowledgeSummaryStep(llm_port=self._llm),
-                EmbedStep(embeddings_port=self._embeddings),
-                StoreStep(knowledge_store_port=self._knowledge_store),
-            ])
+            from core.config import BaseConfig
+            config = BaseConfig()
+            steps = [ChunkStep(chunk_size=2000)]
+            if config.summarize_concurrency > 0:
+                steps.append(DocumentSummaryStep(llm_port=self._llm, concurrency=config.summarize_concurrency))
+                steps.append(BodyOfKnowledgeSummaryStep(llm_port=self._llm))
+            steps.append(EmbedStep(embeddings_port=self._embeddings))
+            steps.append(StoreStep(knowledge_store_port=self._knowledge_store))
+            engine = IngestEngine(steps=steps)
             result = await engine.run(documents, collection_name)
 
             return IngestWebsiteResult(
