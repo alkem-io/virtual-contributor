@@ -71,15 +71,14 @@ class GuidancePlugin:
                     for i, doc in enumerate(result.documents[0]):
                         distance = result.distances[0][i] if result.distances else 1.0
                         score = 1.0 - distance
-                        if score >= 0.3:  # relevance filter
-                            docs.append(doc)
-                            meta = result.metadatas[0][i] if result.metadatas else {}
-                            sources.append(Source(
-                                source=meta.get("source", collection),
-                                title=meta.get("title"),
-                                uri=meta.get("uri"),
-                                score=score,
-                            ))
+                        docs.append(doc)
+                        meta = result.metadatas[0][i] if result.metadatas else {}
+                        sources.append(Source(
+                            source=meta.get("source", collection),
+                            title=meta.get("title"),
+                            uri=meta.get("uri"),
+                            score=score,
+                        ))
             except Exception:
                 logger.warning("Failed to query collection %s", collection)
             return docs, sources
