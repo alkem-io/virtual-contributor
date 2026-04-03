@@ -73,4 +73,4 @@ def create_llm_adapter(config: BaseConfig) -> LangChainLLMAdapter:
                 headers=llm.async_client.headers,
             )
 
-    return LangChainLLMAdapter(llm)
+    return LangChainLLMAdapter(llm, timeout=float(config.llm_timeout))

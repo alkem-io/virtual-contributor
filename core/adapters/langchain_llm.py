@@ -41,18 +41,30 @@ class LangChainLLMAdapter:
     for invoke and streaming support via astream.
     """
 
-    def __init__(self, llm) -> None:
+    def __init__(self, llm, timeout: float = 120.0) -> None:
         self._llm = llm
+        self._timeout = timeout
 
     async def invoke(self, messages: list[dict]) -> str:
         lc_messages = _to_langchain_messages(messages)
         last_exc: Exception | None = None
         for attempt in range(MAX_RETRIES):
             try:
-                result = await self._llm.ainvoke(lc_messages)
+                result = await asyncio.wait_for(
+                    self._llm.ainvoke(lc_messages), timeout=self._timeout
+                )
                 return str(result.content)
+            except asyncio.TimeoutError:
+                last_exc = TimeoutError(
+                    f"LLM call timed out after {self._timeout}s"
+                )
+                logger.warning(
+                    "LLM invoke attempt %d timed out after %.0fs, retrying",
+                    attempt + 1,
+                    self._timeout,
+                )
+                await asyncio.sleep(BASE_DELAY * (2**attempt))
             except (ConnectionError, OSError) as exc:
-                # Connection errors to local endpoints — fail fast with clear message
                 raise ConnectionError(
                     f"Failed to connect to LLM endpoint: {exc}. "
                     "If using a local model, ensure the server is running."
