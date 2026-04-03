@@ -5,7 +5,14 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from core.domain.ingest_pipeline import run_ingest_pipeline
+from core.domain.pipeline import (
+    BodyOfKnowledgeSummaryStep,
+    ChunkStep,
+    DocumentSummaryStep,
+    EmbedStep,
+    IngestEngine,
+    StoreStep,
+)
 from core.events.ingest_space import (
     ErrorDetail,
     IngestBodyOfKnowledge,
@@ -67,16 +74,14 @@ class IngestSpacePlugin:
             await self._knowledge_store.delete_collection(collection_name)
 
             # Run ingest pipeline with ingest-space specific settings
-            result = await run_ingest_pipeline(
-                documents=documents,
-                collection_name=collection_name,
-                embeddings_port=self._embeddings,
-                knowledge_store_port=self._knowledge_store,
-                llm_port=self._llm,
-                chunk_size=9000,
-                chunk_overlap=500,
-                summarize=True,
-            )
+            engine = IngestEngine(steps=[
+                ChunkStep(chunk_size=9000, chunk_overlap=500),
+                DocumentSummaryStep(llm_port=self._llm),
+                BodyOfKnowledgeSummaryStep(llm_port=self._llm),
+                EmbedStep(embeddings_port=self._embeddings),
+                StoreStep(knowledge_store_port=self._knowledge_store),
+            ])
+            result = await engine.run(documents, collection_name)
 
             return IngestBodyOfKnowledgeResult(
                 body_of_knowledge_id=bok_id,
