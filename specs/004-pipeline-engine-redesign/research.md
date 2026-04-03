@@ -111,21 +111,21 @@
 - Separate embedding strategies per chunk type: Over-complicated, same result
 - Remove summary field entirely: Breaking change, violates FR-015
 
-## Decision 8: StoreStep Embedding Safety Guard
+## Decision 8: StoreStep Always Requires Precomputed Embeddings
 
-**Decision**: StoreStep detects whether an EmbedStep ran by checking if any chunk has a precomputed embedding. When embeddings exist, it only stores chunks that have embeddings — skipping unembedded chunks with an error. When no chunks have embeddings, it stores all chunks and delegates embedding to the knowledge store.
+**Decision**: StoreStep only stores chunks that have precomputed embeddings. Chunks without embeddings are unconditionally skipped with an error. EmbedStep is a required predecessor to StoreStep.
 
 **Rationale**:
-- If EmbedStep partially fails (e.g., embedding service timeout on one batch), some chunks have embeddings from the pipeline's embedding model and others have none
-- Storing unembedded chunks alongside embedded ones would cause ChromaDB to embed those chunks with its default model — a different model producing incompatible vectors in the same collection
-- This creates a mixed vector space where similarity search produces wrong results
-- Skipping unembedded chunks preserves vector space consistency at the cost of completeness
-- When no EmbedStep is in the pipeline at all, all chunks are stored without embeddings, allowing the knowledge store to handle embedding uniformly
+- The ChromaDB adapter is configured with `embedding_function=None` and rejects `embeddings=None` at ingest time (see `core/adapters/chromadb.py:82-85`)
+- There is no path in the current system where ChromaDB can compute embeddings itself
+- If EmbedStep partially fails, some chunks have embeddings and others don't — storing only the embedded ones preserves vector space consistency
+- The previous design had a two-path fork (detect whether EmbedStep ran, store all if not), but the "no EmbedStep" path always failed at the adapter level — the fork was dead code that masked a runtime error
+- Simplifying to a single path (always require embeddings) is honest about the system's actual constraints
 
 **Alternatives considered**:
-- Store all chunks regardless: Creates mixed embedding model vectors in the same collection — corrupts retrieval
-- Fail the entire batch if any chunk lacks embeddings: Too aggressive, discards successfully embedded chunks
-- Re-embed failed chunks inline: Violates the step separation principle; EmbedStep is the embedding boundary
+- Two-path fork (detect EmbedStep presence): Dead code — the "no EmbedStep" path fails at the adapter. Removed.
+- Store all chunks regardless: ChromaDB adapter rejects `embeddings=None`
+- Re-embed failed chunks inline: Violates step separation; EmbedStep is the embedding boundary
 
 ## Decision 9: Accurate `chunks_stored` Tracking
 
@@ -140,9 +140,23 @@
 - Return stored count from StoreStep.execute(): Requires changing the PipelineStep protocol return type, breaking all steps
 - Post-hoc query ChromaDB for count: Network round-trip, race conditions, over-engineered
 
-## Decision 10: Single-Section Full Budget in Refine Summarization
+## Decision 10: BoK Filtering Uses `embedding_type` Instead of String Suffix
 
-**Decision**: When `_refine_summarize` receives a single section/chunk, it assigns `progress = 1.0` (full 100% budget) instead of using the general formula which produces 40%.
+**Decision**: BodyOfKnowledgeSummaryStep identifies raw document chunks by checking `embedding_type != "summary"` instead of `not document_id.endswith("-summary")`.
+
+**Rationale**:
+- The previous `endswith("-summary")` heuristic would silently exclude any real document whose ID happens to end in `-summary` (e.g., a URL like `https://example.com/executive-summary`)
+- It would also cause a ChromaDB ID collision: if document "alpha" exists, its summary chunk gets `document_id="alpha-summary"`, which collides with a real document named "alpha-summary" at the storage ID level (`alpha-summary-0`)
+- `embedding_type` is already set explicitly by each step: `"chunk"` for raw chunks, `"summary"` for generated summaries — this is the authoritative signal for chunk kind
+- Filtering by `embedding_type` is O(1) per chunk with no string manipulation, and cannot produce false positives regardless of document ID content
+
+**Alternatives considered**:
+- Keep `endswith("-summary")`: Fragile, creates collision risk documented above
+- Add a separate `record_kind` field to DocumentMetadata: Unnecessary — `embedding_type` already carries this information
+
+## Decision 11: Single-Section Full Budget in Refine Summarization
+
+**Decision**: When `_refine_summarize` receives a single section/chunk, it assigns `progress = 1.0` (full 100% budget) instead of the general formula which produces 40%.
 
 **Rationale**:
 - The progressive budgeting formula `budget = max_length * (0.4 + 0.6 * progress)` is designed for multi-chunk refinement where early chunks get less space to leave room for later refinement

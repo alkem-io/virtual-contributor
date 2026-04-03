@@ -106,13 +106,17 @@ tests/
 
 ## Post-Implementation Corrections
 
-Three correctness bugs were identified during code review and fixed:
+Five issues identified during code review (internal + CodeRabbit PR review) and fixed:
 
 1. **`chunks_stored` accuracy** (engine.py, steps.py): `IngestResult.chunks_stored` was using `len(context.chunks)` — total chunks produced, not actually persisted. Fixed by adding `chunks_stored: int` to `PipelineContext`, incremented by StoreStep only on successful batch persistence. See research.md Decision 9.
 
-2. **StoreStep embedding safety** (steps.py): When EmbedStep partially failed, StoreStep sent unembedded chunks to ChromaDB with `embeddings=None`, causing ChromaDB to re-embed them with a different model — creating mixed vector spaces. Fixed by detecting whether EmbedStep ran and skipping unembedded chunks when it did. See research.md Decision 8.
+2. **StoreStep always requires embeddings** (steps.py): StoreStep had a two-path fork detecting whether EmbedStep ran. The "no EmbedStep" path passed `embeddings=None` to the adapter, but the ChromaDB adapter rejects this (`embedding_function=None` requires precomputed embeddings). Simplified to always require embeddings — chunks without embeddings are unconditionally skipped. See research.md Decision 8.
 
-3. **Single-section budget** (steps.py): `_refine_summarize` with 1 section computed `progress=0`, giving only 40% of the budget instead of 100%. Fixed by special-casing `progress=1.0` when `len(chunks)==1`. See research.md Decision 10.
+3. **Single-section budget** (steps.py): `_refine_summarize` with 1 section computed `progress=0`, giving only 40% of the budget instead of 100%. Fixed by special-casing `progress=1.0` when `len(chunks)==1`. See research.md Decision 11.
+
+4. **BoK filtering fragility** (steps.py): BodyOfKnowledgeSummaryStep used `endswith("-summary")` to distinguish raw chunks from summaries, which would silently exclude real documents with IDs ending in "-summary" and create ChromaDB ID collisions. Fixed by filtering on `embedding_type != "summary"` instead. See research.md Decision 10.
+
+5. **Duplicate tests removed** (test_ingest_website.py, test_ingest_space.py): Removed duplicate test methods that provided no additional coverage.
 
 ## Complexity Tracking
 

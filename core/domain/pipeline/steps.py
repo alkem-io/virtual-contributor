@@ -190,11 +190,11 @@ class BodyOfKnowledgeSummaryStep:
         return "body_of_knowledge_summary"
 
     async def execute(self, context: PipelineContext) -> None:
-        # Collect text per unique document_id from chunks
+        # Collect unique document IDs from raw chunks (exclude summaries)
         seen_doc_ids: list[str] = []
         for chunk in context.chunks:
             doc_id = chunk.metadata.document_id
-            if doc_id not in seen_doc_ids and not doc_id.endswith("-summary"):
+            if doc_id not in seen_doc_ids and chunk.metadata.embedding_type != "summary":
                 seen_doc_ids.append(doc_id)
 
         if not seen_doc_ids:
@@ -204,9 +204,8 @@ class BodyOfKnowledgeSummaryStep:
         sections: list[str] = []
         chunks_by_doc: dict[str, list[str]] = {}
         for chunk in context.chunks:
-            did = chunk.metadata.document_id
-            if not did.endswith("-summary"):
-                chunks_by_doc.setdefault(did, []).append(chunk.content)
+            if chunk.metadata.embedding_type != "summary":
+                chunks_by_doc.setdefault(chunk.metadata.document_id, []).append(chunk.content)
 
         for doc_id in seen_doc_ids:
             if doc_id in context.document_summaries:
@@ -298,17 +297,12 @@ class StoreStep:
         return "store"
 
     async def execute(self, context: PipelineContext) -> None:
-        has_any_embeddings = any(c.embedding is not None for c in context.chunks)
-
-        if has_any_embeddings:
-            storable = [c for c in context.chunks if c.embedding is not None]
-            skipped = len(context.chunks) - len(storable)
-            if skipped > 0:
-                context.errors.append(
-                    f"StoreStep: skipped {skipped} chunks without embeddings"
-                )
-        else:
-            storable = context.chunks
+        storable = [c for c in context.chunks if c.embedding is not None]
+        skipped = len(context.chunks) - len(storable)
+        if skipped > 0:
+            context.errors.append(
+                f"StoreStep: skipped {skipped} chunks without embeddings"
+            )
 
         for i in range(0, len(storable), self._batch_size):
             batch = storable[i : i + self._batch_size]
@@ -326,9 +320,7 @@ class StoreStep:
                 for c in batch
             ]
             ids = [f"{c.metadata.document_id}-{c.chunk_index}" for c in batch]
-            batch_embeddings = (
-                [c.embedding for c in batch] if has_any_embeddings else None
-            )
+            batch_embeddings = [c.embedding for c in batch]
 
             try:
                 await self._store.ingest(

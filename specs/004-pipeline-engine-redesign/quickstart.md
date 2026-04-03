@@ -79,13 +79,13 @@ EmbedStep --- calls EmbeddingsPort in batches, attaches embeddings to all chunks
     |
     v
 StoreStep --- persists embedded chunks to ChromaDB in batches
-    |           skips unembedded chunks when EmbedStep ran (embedding safety)
+    |           skips chunks without embeddings (EmbedStep is required)
     |           tracks actual stored count in context.chunks_stored
     v
 IngestResult (collection_name, documents_processed, chunks_stored, errors, success)
 ```
 
-**Note**: `chunks_stored` reflects what was actually persisted, not total chunks produced. If EmbedStep partially fails, StoreStep skips unembedded chunks to prevent embedding model mismatch in ChromaDB.
+**Note**: `chunks_stored` reflects what was actually persisted, not total chunks produced. StoreStep requires precomputed embeddings on every chunk — the ChromaDB adapter rejects `embeddings=None`. If EmbedStep partially fails, only successfully embedded chunks are stored.
 
 ## Testing a Step in Isolation
 

@@ -102,7 +102,7 @@ StoreStep(
 
 Requires: KnowledgeStorePort
 
-**Embedding safety**: When any chunk has a precomputed embedding (EmbedStep ran), StoreStep only stores chunks with embeddings — chunks without embeddings are skipped to prevent embedding model mismatch. When no chunks have embeddings (no EmbedStep), all chunks are stored and embedding is delegated to the knowledge store. Tracks successful persists via `context.chunks_stored`.
+**Embedding requirement**: StoreStep only stores chunks with precomputed embeddings. Chunks without embeddings are skipped with an error. The ChromaDB adapter requires precomputed embeddings (`embedding_function=None`), making EmbedStep a required predecessor. Tracks successful persists via `context.chunks_stored`.
 
 ## Composition Examples
 
@@ -138,4 +138,4 @@ The engine does NOT validate step ordering. Plugin authors are responsible for c
 2. **DocumentSummaryStep** must precede **BodyOfKnowledgeSummaryStep** (produces document summaries)
 3. **EmbedStep** must precede **StoreStep** (produces embeddings)
 4. Summary steps are optional — omitting them skips LLM calls entirely
-5. **EmbedStep** is optional — omitting it causes StoreStep to delegate embedding to the knowledge store. However, if EmbedStep is present and partially fails, StoreStep will skip unembedded chunks to maintain vector space consistency.
+5. **EmbedStep** is required before **StoreStep** — the ChromaDB adapter requires precomputed embeddings. Omitting EmbedStep causes StoreStep to skip all chunks. If EmbedStep partially fails, StoreStep stores only the successfully embedded chunks.

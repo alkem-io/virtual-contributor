@@ -330,8 +330,8 @@ class TestStoreStep:
         assert store.collections["c"][0]["document"] == "embedded"
         assert any("skipped 1 chunks without embeddings" in e for e in ctx.errors)
 
-    async def test_stores_all_when_no_embeddings(self):
-        """When no chunks have embeddings, store all (no EmbedStep in pipeline)."""
+    async def test_skips_all_when_no_embeddings(self):
+        """Chunks without embeddings are always skipped (EmbedStep is required)."""
         store = MockKnowledgeStorePort()
         meta = DocumentMetadata(document_id="d", source="s", embedding_type="chunk")
         ctx = PipelineContext(
@@ -343,8 +343,9 @@ class TestStoreStep:
             ],
         )
         await StoreStep(knowledge_store_port=store).execute(ctx)
-        assert ctx.chunks_stored == 2
-        assert len(store.collections["c"]) == 2
+        assert ctx.chunks_stored == 0
+        assert "c" not in store.collections
+        assert any("skipped 2 chunks" in e for e in ctx.errors)
 
     async def test_step_name(self):
         store = MockKnowledgeStorePort()
@@ -536,23 +537,26 @@ class TestIngestEngine:
     async def test_metrics_recorded_per_step(self):
         embeddings = MockEmbeddingsPort()
         store = MockKnowledgeStorePort()
+        captured: dict = {}
 
-        engine = IngestEngine(steps=[
-            ChunkStep(chunk_size=100, chunk_overlap=10),
-            EmbedStep(embeddings_port=embeddings),
-            StoreStep(knowledge_store_port=store),
-        ])
         class MetricCapture:
             @property
             def name(self):
                 return "capture"
 
             async def execute(self, context):
-                pass
+                captured["metrics"] = dict(context.metrics)
 
-        engine._steps.append(MetricCapture())  # type: ignore[arg-type]
+        engine = IngestEngine(steps=[
+            ChunkStep(chunk_size=100, chunk_overlap=10),
+            EmbedStep(embeddings_port=embeddings),
+            StoreStep(knowledge_store_port=store),
+            MetricCapture(),  # type: ignore[list-item]
+        ])
         result = await engine.run([_make_doc()], "metric-test")
 
-        # We can't directly access context, but we can verify the result is correct
         assert result.success is True
         assert result.chunks_stored > 0
+        metrics = captured["metrics"]
+        assert {"chunk", "embed", "store"} <= set(metrics)
+        assert all(m.duration >= 0 for m in metrics.values())

@@ -155,7 +155,7 @@ class PipelineStep(Protocol):
 - **Writes**: Appends one BoK summary Chunk to context.chunks
 - **Config**: summary_length (int, default 2000)
 - **Ports**: LLMPort (constructor injected)
-- **Behavior**: For each unique document_id in chunks:
+- **Behavior**: Identifies raw document chunks by filtering on `embedding_type != "summary"`. For each unique document_id in raw chunks:
   - If document_summaries has a summary for it, use that
   - Otherwise, concatenate raw chunk content
 - Generates single overview via refine pattern with BoK-specific prompt.
@@ -183,8 +183,8 @@ class PipelineStep(Protocol):
 - **Behavior**: Processes chunks in batches. Builds metadata dict:
   - documentId, source, type, title, embeddingType, chunkIndex
 - Creates IDs as `{document_id}-{chunk_index}`.
-- **Embedding safety**: When any chunks in the context have precomputed embeddings (meaning EmbedStep ran), only chunks with embeddings are stored — chunks without embeddings are skipped with an error to prevent storing entries with mismatched embedding models. When no chunks have embeddings (no EmbedStep in pipeline), all chunks are stored and embedding is delegated to the knowledge store.
-- Calls knowledge_store_port.ingest() with precomputed embeddings (or None when no EmbedStep).
+- **Embedding requirement**: Only stores chunks that have precomputed embeddings. Chunks without embeddings are skipped with an error. The current ChromaDB adapter requires precomputed embeddings (`embedding_function=None`), making EmbedStep a required predecessor.
+- Calls knowledge_store_port.ingest() with precomputed embeddings.
 - Increments context.chunks_stored only on successful batch persistence.
 - Per-batch errors are captured without halting (FR-009).
 - Insert-only — never deletes (FR-016).
