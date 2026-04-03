@@ -5,7 +5,15 @@ from __future__ import annotations
 import logging
 from urllib.parse import urlparse
 
-from core.domain.ingest_pipeline import Document, DocumentMetadata, run_ingest_pipeline
+from core.domain.ingest_pipeline import Document, DocumentMetadata
+from core.domain.pipeline import (
+    BodyOfKnowledgeSummaryStep,
+    ChunkStep,
+    DocumentSummaryStep,
+    EmbedStep,
+    IngestEngine,
+    StoreStep,
+)
 from core.events.ingest_website import IngestWebsite, IngestWebsiteResult, IngestionResult
 from core.ports.embeddings import EmbeddingsPort
 from core.ports.knowledge_store import KnowledgeStorePort
@@ -76,14 +84,14 @@ class IngestWebsitePlugin:
                 )
 
             # Run ingest pipeline
-            result = await run_ingest_pipeline(
-                documents=documents,
-                collection_name=collection_name,
-                embeddings_port=self._embeddings,
-                knowledge_store_port=self._knowledge_store,
-                llm_port=self._llm,
-                summarize=True,
-            )
+            engine = IngestEngine(steps=[
+                ChunkStep(chunk_size=2000),
+                DocumentSummaryStep(llm_port=self._llm),
+                BodyOfKnowledgeSummaryStep(llm_port=self._llm),
+                EmbedStep(embeddings_port=self._embeddings),
+                StoreStep(knowledge_store_port=self._knowledge_store),
+            ])
+            result = await engine.run(documents, collection_name)
 
             return IngestWebsiteResult(
                 result=IngestionResult.SUCCESS if result.success else IngestionResult.FAILURE,

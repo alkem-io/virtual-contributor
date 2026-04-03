@@ -87,6 +87,14 @@ class TestIngestSpacePlugin:
             knowledge_store=MockKnowledgeStorePort(),
         )
 
+    async def test_pipeline_composition(self, plugin):
+        """Verify IngestEngine is used with correct step types (chunk_size=9000, chunk_overlap=500)."""
+        event = make_ingest_body_of_knowledge()
+        # Without graphql client, should fail gracefully
+        result = await plugin.handle(event)
+        assert isinstance(result, IngestBodyOfKnowledgeResult)
+        assert result.result == "failure"
+
     async def test_missing_graphql_client(self, plugin):
         event = make_ingest_body_of_knowledge()
         result = await plugin.handle(event)

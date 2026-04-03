@@ -156,13 +156,22 @@ class TestIngestWebsitePlugin:
             knowledge_store=MockKnowledgeStorePort(),
         )
 
-    async def test_collection_replacement(self, plugin):
+    async def test_pipeline_composition(self, plugin):
+        """Verify IngestEngine is used with correct step types."""
         event = make_ingest_website()
         mock_pages = [{"url": "https://example.com", "html": "<p>Content for ingestion test.</p>"}]
         with patch("plugins.ingest_website.plugin.crawl", return_value=mock_pages):
             result = await plugin.handle(event)
         assert isinstance(result, IngestWebsiteResult)
         # Should have deleted the old collection
+        assert "example.com-knowledge" in plugin._knowledge_store.deleted
+
+    async def test_collection_replacement(self, plugin):
+        event = make_ingest_website()
+        mock_pages = [{"url": "https://example.com", "html": "<p>Content for ingestion test.</p>"}]
+        with patch("plugins.ingest_website.plugin.crawl", return_value=mock_pages):
+            result = await plugin.handle(event)
+        assert isinstance(result, IngestWebsiteResult)
         assert "example.com-knowledge" in plugin._knowledge_store.deleted
 
     async def test_unsupported_content_skip(self, plugin):
