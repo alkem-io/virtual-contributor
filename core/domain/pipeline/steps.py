@@ -112,7 +112,7 @@ class DocumentSummaryStep:
     def __init__(
         self,
         llm_port: LLMPort,
-        summary_length: int = 2000,
+        summary_length: int = 10000,
         concurrency: int = 8,
     ) -> None:
         self._llm = llm_port
@@ -180,7 +180,7 @@ class BodyOfKnowledgeSummaryStep:
     def __init__(
         self,
         llm_port: LLMPort,
-        summary_length: int = 2000,
+        summary_length: int = 10000,
     ) -> None:
         self._llm = llm_port
         self._summary_length = summary_length
@@ -308,18 +308,24 @@ class StoreStep:
             batch = storable[i : i + self._batch_size]
 
             documents = [c.content for c in batch]
-            metadatas = [
-                {
-                    "documentId": c.metadata.document_id,
+            metadatas = []
+            ids = []
+            for c in batch:
+                # Raw chunks get "{id}-chunk{i}" format matching the original repo.
+                # Summary and BoK chunks keep their document_id as-is.
+                if c.metadata.embedding_type == "chunk":
+                    storage_id = f"{c.metadata.document_id}-chunk{c.chunk_index}"
+                else:
+                    storage_id = c.metadata.document_id
+                metadatas.append({
+                    "documentId": storage_id,
                     "source": c.metadata.source,
                     "type": c.metadata.type,
                     "title": c.metadata.title,
                     "embeddingType": c.metadata.embedding_type,
                     "chunkIndex": c.chunk_index,
-                }
-                for c in batch
-            ]
-            ids = [f"{c.metadata.document_id}-{c.chunk_index}" for c in batch]
+                })
+                ids.append(f"{storage_id}-{c.chunk_index}")
             batch_embeddings = [c.embedding for c in batch]
 
             try:
