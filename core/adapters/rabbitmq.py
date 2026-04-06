@@ -79,16 +79,18 @@ class RabbitMQAdapter:
         await q.bind(self._exchange, routing_key=queue)
 
         max_retries = self._max_retries
+        exchange = self._exchange
+        assert exchange is not None, "consume() called before connect()"
 
         async def on_message(message: aio_pika.abc.AbstractIncomingMessage) -> None:
             headers = message.headers or {}
-            retry_count = headers.get("x-retry-count", 0)
+            retry_count = int(headers.get("x-retry-count", 0))
 
             try:
-                async with message.process(requeue=False):
-                    body = json.loads(message.body.decode("utf-8"))
-                    logger.info("Received message on queue %s (attempt %d/%d)", queue, retry_count + 1, max_retries)
-                    await callback(body)
+                body = json.loads(message.body.decode("utf-8"))
+                logger.info("Received message on queue %s (attempt %d/%d)", queue, retry_count + 1, max_retries)
+                await callback(body)
+                await message.ack()
             except Exception as exc:
                 if retry_count < max_retries - 1:
                     logger.warning(
@@ -102,12 +104,17 @@ class RabbitMQAdapter:
                         content_type=message.content_type,
                         headers=new_headers,
                     )
-                    await self._exchange.publish(retry_msg, routing_key=queue)
+                    try:
+                        await exchange.publish(retry_msg, routing_key=queue)
+                    except Exception as pub_exc:
+                        logger.error("Failed to republish retry message: %s", pub_exc)
+                    await message.reject(requeue=False)
                 else:
                     logger.error(
                         "Message failed after %d attempts, discarding: %s",
                         max_retries, exc,
                     )
+                    await message.reject(requeue=False)
 
         await q.consume(on_message)
         logger.info("Consuming from queue: %s", queue)

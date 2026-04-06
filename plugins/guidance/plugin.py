@@ -110,8 +110,8 @@ class GuidancePlugin:
         # Deduplicate by source URL, keeping the highest-scoring chunk per page
         seen_sources: set[str] = set()
         deduped: list[tuple[str, Source]] = []
-        for doc, src in all_pairs:
-            key = src.source or ""
+        for idx, (doc, src) in enumerate(all_pairs):
+            key = src.source or f"__no_source_{idx}__"
             if key not in seen_sources:
                 seen_sources.add(key)
                 deduped.append((doc, src))

@@ -94,6 +94,14 @@ class BaseConfig(BaseSettings):
             raise ValueError(
                 f"LLM_TIMEOUT must be greater than 0, got {self.llm_timeout}"
             )
+        if self.rabbitmq_heartbeat < 0:
+            raise ValueError(
+                f"RABBITMQ_HEARTBEAT must be >= 0, got {self.rabbitmq_heartbeat}"
+            )
+        if self.rabbitmq_max_retries < 1:
+            raise ValueError(
+                f"RABBITMQ_MAX_RETRIES must be >= 1, got {self.rabbitmq_max_retries}"
+            )
 
         return self
 
