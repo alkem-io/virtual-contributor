@@ -155,6 +155,11 @@ class ChangeDetectionStep:
             context.unchanged_chunk_hashes.clear()
             context.orphan_ids.clear()
             context.removed_document_ids.clear()
+            context.changed_document_ids.clear()
+            context.chunks_skipped = 0
+            for chunk in context.chunks:
+                if chunk.metadata.embedding_type == "chunk":
+                    chunk.embedding = None
 
     async def _detect(self, context: PipelineContext) -> None:
         # Collect current document IDs from content chunks
@@ -318,8 +323,12 @@ class BodyOfKnowledgeSummaryStep:
         return "body_of_knowledge_summary"
 
     async def execute(self, context: PipelineContext) -> None:
-        # Skip if change detection ran and found no changes
-        if context.change_detection_ran and not context.changed_document_ids:
+        # Skip if change detection ran and found no changes or removals
+        if (
+            context.change_detection_ran
+            and not context.changed_document_ids
+            and not context.removed_document_ids
+        ):
             return
 
         # Collect unique document IDs from raw chunks (exclude summaries)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from core.domain.ingest_pipeline import Chunk, Document, DocumentMetadata, IngestResult
 from core.domain.pipeline.engine import IngestEngine, PipelineContext
+from core.ports.knowledge_store import GetResult
 from core.domain.pipeline.steps import (
     BodyOfKnowledgeSummaryStep,
     ChangeDetectionStep,
@@ -658,10 +659,17 @@ class TestChangeDetectionStep:
         assert "doc-2" in ctx.removed_document_ids
 
     async def test_fallback_on_store_failure(self):
-        """When store raises, all chunks treated as new (full re-embedding)."""
+        """When store raises, all chunks treated as new — full state reset."""
+        call_count = 0
 
-        class FailingStore:
+        class FailOnSecondCallStore:
             async def get(self, **kwargs):
+                nonlocal call_count
+                call_count += 1
+                if call_count == 1:
+                    # First call succeeds (all-existing query)
+                    return GetResult(ids=["hash-1"], metadatas=[{"documentId": "doc-1", "embeddingType": "chunk"}])
+                # Second call (per-doc query) fails
                 raise RuntimeError("Store unavailable")
             async def ingest(self, **kwargs):
                 pass
@@ -676,10 +684,13 @@ class TestChangeDetectionStep:
         chunk = Chunk(content="text", metadata=meta, chunk_index=0, content_hash="hash-1")
 
         ctx = PipelineContext(collection_name="coll", documents=[], chunks=[chunk])
-        await ChangeDetectionStep(knowledge_store_port=FailingStore()).execute(ctx)  # type: ignore[arg-type]
+        await ChangeDetectionStep(knowledge_store_port=FailOnSecondCallStore()).execute(ctx)  # type: ignore[arg-type]
 
         assert len(ctx.unchanged_chunk_hashes) == 0
         assert len(ctx.orphan_ids) == 0
+        assert len(ctx.changed_document_ids) == 0
+        assert ctx.chunks_skipped == 0
+        assert ctx.change_detection_ran is False
         assert chunk.embedding is None
 
     async def test_summary_chunks_not_flagged_as_removed(self):
@@ -936,6 +947,30 @@ class TestBoKSummaryStepDedup:
         )
         ctx.change_detection_ran = True
         ctx.changed_document_ids = {"d1"}
+
+        await BodyOfKnowledgeSummaryStep(llm_port=llm).execute(ctx)
+
+        bok = [c for c in ctx.chunks if c.metadata.document_id == "body-of-knowledge-summary"]
+        assert len(bok) == 1
+        assert len(llm.calls) > 0
+
+    async def test_regenerates_when_documents_removed(self):
+        """BoK summary regenerates when documents are removed even if no content changed."""
+        llm = MockLLMPort(response="Updated BoK after removal")
+        ctx = PipelineContext(
+            collection_name="test",
+            documents=[],
+            chunks=[
+                Chunk(
+                    content="text",
+                    metadata=DocumentMetadata(document_id="d1", source="s", embedding_type="chunk"),
+                    chunk_index=0,
+                ),
+            ],
+        )
+        ctx.change_detection_ran = True
+        # No changed docs, but a document was removed
+        ctx.removed_document_ids = {"d2"}
 
         await BodyOfKnowledgeSummaryStep(llm_port=llm).execute(ctx)
 
