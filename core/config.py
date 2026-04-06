@@ -37,6 +37,8 @@ class BaseConfig(BaseSettings):
         default="event-bus", validation_alias="RABBITMQ_EVENT_BUS_EXCHANGE"
     )
     rabbitmq_result_routing_key: str = "invoke-engine-result"
+    rabbitmq_heartbeat: int = 300
+    rabbitmq_max_retries: int = 3
 
     # ChromaDB / Vector DB
     vector_db_host: str | None = None

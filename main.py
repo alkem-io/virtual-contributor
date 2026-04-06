@@ -137,6 +137,8 @@ async def _run(config: BaseConfig) -> None:
         user=config.rabbitmq_user,
         password=config.rabbitmq_password,
         exchange_name=config.rabbitmq_exchange,
+        heartbeat=config.rabbitmq_heartbeat,
+        max_retries=config.rabbitmq_max_retries,
     )
     await transport.connect()
 
