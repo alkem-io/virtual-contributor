@@ -14,6 +14,16 @@ class QueryResult:
     ids: list[list[str]]
 
 
+@dataclass
+class GetResult:
+    """Result from a get-by-ID or get-by-filter operation."""
+
+    ids: list[str]
+    metadatas: list[dict] | None = None
+    documents: list[str] | None = None
+    embeddings: list[list[float]] | None = None
+
+
 @runtime_checkable
 class KnowledgeStorePort(Protocol):
     """Port for vector knowledge store interactions."""
@@ -40,4 +50,23 @@ class KnowledgeStorePort(Protocol):
 
     async def delete_collection(self, collection: str) -> None:
         """Delete an entire collection."""
+        ...
+
+    async def get(
+        self,
+        collection: str,
+        ids: list[str] | None = None,
+        where: dict | None = None,
+        include: list[str] | None = None,
+    ) -> GetResult:
+        """Retrieve chunks by ID list and/or metadata filter."""
+        ...
+
+    async def delete(
+        self,
+        collection: str,
+        ids: list[str] | None = None,
+        where: dict | None = None,
+    ) -> None:
+        """Delete chunks by ID list and/or metadata filter."""
         ...

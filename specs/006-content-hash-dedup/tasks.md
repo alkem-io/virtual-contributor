@@ -35,13 +35,13 @@ No setup tasks required — project structure exists and no new directories are 
 
 **Why here**: US3 and US4 are P2 stories but are architectural enablers. US1 depends on content hashes (US3) and store lookups (US4). US2 depends on store deletion (US4) and orphan identification via hashes (US3).
 
-- [ ] T001 [P] Add GetResult dataclass and extend KnowledgeStorePort protocol with get() and delete() methods in core/ports/knowledge_store.py
-- [ ] T002 [P] Add content_hash field to Chunk dataclass and add chunks_skipped/chunks_deleted fields to IngestResult in core/domain/ingest_pipeline.py
-- [ ] T003 [P] Add dedup tracking fields (unchanged_chunk_hashes, orphan_ids, removed_document_ids, changed_document_ids, chunks_skipped, chunks_deleted) to PipelineContext and propagate chunks_skipped/chunks_deleted to IngestResult in IngestEngine.run() in core/domain/pipeline/engine.py
-- [ ] T004 [P] Implement get() and delete() methods in ChromaDBAdapter using collection.get()/collection.delete() wrapped in asyncio.to_thread() with existing _retry() logic in core/adapters/chromadb.py
-- [ ] T005 [P] Implement ContentHashStep — compute SHA-256 of content+title+source+type+document_id joined by null byte separator for each content chunk in core/domain/pipeline/steps.py
-- [ ] T006 [P] Extend MockKnowledgeStorePort with get() and delete() methods in tests/conftest.py
-- [ ] T007 Write content hash unit tests — determinism, sensitivity to each metadata field, stability across runs in tests/core/domain/test_content_hash.py
+- [x] T001 [P] Add GetResult dataclass and extend KnowledgeStorePort protocol with get() and delete() methods in core/ports/knowledge_store.py
+- [x] T002 [P] Add content_hash field to Chunk dataclass and add chunks_skipped/chunks_deleted fields to IngestResult in core/domain/ingest_pipeline.py
+- [x] T003 [P] Add dedup tracking fields (unchanged_chunk_hashes, orphan_ids, removed_document_ids, changed_document_ids, chunks_skipped, chunks_deleted) to PipelineContext and propagate chunks_skipped/chunks_deleted to IngestResult in IngestEngine.run() in core/domain/pipeline/engine.py
+- [x] T004 [P] Implement get() and delete() methods in ChromaDBAdapter using collection.get()/collection.delete() wrapped in asyncio.to_thread() with existing _retry() logic in core/adapters/chromadb.py
+- [x] T005 [P] Implement ContentHashStep — compute SHA-256 of content+title+source+type+document_id joined by null byte separator for each content chunk in core/domain/pipeline/steps.py
+- [x] T006 [P] Extend MockKnowledgeStorePort with get() and delete() methods in tests/conftest.py
+- [x] T007 Write content hash unit tests — determinism, sensitivity to each metadata field, stability across runs in tests/core/domain/test_content_hash.py
 
 **Checkpoint**: Port extended, data model updated, content hashing works. Foundation ready for P1 stories.
 
@@ -55,12 +55,12 @@ No setup tasks required — project structure exists and no new directories are 
 
 ### Implementation for User Story 1
 
-- [ ] T008 [US1] Implement ChangeDetectionStep — query store for existing chunk hashes per document, pre-load embeddings onto unchanged chunks, populate orphan_ids/changed_document_ids/chunks_skipped, log skip count at INFO level (FR-004), fallback to full re-embedding on store failure (FR-008) in core/domain/pipeline/steps.py
-- [ ] T009 [US1] Modify StoreStep to use chunk.content_hash as storage ID for content chunks (embeddingType="chunk"), use deterministic IDs for summary chunks ({document_id}-summary-{chunk_index}), and store original documentId in metadata for all chunk types in core/domain/pipeline/steps.py
+- [x] T008 [US1] Implement ChangeDetectionStep — query store for existing chunk hashes per document, pre-load embeddings onto unchanged chunks, populate orphan_ids/changed_document_ids/chunks_skipped, log skip count at INFO level (FR-004), fallback to full re-embedding on store failure (FR-008) in core/domain/pipeline/steps.py
+- [x] T009 [US1] Modify StoreStep to use chunk.content_hash as storage ID for content chunks (embeddingType="chunk"), use deterministic IDs for summary chunks ({document_id}-summary-{chunk_index}), and store original documentId in metadata for all chunk types in core/domain/pipeline/steps.py
 
 ### Tests for User Story 1
 
-- [ ] T010 [US1] Write ChangeDetectionStep tests (unchanged skip with embedding pre-load, new chunk detection, orphan identification, removed document detection, fallback on store failure) and StoreStep tests (content-hash ID generation, deterministic summary IDs, metadata documentId correctness) in tests/core/domain/test_pipeline_steps.py
+- [x] T010 [US1] Write ChangeDetectionStep tests (unchanged skip with embedding pre-load, new chunk detection, orphan identification, removed document detection, fallback on store failure) and StoreStep tests (content-hash ID generation, deterministic summary IDs, metadata documentId correctness) in tests/core/domain/test_pipeline_steps.py
 
 **Checkpoint**: US1 is independently testable — unchanged chunks are skipped and content-hash IDs are used for storage.
 
@@ -74,12 +74,12 @@ No setup tasks required — project structure exists and no new directories are 
 
 ### Implementation for User Story 2
 
-- [ ] T011 [US2] Implement OrphanCleanupStep — delete orphan chunk IDs from context.orphan_ids via knowledge_store.delete(ids=...), delete all chunks for removed documents via knowledge_store.delete(where={"documentId": doc_id}), update context.chunks_deleted in core/domain/pipeline/steps.py
-- [ ] T012 [US2] Modify DocumentSummaryStep to check context.changed_document_ids before summarizing — skip summarization for documents with zero changed chunks in core/domain/pipeline/steps.py
+- [x] T011 [US2] Implement OrphanCleanupStep — delete orphan chunk IDs from context.orphan_ids via knowledge_store.delete(ids=...), delete all chunks for removed documents via knowledge_store.delete(where={"documentId": doc_id}), update context.chunks_deleted in core/domain/pipeline/steps.py
+- [x] T012 [US2] Modify DocumentSummaryStep to check context.changed_document_ids before summarizing — skip summarization for documents with zero changed chunks in core/domain/pipeline/steps.py
 
 ### Tests for User Story 2
 
-- [ ] T013 [US2] Write OrphanCleanupStep tests (orphan deletion, removed document cleanup, empty document producing zero chunks, idempotent on empty sets) and DocumentSummaryStep tests (skip unchanged documents, summarize changed documents) in tests/core/domain/test_pipeline_steps.py
+- [x] T013 [US2] Write OrphanCleanupStep tests (orphan deletion, removed document cleanup, empty document producing zero chunks, idempotent on empty sets) and DocumentSummaryStep tests (skip unchanged documents, summarize changed documents) in tests/core/domain/test_pipeline_steps.py
 
 **Checkpoint**: US2 is independently testable — orphans are cleaned up and unchanged document summaries are preserved.
 
@@ -89,10 +89,10 @@ No setup tasks required — project structure exists and no new directories are 
 
 **Purpose**: Export new steps, wire pipeline composition in plugins, validate end-to-end
 
-- [ ] T014 Export ContentHashStep, ChangeDetectionStep, OrphanCleanupStep from core/domain/pipeline/__init__.py
-- [ ] T015 [P] Modify IngestSpacePlugin — remove delete_collection() call (line 74), wire ContentHashStep after ChunkStep, ChangeDetectionStep after ContentHashStep, OrphanCleanupStep after StoreStep, inject knowledge_store_port into new steps in plugins/ingest_space/plugin.py
-- [ ] T016 [P] Modify IngestWebsitePlugin — remove delete_collection() call (line 57), wire ContentHashStep after ChunkStep, ChangeDetectionStep after ContentHashStep, OrphanCleanupStep after StoreStep, inject knowledge_store_port into new steps in plugins/ingest_website/plugin.py
-- [ ] T017 Write integration tests — full pipeline: ingest corpus then re-ingest unchanged (verify >80% skip rate), ingest then re-ingest with changed content (verify orphan cleanup), ingest then remove document (verify chunk removal) in tests/core/domain/test_pipeline_steps.py
+- [x] T014 Export ContentHashStep, ChangeDetectionStep, OrphanCleanupStep from core/domain/pipeline/__init__.py
+- [x] T015 [P] Modify IngestSpacePlugin — remove delete_collection() call (line 74), wire ContentHashStep after ChunkStep, ChangeDetectionStep after ContentHashStep, OrphanCleanupStep after StoreStep, inject knowledge_store_port into new steps in plugins/ingest_space/plugin.py
+- [x] T016 [P] Modify IngestWebsitePlugin — remove delete_collection() call (line 57), wire ContentHashStep after ChunkStep, ChangeDetectionStep after ContentHashStep, OrphanCleanupStep after StoreStep, inject knowledge_store_port into new steps in plugins/ingest_website/plugin.py
+- [x] T017 Write integration tests — full pipeline: ingest corpus then re-ingest unchanged (verify >80% skip rate), ingest then re-ingest with changed content (verify orphan cleanup), ingest then remove document (verify chunk removal) in tests/core/domain/test_pipeline_steps.py
 
 **Checkpoint**: Full pipeline works end-to-end with dedup and orphan cleanup. All existing tests pass (SC-004).
 
@@ -102,8 +102,8 @@ No setup tasks required — project structure exists and no new directories are 
 
 **Purpose**: Documentation and final validation
 
-- [ ] T018 Write ADR for port extension (get/delete) and content-addressable storage scheme in docs/adr/000X-content-hash-dedup.md (required by constitution P8)
-- [ ] T019 Run quickstart.md validation — poetry run pytest, poetry run ruff check core/ plugins/ tests/, poetry run pyright core/ plugins/
+- [x] T018 Write ADR for port extension (get/delete) and content-addressable storage scheme in docs/adr/0006-content-hash-dedup.md (required by constitution P8)
+- [x] T019 Run quickstart.md validation — poetry run pytest, poetry run ruff check core/ plugins/ tests/, poetry run pyright core/ plugins/
 
 ---
 

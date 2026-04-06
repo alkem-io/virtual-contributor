@@ -97,6 +97,8 @@ content_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 - For unchanged documents, we skip summary generation entirely (the existing summary in the store is still valid).
 - For changed documents, we regenerate the summary and upsert it with the same deterministic ID, replacing the old version.
 
+**Disambiguation**: A `change_detection_ran` boolean flag on `PipelineContext` distinguishes "change detection ran and found zero changes" (`True` + empty `changed_document_ids`) from "change detection step was not in the pipeline" (`False` + empty `changed_document_ids`). Without this flag, an empty `changed_document_ids` set would cause both `DocumentSummaryStep` and `BodyOfKnowledgeSummaryStep` to regenerate all summaries on every unchanged re-ingestion — defeating the dedup optimization and introducing semantic drift from non-deterministic LLM output.
+
 **Alternatives considered**:
 - *Hash summary inputs (concatenated chunk texts)*: Would detect input changes but still requires LLM call to produce the summary. The optimization of skipping the LLM call for unchanged documents achieves the same result more simply. Rejected.
 - *Content-hash all chunks including summaries*: Would cause summary chunks to become orphans on every re-ingestion (new hash each time). Rejected.

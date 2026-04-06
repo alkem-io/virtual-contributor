@@ -52,7 +52,8 @@ Design artifacts reviewed against constitution. No new violations introduced:
 | Port extension scope | `get()` and `delete()` are minimal CRUD completions, not feature-specific bloat. `GetResult` mirrors `QueryResult` shape. **P2-I**: PASS. |
 | Hybrid ID scheme (content-hash + deterministic) | Content-hash for content chunks, deterministic for summaries. No speculative abstraction — each scheme serves a specific, necessary purpose. **Simplicity**: PASS. |
 | `PipelineContext` field additions | Six new fields track dedup state. All are consumed by specific steps. No god-object concern — context is a pipeline-scoped data bag by design. **P2-S**: PASS. |
-| `DocumentSummaryStep` behavior change | Skip logic is additive (check `changed_document_ids`). Unchanged documents produce identical results to before. **Backward compat**: PASS. |
+| `DocumentSummaryStep` behavior change | Skip logic is additive — checks `change_detection_ran` flag and `changed_document_ids` to disambiguate "no changes" from "no change detection step". Unchanged documents produce identical results to before. **Backward compat**: PASS. |
+| `BodyOfKnowledgeSummaryStep` behavior change | Skips regeneration when `change_detection_ran` is True and `changed_document_ids` is empty (no content changed). Regenerates if any document changed, or if change detection didn't run (backward compat). **Backward compat**: PASS. |
 | `delete_collection()` removal from plugins | Moves from destructive wipe to incremental update. Strictly safer. `delete_collection()` retained on port for admin use. **No regression**: PASS. |
 | ADR requirement | Port interface change confirmed → ADR `docs/adr/000X-content-hash-dedup.md` required at implementation time. **P8**: ACTION remains. |
 
@@ -84,9 +85,9 @@ core/
 ├── domain/
 │   ├── ingest_pipeline.py          # Extended: content_hash field on Chunk
 │   └── pipeline/
-│       ├── engine.py               # Extended: dedup tracking fields on PipelineContext
+│       ├── engine.py               # Extended: dedup tracking fields + change_detection_ran flag on PipelineContext
 │       └── steps.py                # New: ContentHashStep, ChangeDetectionStep, OrphanCleanupStep
-│                                   # Modified: StoreStep (content-hash IDs, skip unchanged)
+│                                   # Modified: StoreStep (content-hash IDs), DocumentSummaryStep & BoKSummaryStep (skip unchanged via flag)
 
 plugins/
 ├── ingest_space/plugin.py          # Modified: remove delete_collection(), wire new steps

@@ -12,7 +12,7 @@ from core.events import (
     Input,
     Response,
 )
-from core.ports.knowledge_store import QueryResult
+from core.ports.knowledge_store import GetResult, QueryResult
 
 
 # ---------------------------------------------------------------------------
@@ -80,14 +80,83 @@ class MockKnowledgeStorePort:
         embeddings: list[list[float]] | None = None,
     ) -> None:
         self.collections.setdefault(collection, [])
-        for doc, meta, doc_id in zip(documents, metadatas, ids):
-            self.collections[collection].append(
-                {"document": doc, "metadata": meta, "id": doc_id}
-            )
+        for i, (doc, meta, doc_id) in enumerate(zip(documents, metadatas, ids)):
+            entry: dict = {"document": doc, "metadata": meta, "id": doc_id}
+            if embeddings is not None:
+                entry["embedding"] = embeddings[i]
+            # Upsert: replace existing entry with same ID
+            self.collections[collection] = [
+                it for it in self.collections[collection] if it["id"] != doc_id
+            ]
+            self.collections[collection].append(entry)
 
     async def delete_collection(self, collection: str) -> None:
         self.deleted.append(collection)
         self.collections.pop(collection, None)
+
+    async def get(
+        self,
+        collection: str,
+        ids: list[str] | None = None,
+        where: dict | None = None,
+        include: list[str] | None = None,
+    ) -> GetResult:
+        items = self.collections.get(collection, [])
+        matched = items
+        if ids is not None:
+            matched = [it for it in matched if it["id"] in ids]
+        if where is not None:
+            for key, value in where.items():
+                matched = [
+                    it for it in matched
+                    if it.get("metadata", {}).get(key) == value
+                ]
+        result_ids = [it["id"] for it in matched]
+        result_metadatas = (
+            [it.get("metadata", {}) for it in matched]
+            if include and "metadatas" in include
+            else None
+        )
+        result_documents = (
+            [it.get("document", "") for it in matched]
+            if include and "documents" in include
+            else None
+        )
+        result_embeddings = (
+            [it.get("embedding", []) for it in matched]
+            if include and "embeddings" in include
+            else None
+        )
+        return GetResult(
+            ids=result_ids,
+            metadatas=result_metadatas,
+            documents=result_documents,
+            embeddings=result_embeddings,
+        )
+
+    async def delete(
+        self,
+        collection: str,
+        ids: list[str] | None = None,
+        where: dict | None = None,
+    ) -> None:
+        items = self.collections.get(collection, [])
+        if not items:
+            return
+        to_remove = set()
+        for i, it in enumerate(items):
+            if ids is not None and it["id"] in ids:
+                to_remove.add(i)
+            if where is not None:
+                match = all(
+                    it.get("metadata", {}).get(k) == v
+                    for k, v in where.items()
+                )
+                if match:
+                    to_remove.add(i)
+        self.collections[collection] = [
+            it for i, it in enumerate(items) if i not in to_remove
+        ]
 
 
 class MockTransportPort:

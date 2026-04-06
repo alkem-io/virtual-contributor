@@ -37,6 +37,13 @@ class PipelineContext:
     errors: list[str] = field(default_factory=list)
     metrics: dict[str, StepMetrics] = field(default_factory=dict)
     chunks_stored: int = 0
+    unchanged_chunk_hashes: set[str] = field(default_factory=set)
+    orphan_ids: set[str] = field(default_factory=set)
+    removed_document_ids: set[str] = field(default_factory=set)
+    changed_document_ids: set[str] = field(default_factory=set)
+    chunks_skipped: int = 0
+    chunks_deleted: int = 0
+    change_detection_ran: bool = False
 
 
 class IngestEngine:
@@ -80,4 +87,6 @@ class IngestEngine:
             chunks_stored=context.chunks_stored,
             errors=context.errors,
             success=len(context.errors) == 0,
+            chunks_skipped=context.chunks_skipped,
+            chunks_deleted=context.chunks_deleted,
         )

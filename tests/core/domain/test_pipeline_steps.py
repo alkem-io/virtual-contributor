@@ -6,9 +6,12 @@ from core.domain.ingest_pipeline import Chunk, Document, DocumentMetadata, Inges
 from core.domain.pipeline.engine import IngestEngine, PipelineContext
 from core.domain.pipeline.steps import (
     BodyOfKnowledgeSummaryStep,
+    ChangeDetectionStep,
     ChunkStep,
+    ContentHashStep,
     DocumentSummaryStep,
     EmbedStep,
+    OrphanCleanupStep,
     StoreStep,
 )
 from tests.conftest import MockEmbeddingsPort, MockKnowledgeStorePort, MockLLMPort
@@ -267,14 +270,15 @@ class TestStoreStep:
                     ),
                     chunk_index=0,
                     embedding=[0.1] * 384,
+                    content_hash="hash-abc",
                 ),
             ],
         )
 
         await StoreStep(knowledge_store_port=store).execute(ctx)
         stored = store.collections["coll"][0]
-        assert stored["id"] == "my-doc-chunk0-0"
-        assert stored["metadata"]["documentId"] == "my-doc-chunk0"
+        assert stored["id"] == "hash-abc"
+        assert stored["metadata"]["documentId"] == "my-doc"
         assert stored["metadata"]["source"] == "my-src"
         assert stored["metadata"]["embeddingType"] == "chunk"
         assert stored["metadata"]["chunkIndex"] == 0
@@ -560,3 +564,483 @@ class TestIngestEngine:
         metrics = captured["metrics"]
         assert {"chunk", "embed", "store"} <= set(metrics)
         assert all(m.duration >= 0 for m in metrics.values())
+
+
+# ---------------------------------------------------------------------------
+# T010: ChangeDetectionStep tests
+# ---------------------------------------------------------------------------
+
+
+class TestChangeDetectionStep:
+    def _store_with_chunks(self, collection: str, chunks: list[dict]) -> MockKnowledgeStorePort:
+        """Pre-populate a mock store with chunk entries."""
+        store = MockKnowledgeStorePort()
+        store.collections[collection] = chunks
+        return store
+
+    async def test_unchanged_chunks_skipped_with_embedding_preload(self):
+        """Chunks whose content_hash matches an existing ID get their embedding pre-loaded."""
+        meta = DocumentMetadata(document_id="doc-1", source="s", type="knowledge", title="T", embedding_type="chunk")
+        chunk = Chunk(content="text", metadata=meta, chunk_index=0, content_hash="hash-abc")
+
+        store = self._store_with_chunks("coll", [
+            {"id": "hash-abc", "metadata": {"documentId": "doc-1"}, "document": "text", "embedding": [1.0, 2.0]},
+        ])
+
+        ctx = PipelineContext(collection_name="coll", documents=[], chunks=[chunk])
+        await ChangeDetectionStep(knowledge_store_port=store).execute(ctx)
+
+        assert chunk.embedding == [1.0, 2.0]
+        assert "hash-abc" in ctx.unchanged_chunk_hashes
+        assert ctx.chunks_skipped == 1
+        assert "doc-1" not in ctx.changed_document_ids
+
+    async def test_new_chunk_detected(self):
+        """Chunks with a hash not in the store are marked as changed."""
+        meta = DocumentMetadata(document_id="doc-1", source="s", type="knowledge", title="T", embedding_type="chunk")
+        chunk = Chunk(content="new text", metadata=meta, chunk_index=0, content_hash="hash-new")
+
+        store = self._store_with_chunks("coll", [
+            {"id": "hash-old", "metadata": {"documentId": "doc-1"}, "document": "old", "embedding": [1.0]},
+        ])
+
+        ctx = PipelineContext(collection_name="coll", documents=[], chunks=[chunk])
+        await ChangeDetectionStep(knowledge_store_port=store).execute(ctx)
+
+        assert chunk.embedding is None
+        assert ctx.chunks_skipped == 0
+        assert "doc-1" in ctx.changed_document_ids
+
+    async def test_orphan_identification(self):
+        """Existing IDs not produced by current chunking become orphans."""
+        meta = DocumentMetadata(document_id="doc-1", source="s", type="knowledge", title="T", embedding_type="chunk")
+        chunk = Chunk(content="text", metadata=meta, chunk_index=0, content_hash="hash-new")
+
+        store = self._store_with_chunks("coll", [
+            {"id": "hash-old", "metadata": {"documentId": "doc-1"}, "document": "old", "embedding": [1.0]},
+        ])
+
+        ctx = PipelineContext(collection_name="coll", documents=[], chunks=[chunk])
+        await ChangeDetectionStep(knowledge_store_port=store).execute(ctx)
+
+        assert "hash-old" in ctx.orphan_ids
+
+    async def test_removed_document_detection(self):
+        """Documents in the store but not in current batch are flagged as removed."""
+        meta = DocumentMetadata(document_id="doc-1", source="s", type="knowledge", title="T", embedding_type="chunk")
+        chunk = Chunk(content="text", metadata=meta, chunk_index=0, content_hash="hash-1")
+
+        store = self._store_with_chunks("coll", [
+            {"id": "hash-1", "metadata": {"documentId": "doc-1", "embeddingType": "chunk"}, "document": "text", "embedding": [1.0]},
+            {"id": "hash-2", "metadata": {"documentId": "doc-2", "embeddingType": "chunk"}, "document": "old", "embedding": [2.0]},
+        ])
+
+        ctx = PipelineContext(collection_name="coll", documents=[], chunks=[chunk])
+        await ChangeDetectionStep(knowledge_store_port=store).execute(ctx)
+
+        assert "doc-2" in ctx.removed_document_ids
+
+    async def test_fallback_on_store_failure(self):
+        """When store raises, all chunks treated as new (full re-embedding)."""
+
+        class FailingStore:
+            async def get(self, **kwargs):
+                raise RuntimeError("Store unavailable")
+            async def ingest(self, **kwargs):
+                pass
+            async def query(self, **kwargs):
+                pass
+            async def delete_collection(self, collection):
+                pass
+            async def delete(self, **kwargs):
+                pass
+
+        meta = DocumentMetadata(document_id="doc-1", source="s", type="knowledge", title="T", embedding_type="chunk")
+        chunk = Chunk(content="text", metadata=meta, chunk_index=0, content_hash="hash-1")
+
+        ctx = PipelineContext(collection_name="coll", documents=[], chunks=[chunk])
+        await ChangeDetectionStep(knowledge_store_port=FailingStore()).execute(ctx)  # type: ignore[arg-type]
+
+        assert len(ctx.unchanged_chunk_hashes) == 0
+        assert len(ctx.orphan_ids) == 0
+        assert chunk.embedding is None
+
+    async def test_summary_chunks_not_flagged_as_removed(self):
+        """Summary and BoK chunks in the store should not trigger removed-document detection."""
+        meta = DocumentMetadata(document_id="doc-1", source="s", type="knowledge", title="T", embedding_type="chunk")
+        chunk = Chunk(content="text", metadata=meta, chunk_index=0, content_hash="hash-1")
+
+        store = MockKnowledgeStorePort()
+        store.collections["coll"] = [
+            # Content chunk
+            {"id": "hash-1", "metadata": {"documentId": "doc-1", "embeddingType": "chunk"}, "document": "text", "embedding": [1.0]},
+            # Summary chunk
+            {"id": "doc-1-summary-0", "metadata": {"documentId": "doc-1-summary", "embeddingType": "summary"}, "document": "summary", "embedding": [2.0]},
+            # BoK summary chunk
+            {"id": "body-of-knowledge-summary-0", "metadata": {"documentId": "body-of-knowledge-summary", "embeddingType": "summary"}, "document": "bok", "embedding": [3.0]},
+        ]
+
+        ctx = PipelineContext(collection_name="coll", documents=[], chunks=[chunk])
+        await ChangeDetectionStep(knowledge_store_port=store).execute(ctx)
+
+        # Summary document IDs should NOT appear as removed
+        assert "doc-1-summary" not in ctx.removed_document_ids
+        assert "body-of-knowledge-summary" not in ctx.removed_document_ids
+        assert len(ctx.removed_document_ids) == 0
+
+    async def test_step_name(self):
+        store = MockKnowledgeStorePort()
+        assert ChangeDetectionStep(knowledge_store_port=store).name == "change_detection"
+
+
+# ---------------------------------------------------------------------------
+# T010: StoreStep dedup tests (content-hash IDs, metadata)
+# ---------------------------------------------------------------------------
+
+
+class TestStoreStepDedup:
+    async def test_content_hash_used_as_storage_id(self):
+        """Content chunks with content_hash use it as storage ID."""
+        store = MockKnowledgeStorePort()
+        meta = DocumentMetadata(document_id="doc-1", source="s", type="knowledge", title="T", embedding_type="chunk")
+        chunk = Chunk(content="text", metadata=meta, chunk_index=0, embedding=[0.1], content_hash="abc123def456")
+
+        ctx = PipelineContext(collection_name="coll", documents=[], chunks=[chunk])
+        await StoreStep(knowledge_store_port=store).execute(ctx)
+
+        stored = store.collections["coll"][0]
+        assert stored["id"] == "abc123def456"
+
+    async def test_summary_uses_deterministic_id(self):
+        """Summary chunks use {document_id}-{chunk_index} as ID."""
+        store = MockKnowledgeStorePort()
+        meta = DocumentMetadata(document_id="doc-1-summary", source="s", type="knowledge", title="T", embedding_type="summary")
+        chunk = Chunk(content="summary text", metadata=meta, chunk_index=0, embedding=[0.1])
+
+        ctx = PipelineContext(collection_name="coll", documents=[], chunks=[chunk])
+        await StoreStep(knowledge_store_port=store).execute(ctx)
+
+        stored = store.collections["coll"][0]
+        assert stored["id"] == "doc-1-summary-0"
+
+    async def test_metadata_stores_original_document_id(self):
+        """Metadata documentId field stores the original document_id for all chunk types."""
+        store = MockKnowledgeStorePort()
+        meta = DocumentMetadata(document_id="doc-1", source="s", type="knowledge", title="T", embedding_type="chunk")
+        chunk = Chunk(content="text", metadata=meta, chunk_index=0, embedding=[0.1], content_hash="hash123")
+
+        ctx = PipelineContext(collection_name="coll", documents=[], chunks=[chunk])
+        await StoreStep(knowledge_store_port=store).execute(ctx)
+
+        stored = store.collections["coll"][0]
+        assert stored["metadata"]["documentId"] == "doc-1"
+
+
+# ---------------------------------------------------------------------------
+# T013: OrphanCleanupStep tests
+# ---------------------------------------------------------------------------
+
+
+class TestOrphanCleanupStep:
+    async def test_orphan_deletion(self):
+        """Orphan IDs from context are deleted from the store."""
+        store = MockKnowledgeStorePort()
+        store.collections["coll"] = [
+            {"id": "orphan-1", "metadata": {"documentId": "doc-1"}, "document": "old"},
+            {"id": "keep-1", "metadata": {"documentId": "doc-1"}, "document": "keep"},
+        ]
+
+        ctx = PipelineContext(
+            collection_name="coll",
+            documents=[],
+            orphan_ids={"orphan-1"},
+        )
+        await OrphanCleanupStep(knowledge_store_port=store).execute(ctx)
+
+        remaining_ids = [it["id"] for it in store.collections["coll"]]
+        assert "orphan-1" not in remaining_ids
+        assert "keep-1" in remaining_ids
+        assert ctx.chunks_deleted > 0
+
+    async def test_removed_document_cleanup(self):
+        """All chunks for removed documents are deleted, including summaries."""
+        store = MockKnowledgeStorePort()
+        store.collections["coll"] = [
+            {"id": "c1", "metadata": {"documentId": "doc-removed"}, "document": "x"},
+            {"id": "c2", "metadata": {"documentId": "doc-removed"}, "document": "y"},
+            {"id": "s1", "metadata": {"documentId": "doc-removed-summary"}, "document": "summary"},
+            {"id": "c3", "metadata": {"documentId": "doc-keep"}, "document": "z"},
+        ]
+
+        ctx = PipelineContext(
+            collection_name="coll",
+            documents=[],
+            removed_document_ids={"doc-removed"},
+        )
+        await OrphanCleanupStep(knowledge_store_port=store).execute(ctx)
+
+        remaining_ids = [it["id"] for it in store.collections["coll"]]
+        assert "c1" not in remaining_ids
+        assert "c2" not in remaining_ids
+        assert "s1" not in remaining_ids  # summary chunk also deleted
+        assert "c3" in remaining_ids
+
+    async def test_idempotent_on_empty_sets(self):
+        """No errors when orphan_ids and removed_document_ids are empty."""
+        store = MockKnowledgeStorePort()
+        store.collections["coll"] = [
+            {"id": "c1", "metadata": {"documentId": "doc-1"}, "document": "x"},
+        ]
+
+        ctx = PipelineContext(collection_name="coll", documents=[])
+        await OrphanCleanupStep(knowledge_store_port=store).execute(ctx)
+
+        assert ctx.chunks_deleted == 0
+        assert len(store.collections["coll"]) == 1
+        assert len(ctx.errors) == 0
+
+    async def test_step_name(self):
+        store = MockKnowledgeStorePort()
+        assert OrphanCleanupStep(knowledge_store_port=store).name == "orphan_cleanup"
+
+
+# ---------------------------------------------------------------------------
+# T013: DocumentSummaryStep dedup tests
+# ---------------------------------------------------------------------------
+
+
+class TestDocumentSummaryStepDedup:
+    async def test_skips_unchanged_documents(self):
+        """Documents not in changed_document_ids are skipped when change detection ran."""
+        llm = MockLLMPort(response="Summary")
+        ctx = _make_context()
+        await ChunkStep(chunk_size=100, chunk_overlap=10).execute(ctx)
+        assert len(ctx.chunks) > 3
+
+        ctx.change_detection_ran = True
+        ctx.changed_document_ids = {"other-doc"}
+
+        chunks_before = len(ctx.chunks)
+        await DocumentSummaryStep(llm_port=llm).execute(ctx)
+
+        assert len(ctx.chunks) == chunks_before  # No summary added
+        assert len(llm.calls) == 0
+
+    async def test_skips_all_when_nothing_changed(self):
+        """When change detection ran and found zero changes, skip all summaries."""
+        llm = MockLLMPort(response="Summary")
+        ctx = _make_context()
+        await ChunkStep(chunk_size=100, chunk_overlap=10).execute(ctx)
+        assert len(ctx.chunks) > 3
+
+        ctx.change_detection_ran = True
+        # changed_document_ids is empty — nothing changed
+
+        chunks_before = len(ctx.chunks)
+        await DocumentSummaryStep(llm_port=llm).execute(ctx)
+
+        assert len(ctx.chunks) == chunks_before
+        assert len(llm.calls) == 0
+
+    async def test_summarizes_changed_documents(self):
+        """Documents in changed_document_ids get summarized normally."""
+        llm = MockLLMPort(response="Summary for changed doc")
+        ctx = _make_context()
+        await ChunkStep(chunk_size=100, chunk_overlap=10).execute(ctx)
+        assert len(ctx.chunks) > 3
+
+        ctx.change_detection_ran = True
+        ctx.changed_document_ids = {"doc-1"}
+
+        chunks_before = len(ctx.chunks)
+        await DocumentSummaryStep(llm_port=llm).execute(ctx)
+
+        assert len(ctx.chunks) == chunks_before + 1
+        summary_chunks = [c for c in ctx.chunks if c.metadata.embedding_type == "summary"]
+        assert len(summary_chunks) == 1
+
+    async def test_summarizes_all_when_no_change_detection(self):
+        """When change_detection_ran is False (no ChangeDetectionStep), all docs are summarized."""
+        llm = MockLLMPort(response="Summary")
+        ctx = _make_context()
+        await ChunkStep(chunk_size=100, chunk_overlap=10).execute(ctx)
+        assert len(ctx.chunks) > 3
+
+        # change_detection_ran is False (default) — should summarize all
+        assert ctx.change_detection_ran is False
+        chunks_before = len(ctx.chunks)
+        await DocumentSummaryStep(llm_port=llm).execute(ctx)
+
+        assert len(ctx.chunks) == chunks_before + 1
+
+
+# ---------------------------------------------------------------------------
+# BodyOfKnowledgeSummaryStep dedup tests
+# ---------------------------------------------------------------------------
+
+
+class TestBoKSummaryStepDedup:
+    async def test_skips_when_nothing_changed(self):
+        """BoK summary is skipped when change detection ran and found no changes."""
+        llm = MockLLMPort(response="BoK overview")
+        ctx = PipelineContext(
+            collection_name="test",
+            documents=[],
+            chunks=[
+                Chunk(
+                    content="text",
+                    metadata=DocumentMetadata(document_id="d1", source="s", embedding_type="chunk"),
+                    chunk_index=0,
+                ),
+            ],
+        )
+        ctx.change_detection_ran = True
+        # changed_document_ids is empty — nothing changed
+
+        await BodyOfKnowledgeSummaryStep(llm_port=llm).execute(ctx)
+
+        bok = [c for c in ctx.chunks if c.metadata.document_id == "body-of-knowledge-summary"]
+        assert len(bok) == 0
+        assert len(llm.calls) == 0
+
+    async def test_regenerates_when_docs_changed(self):
+        """BoK summary regenerates when any document has changes."""
+        llm = MockLLMPort(response="Updated BoK")
+        ctx = PipelineContext(
+            collection_name="test",
+            documents=[],
+            chunks=[
+                Chunk(
+                    content="text",
+                    metadata=DocumentMetadata(document_id="d1", source="s", embedding_type="chunk"),
+                    chunk_index=0,
+                ),
+            ],
+        )
+        ctx.change_detection_ran = True
+        ctx.changed_document_ids = {"d1"}
+
+        await BodyOfKnowledgeSummaryStep(llm_port=llm).execute(ctx)
+
+        bok = [c for c in ctx.chunks if c.metadata.document_id == "body-of-knowledge-summary"]
+        assert len(bok) == 1
+        assert len(llm.calls) > 0
+
+    async def test_regenerates_when_no_change_detection(self):
+        """BoK summary always regenerates when change detection didn't run (backward compat)."""
+        llm = MockLLMPort(response="BoK overview")
+        ctx = PipelineContext(
+            collection_name="test",
+            documents=[],
+            chunks=[
+                Chunk(
+                    content="text",
+                    metadata=DocumentMetadata(document_id="d1", source="s", embedding_type="chunk"),
+                    chunk_index=0,
+                ),
+            ],
+        )
+        assert ctx.change_detection_ran is False
+
+        await BodyOfKnowledgeSummaryStep(llm_port=llm).execute(ctx)
+
+        bok = [c for c in ctx.chunks if c.metadata.document_id == "body-of-knowledge-summary"]
+        assert len(bok) == 1
+
+
+# ---------------------------------------------------------------------------
+# T017: Integration tests — full pipeline with dedup
+# ---------------------------------------------------------------------------
+
+
+class TestPipelineIntegration:
+    async def test_reingest_unchanged_skips_all(self):
+        """Ingest a corpus, then re-ingest unchanged — verify >80% skip rate."""
+        store = MockKnowledgeStorePort()
+        embeddings = MockEmbeddingsPort()
+
+        # First ingestion
+        engine = IngestEngine(steps=[
+            ChunkStep(chunk_size=100, chunk_overlap=10),
+            ContentHashStep(),
+            ChangeDetectionStep(knowledge_store_port=store),
+            EmbedStep(embeddings_port=embeddings),
+            StoreStep(knowledge_store_port=store),
+            OrphanCleanupStep(knowledge_store_port=store),
+        ])
+        result1 = await engine.run([_make_doc()], "integ-test")
+        assert result1.success
+        assert result1.chunks_stored > 0
+
+        # Reset embed call tracking
+        embeddings.calls.clear()
+
+        # Second ingestion — same content
+        result2 = await engine.run([_make_doc()], "integ-test")
+        assert result2.success
+        assert result2.chunks_skipped > 0
+
+        # All content chunks should be skipped (100% skip rate on unchanged)
+        assert result2.chunks_skipped == result1.chunks_stored
+
+        # Zero embedding calls on re-ingestion (all pre-loaded from store)
+        assert len(embeddings.calls) == 0
+
+    async def test_reingest_changed_content_cleans_orphans(self):
+        """Ingest then re-ingest with different content — verify orphan cleanup."""
+        store = MockKnowledgeStorePort()
+        embeddings = MockEmbeddingsPort()
+
+        engine = IngestEngine(steps=[
+            ChunkStep(chunk_size=100, chunk_overlap=10),
+            ContentHashStep(),
+            ChangeDetectionStep(knowledge_store_port=store),
+            EmbedStep(embeddings_port=embeddings),
+            StoreStep(knowledge_store_port=store),
+            OrphanCleanupStep(knowledge_store_port=store),
+        ])
+
+        # First ingestion
+        doc1 = _make_doc(content="Original content. " * 50)
+        result1 = await engine.run([doc1], "orphan-test")
+        assert result1.success
+
+        # Second ingestion — different content
+        doc2 = _make_doc(content="Completely different text. " * 50)
+        result2 = await engine.run([doc2], "orphan-test")
+        assert result2.success
+        assert result2.chunks_deleted > 0
+
+        # All stored chunks should be from the new content
+        stored_after_second = len(store.collections.get("orphan-test", []))
+        assert stored_after_second > 0
+
+    async def test_removed_document_chunks_deleted(self):
+        """Ingest two docs, re-ingest with one removed — verify cleanup."""
+        store = MockKnowledgeStorePort()
+        embeddings = MockEmbeddingsPort()
+
+        engine = IngestEngine(steps=[
+            ChunkStep(chunk_size=100, chunk_overlap=10),
+            ContentHashStep(),
+            ChangeDetectionStep(knowledge_store_port=store),
+            EmbedStep(embeddings_port=embeddings),
+            StoreStep(knowledge_store_port=store),
+            OrphanCleanupStep(knowledge_store_port=store),
+        ])
+
+        # Ingest two documents
+        doc_a = _make_doc(content="Document A content. " * 50, doc_id="doc-a")
+        doc_b = _make_doc(content="Document B content. " * 50, doc_id="doc-b")
+        result1 = await engine.run([doc_a, doc_b], "remove-test")
+        assert result1.success
+
+        # Re-ingest with only doc_a
+        result2 = await engine.run([doc_a], "remove-test")
+        assert result2.success
+
+        # doc-b chunks should have been cleaned up
+        remaining = store.collections.get("remove-test", [])
+        remaining_doc_ids = {it["metadata"].get("documentId") for it in remaining}
+        assert "doc-b" not in remaining_doc_ids
+        assert "doc-a" in remaining_doc_ids

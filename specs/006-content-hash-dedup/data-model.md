@@ -53,6 +53,7 @@ class PipelineContext:
     changed_document_ids: set[str] = field(default_factory=set)
     chunks_skipped: int = 0
     chunks_deleted: int = 0
+    change_detection_ran: bool = False
 ```
 
 | Field | Type | Description |
@@ -60,9 +61,10 @@ class PipelineContext:
 | `unchanged_chunk_hashes` | `set[str]` | **NEW** — Content hashes of chunks that already exist unchanged in the store. `ChangeDetectionStep` populates this; `EmbedStep` uses it (indirectly — unchanged chunks get their embedding pre-loaded so they're skipped). |
 | `orphan_ids` | `set[str]` | **NEW** — Storage IDs of chunks that exist in the store but are no longer produced by current chunking. `ChangeDetectionStep` populates this; `OrphanCleanupStep` deletes them. |
 | `removed_document_ids` | `set[str]` | **NEW** — Document IDs that were in the store but are not in the current ingestion batch. `ChangeDetectionStep` populates this; `OrphanCleanupStep` cleans up their chunks. |
-| `changed_document_ids` | `set[str]` | **NEW** — Document IDs with at least one changed or new chunk. `ChangeDetectionStep` populates this; `DocumentSummaryStep` uses it to skip unchanged documents. |
+| `changed_document_ids` | `set[str]` | **NEW** — Document IDs with at least one changed or new chunk. `ChangeDetectionStep` populates this; `DocumentSummaryStep` and `BodyOfKnowledgeSummaryStep` use it to skip unchanged documents. |
 | `chunks_skipped` | `int` | **NEW** — Count of chunks skipped due to dedup (for metrics/logging per FR-004). |
 | `chunks_deleted` | `int` | **NEW** — Count of orphan chunks deleted (for metrics/logging). |
+| `change_detection_ran` | `bool` | **NEW** — Set to `True` by `ChangeDetectionStep` on successful completion. Disambiguates "no changes detected" (empty `changed_document_ids` + `True`) from "change detection not in pipeline" (empty `changed_document_ids` + `False`). `DocumentSummaryStep` and `BodyOfKnowledgeSummaryStep` check this flag to decide whether to skip unchanged documents. |
 
 ---
 
