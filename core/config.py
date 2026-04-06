@@ -102,6 +102,10 @@ class BaseConfig(BaseSettings):
     embeddings_endpoint: str | None = None
     embeddings_model_name: str | None = None
 
+    # Retrieval
+    retrieval_n_results: int = 5
+    retrieval_score_threshold: float = 0.3
+
     # Ingest pipeline
     chunk_size: int = 2000
     chunk_overlap: int = 400

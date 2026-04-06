@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from core.events.response import Response
+from core.ports.knowledge_store import QueryResult
 from plugins.guidance.plugin import GuidancePlugin
 from tests.conftest import MockLLMPort, MockKnowledgeStorePort, make_input
 
@@ -30,6 +31,35 @@ class TestGuidancePlugin:
         assert isinstance(result, Response)
         # MockKnowledgeStore returns distances [0.1, 0.2] -> scores [0.9, 0.8]
         assert len(result.sources) > 0
+
+    async def test_low_score_chunks_filtered_out(self):
+        """Chunks below the score threshold should be excluded."""
+        class LowScoreKS(MockKnowledgeStorePort):
+            async def query(self, collection, query_texts, n_results=10):
+                self.query_calls.append((collection, query_texts, n_results))
+                return QueryResult(
+                    documents=[["relevant doc", "irrelevant doc"]],
+                    metadatas=[[{"source": "a"}, {"source": "b"}]],
+                    distances=[[0.1, 0.95]],  # scores: 0.9, 0.05
+                    ids=[["id1", "id2"]],
+                )
+
+        plugin = GuidancePlugin(
+            llm=MockLLMPort(response='{"answer": "ok"}'),
+            knowledge_store=LowScoreKS(),
+        )
+        event = make_input()
+        result = await plugin.handle(event)
+        # Only the high-score chunk should survive filtering
+        assert all(s.source == "a" for s in result.sources)
+
+    async def test_source_prefix_formatting(self, plugin):
+        """Context passed to LLM should have [source:N] prefixes."""
+        event = make_input()
+        await plugin.handle(event)
+        # The LLM call should contain [source:0] in the prompt
+        llm_prompt = plugin._llm.calls[-1][0]["content"]
+        assert "[source:0]" in llm_prompt
 
     async def test_history_condensation(self, plugin):
         event = make_input(
