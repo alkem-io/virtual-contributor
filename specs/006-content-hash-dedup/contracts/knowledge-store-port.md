@@ -117,7 +117,7 @@ Both wrapped in `asyncio.to_thread()` with the existing `_retry()` logic. The `g
 | Consumer | Method Used | Purpose |
 |---|---|---|
 | `ChangeDetectionStep` | `get(where={"documentId": doc_id}, include=["metadatas", "embeddings"])` | Look up existing chunks for a document |
-| `ChangeDetectionStep` | `get(where={}, include=[])` | Get all existing document IDs (for removed document detection) |
+| `ChangeDetectionStep` | `get(include=["metadatas"])` | Get all existing document IDs (for removed document detection) |
 | `OrphanCleanupStep` | `delete(ids=[...])` | Remove orphaned content chunks |
 | `OrphanCleanupStep` | `delete(where={"documentId": doc_id})` | Remove all chunks for a deleted document |
 

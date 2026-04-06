@@ -210,14 +210,13 @@ All chunk types store the same metadata structure in ChromaDB:
 
 ```python
 {
-    "documentId": str,        # Original document_id (for document-level queries)
+    "documentId": str,        # Content: document_id; summary: f"{document_id}-summary"; BoK: "body-of-knowledge-summary"
     "source": str,            # Source identifier
     "type": str,              # Document type
     "title": str,             # Display title
-    "embeddingType": str,     # "chunk" | "summary" | "bodyOfKnowledgeSummary"
+    "embeddingType": str,     # "chunk" | "summary"
     "chunkIndex": int,        # Position within document
-    "contentHash": str | None # SHA-256 fingerprint (only for content chunks)
 }
 ```
 
-**Key change**: `documentId` now stores the original `document_id` for ALL chunk types (previously, content chunks used `{doc_id}-chunk{i}`). This enables `where={"documentId": doc_id}` queries to find all chunks for a document regardless of type.
+**Key change**: `documentId` stores the original `document_id` for content chunks (enabling `where={"documentId": doc_id}` queries), `f"{document_id}-summary"` for document summaries, and `"body-of-knowledge-summary"` for the BoK entry. `contentHash` is NOT stored in metadata — the content hash is used as the storage ID directly.

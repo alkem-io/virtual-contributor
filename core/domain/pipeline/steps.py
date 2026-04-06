@@ -215,6 +215,8 @@ class ChangeDetectionStep:
 
             # Orphan detection for this document
             orphans = existing_ids - new_hashes
+            if orphans:
+                context.changed_document_ids.add(doc_id)
             context.orphan_ids.update(orphans)
 
         context.change_detection_ran = True

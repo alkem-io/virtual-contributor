@@ -625,6 +625,23 @@ class TestChangeDetectionStep:
 
         assert "hash-old" in ctx.orphan_ids
 
+    async def test_orphans_mark_document_as_changed(self):
+        """Documents with orphans are marked as changed even if all current chunks exist."""
+        meta = DocumentMetadata(document_id="doc-1", source="s", type="knowledge", title="T", embedding_type="chunk")
+        chunk = Chunk(content="text", metadata=meta, chunk_index=0, content_hash="hash-keep")
+
+        store = self._store_with_chunks("coll", [
+            {"id": "hash-keep", "metadata": {"documentId": "doc-1"}, "document": "text", "embedding": [1.0]},
+            {"id": "hash-gone", "metadata": {"documentId": "doc-1"}, "document": "old", "embedding": [2.0]},
+        ])
+
+        ctx = PipelineContext(collection_name="coll", documents=[], chunks=[chunk])
+        await ChangeDetectionStep(knowledge_store_port=store).execute(ctx)
+
+        # hash-gone is orphaned, so doc-1 should be marked as changed
+        assert "doc-1" in ctx.changed_document_ids
+        assert "hash-gone" in ctx.orphan_ids
+
     async def test_removed_document_detection(self):
         """Documents in the store but not in current batch are flagged as removed."""
         meta = DocumentMetadata(document_id="doc-1", source="s", type="knowledge", title="T", embedding_type="chunk")
