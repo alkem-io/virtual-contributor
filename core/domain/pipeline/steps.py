@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from dataclasses import replace
 
@@ -112,7 +111,7 @@ class DocumentSummaryStep:
     def __init__(
         self,
         llm_port: LLMPort,
-        summary_length: int = 2000,
+        summary_length: int = 10000,
         concurrency: int = 8,
     ) -> None:
         self._llm = llm_port
@@ -129,45 +128,42 @@ class DocumentSummaryStep:
         for chunk in context.chunks:
             chunks_by_doc.setdefault(chunk.metadata.document_id, []).append(chunk)
 
-        sem = asyncio.Semaphore(self._concurrency)
-
-        async def _summarize_doc(doc_id: str, doc_chunks: list[Chunk]) -> None:
-            async with sem:
-                try:
-                    summary = await _refine_summarize(
-                        [c.content for c in doc_chunks],
-                        self._llm.invoke,
-                        self._summary_length,
-                        DOCUMENT_REFINE_SYSTEM,
-                        DOCUMENT_REFINE_INITIAL,
-                        DOCUMENT_REFINE_SUBSEQUENT,
-                    )
-                    # Store in context for BoK step
-                    context.document_summaries[doc_id] = summary
-
-                    # Create a separate summary chunk
-                    source_meta = doc_chunks[0].metadata
-                    summary_meta = DocumentMetadata(
-                        document_id=f"{doc_id}-summary",
-                        source=source_meta.source,
-                        type=source_meta.type,
-                        title=source_meta.title,
-                        embedding_type="summary",
-                    )
-                    context.chunks.append(
-                        Chunk(content=summary, metadata=summary_meta, chunk_index=0)
-                    )
-                except Exception as exc:
-                    context.errors.append(
-                        f"DocumentSummaryStep: summarization failed for {doc_id}: {exc}"
-                    )
-
-        tasks = [
-            _summarize_doc(doc_id, doc_chunks)
+        docs_to_summarize = [
+            (doc_id, doc_chunks)
             for doc_id, doc_chunks in chunks_by_doc.items()
             if len(doc_chunks) > 3
         ]
-        await asyncio.gather(*tasks)
+
+        for doc_id, doc_chunks in docs_to_summarize:
+            try:
+                logger.info("Summarizing document %s (%d chunks)", doc_id, len(doc_chunks))
+                summary = await _refine_summarize(
+                    [c.content for c in doc_chunks],
+                    self._llm.invoke,
+                    self._summary_length,
+                    DOCUMENT_REFINE_SYSTEM,
+                    DOCUMENT_REFINE_INITIAL,
+                    DOCUMENT_REFINE_SUBSEQUENT,
+                )
+                context.document_summaries[doc_id] = summary
+
+                source_meta = doc_chunks[0].metadata
+                summary_meta = DocumentMetadata(
+                    document_id=f"{doc_id}-summary",
+                    source=source_meta.source,
+                    type=source_meta.type,
+                    title=source_meta.title,
+                    embedding_type="summary",
+                )
+                context.chunks.append(
+                    Chunk(content=summary, metadata=summary_meta, chunk_index=0)
+                )
+                logger.info("Summarized document %s", doc_id)
+            except Exception as exc:
+                logger.warning("Summarization failed for %s: %s", doc_id, exc)
+                context.errors.append(
+                    f"DocumentSummaryStep: summarization failed for {doc_id}: {exc}"
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -180,7 +176,7 @@ class BodyOfKnowledgeSummaryStep:
     def __init__(
         self,
         llm_port: LLMPort,
-        summary_length: int = 2000,
+        summary_length: int = 10000,
     ) -> None:
         self._llm = llm_port
         self._summary_length = summary_length
@@ -308,18 +304,24 @@ class StoreStep:
             batch = storable[i : i + self._batch_size]
 
             documents = [c.content for c in batch]
-            metadatas = [
-                {
-                    "documentId": c.metadata.document_id,
+            metadatas = []
+            ids = []
+            for c in batch:
+                # Raw chunks get "{id}-chunk{i}" format matching the original repo.
+                # Summary and BoK chunks keep their document_id as-is.
+                if c.metadata.embedding_type == "chunk":
+                    storage_id = f"{c.metadata.document_id}-chunk{c.chunk_index}"
+                else:
+                    storage_id = c.metadata.document_id
+                metadatas.append({
+                    "documentId": storage_id,
                     "source": c.metadata.source,
                     "type": c.metadata.type,
                     "title": c.metadata.title,
                     "embeddingType": c.metadata.embedding_type,
                     "chunkIndex": c.chunk_index,
-                }
-                for c in batch
-            ]
-            ids = [f"{c.metadata.document_id}-{c.chunk_index}" for c in batch]
+                })
+                ids.append(f"{storage_id}-{c.chunk_index}")
             batch_embeddings = [c.embedding for c in batch]
 
             try:

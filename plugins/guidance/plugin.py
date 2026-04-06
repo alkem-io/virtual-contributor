@@ -32,9 +32,16 @@ class GuidancePlugin:
     name = "guidance"
     event_type = Input
 
-    def __init__(self, llm: LLMPort, knowledge_store: KnowledgeStorePort) -> None:
+    def __init__(
+        self,
+        llm: LLMPort,
+        knowledge_store: KnowledgeStorePort,
+        *,
+        score_threshold: float = 0.3,
+    ) -> None:
         self._llm = llm
         self._knowledge_store = knowledge_store
+        self._score_threshold = score_threshold
 
     async def startup(self) -> None:
         logger.info("GuidancePlugin started")
@@ -73,10 +80,11 @@ class GuidancePlugin:
                         score = 1.0 - distance
                         docs.append(doc)
                         meta = result.metadatas[0][i] if result.metadatas else {}
+                        source_url = meta.get("source", collection)
                         sources.append(Source(
-                            source=meta.get("source", collection),
+                            source=source_url,
                             title=meta.get("title"),
-                            uri=meta.get("uri"),
+                            uri=source_url,
                             score=score,
                         ))
             except Exception:
@@ -86,13 +94,40 @@ class GuidancePlugin:
         query_results = await asyncio.gather(
             *[_query_collection(c) for c in DEFAULT_COLLECTIONS]
         )
-        all_docs = []
-        all_sources = []
+        all_pairs: list[tuple[str, Source]] = []
         for docs, sources in query_results:
-            all_docs.extend(docs)
-            all_sources.extend(sources)
+            all_pairs.extend(zip(docs, sources))
 
-        context = "\n\n".join(all_docs) if all_docs else "No relevant context found."
+        # Sort by relevance (highest score first)
+        all_pairs.sort(key=lambda p: p[1].score or 0, reverse=True)
+
+        # Filter by score threshold — discard low-relevance chunks
+        all_pairs = [
+            (doc, src) for doc, src in all_pairs
+            if (src.score or 0) >= self._score_threshold
+        ]
+
+        # Deduplicate by source URL, keeping the highest-scoring chunk per page
+        seen_sources: set[str] = set()
+        deduped: list[tuple[str, Source]] = []
+        for idx, (doc, src) in enumerate(all_pairs):
+            key = src.source or f"__no_source_{idx}__"
+            if key not in seen_sources:
+                seen_sources.add(key)
+                deduped.append((doc, src))
+
+        deduped = deduped[:5]
+
+        all_docs = [doc for doc, _ in deduped]
+        all_sources = [src for _, src in deduped]
+
+        # Prefix each chunk with [source:N] for LLM source attribution
+        if all_docs:
+            context = "\n\n".join(
+                f"[source:{i}] {doc}" for i, doc in enumerate(all_docs)
+            )
+        else:
+            context = "No relevant context found."
 
         # Generate response
         from plugins.guidance.prompts import retrieve_prompt

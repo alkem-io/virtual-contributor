@@ -273,8 +273,8 @@ class TestStoreStep:
 
         await StoreStep(knowledge_store_port=store).execute(ctx)
         stored = store.collections["coll"][0]
-        assert stored["id"] == "my-doc-0"
-        assert stored["metadata"]["documentId"] == "my-doc"
+        assert stored["id"] == "my-doc-chunk0-0"
+        assert stored["metadata"]["documentId"] == "my-doc-chunk0"
         assert stored["metadata"]["source"] == "my-src"
         assert stored["metadata"]["embeddingType"] == "chunk"
         assert stored["metadata"]["chunkIndex"] == 0

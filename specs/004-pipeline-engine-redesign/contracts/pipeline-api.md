@@ -62,7 +62,7 @@ No port dependencies.
 ```python
 DocumentSummaryStep(
     llm_port: LLMPort,
-    summary_length: int = 2000,
+    summary_length: int = 10000,
     concurrency: int = 8,
 )
 ```
@@ -74,7 +74,7 @@ Requires: LLMPort
 ```python
 BodyOfKnowledgeSummaryStep(
     llm_port: LLMPort,
-    summary_length: int = 2000,
+    summary_length: int = 10000,
 )
 ```
 

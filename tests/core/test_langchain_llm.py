@@ -52,21 +52,21 @@ class TestMessageConversion:
 
 
 class TestInvoke:
-    """Test invoke returns string from LLM response."""
+    """Test invoke returns string from LLM response (sync invoke in thread)."""
 
     @pytest.mark.asyncio
     async def test_invoke_returns_string(self) -> None:
-        mock_llm = AsyncMock()
-        mock_llm.ainvoke.return_value = MagicMock(content="Hello world")
+        mock_llm = MagicMock()
+        mock_llm.invoke.return_value = MagicMock(content="Hello world")
         adapter = LangChainLLMAdapter(mock_llm)
         result = await adapter.invoke([{"role": "human", "content": "Hi"}])
         assert result == "Hello world"
-        mock_llm.ainvoke.assert_called_once()
+        mock_llm.invoke.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_invoke_retries_on_failure(self) -> None:
-        mock_llm = AsyncMock()
-        mock_llm.ainvoke.side_effect = [
+        mock_llm = MagicMock()
+        mock_llm.invoke.side_effect = [
             RuntimeError("fail 1"),
             RuntimeError("fail 2"),
             MagicMock(content="Success"),
@@ -75,22 +75,22 @@ class TestInvoke:
         with patch("core.adapters.langchain_llm.asyncio.sleep", new_callable=AsyncMock):
             result = await adapter.invoke([{"role": "human", "content": "Hi"}])
         assert result == "Success"
-        assert mock_llm.ainvoke.call_count == 3
+        assert mock_llm.invoke.call_count == 3
 
     @pytest.mark.asyncio
     async def test_invoke_raises_after_max_retries(self) -> None:
-        mock_llm = AsyncMock()
-        mock_llm.ainvoke.side_effect = RuntimeError("persistent failure")
+        mock_llm = MagicMock()
+        mock_llm.invoke.side_effect = RuntimeError("persistent failure")
         adapter = LangChainLLMAdapter(mock_llm)
         with patch("core.adapters.langchain_llm.asyncio.sleep", new_callable=AsyncMock):
             with pytest.raises(RuntimeError, match="persistent failure"):
                 await adapter.invoke([{"role": "human", "content": "Hi"}])
-        assert mock_llm.ainvoke.call_count == 3
+        assert mock_llm.invoke.call_count == 3
 
     @pytest.mark.asyncio
     async def test_invoke_exponential_backoff(self) -> None:
-        mock_llm = AsyncMock()
-        mock_llm.ainvoke.side_effect = [
+        mock_llm = MagicMock()
+        mock_llm.invoke.side_effect = [
             RuntimeError("fail 1"),
             RuntimeError("fail 2"),
             MagicMock(content="ok"),
@@ -111,22 +111,22 @@ class TestConnectionError:
 
     @pytest.mark.asyncio
     async def test_connection_error_fails_fast(self) -> None:
-        mock_llm = AsyncMock()
-        mock_llm.ainvoke.side_effect = ConnectionError("Connection refused")
+        mock_llm = MagicMock()
+        mock_llm.invoke.side_effect = ConnectionError("Connection refused")
         adapter = LangChainLLMAdapter(mock_llm)
         with pytest.raises(ConnectionError, match="Failed to connect to LLM endpoint"):
             await adapter.invoke([{"role": "human", "content": "Hi"}])
         # Should fail on first attempt, no retries for connection errors
-        assert mock_llm.ainvoke.call_count == 1
+        assert mock_llm.invoke.call_count == 1
 
     @pytest.mark.asyncio
     async def test_os_error_fails_fast(self) -> None:
-        mock_llm = AsyncMock()
-        mock_llm.ainvoke.side_effect = OSError("Network unreachable")
+        mock_llm = MagicMock()
+        mock_llm.invoke.side_effect = OSError("Network unreachable")
         adapter = LangChainLLMAdapter(mock_llm)
         with pytest.raises(ConnectionError, match="Failed to connect to LLM endpoint"):
             await adapter.invoke([{"role": "human", "content": "Hi"}])
-        assert mock_llm.ainvoke.call_count == 1
+        assert mock_llm.invoke.call_count == 1
 
 
 class TestStream:

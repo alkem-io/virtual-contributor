@@ -124,6 +124,13 @@ async def _run(config: BaseConfig) -> None:
 
     # Construct plugin with dependencies
     deps = container.resolve_for_plugin(plugin_class)
+    # Inject retrieval config for plugins that accept it
+    import inspect
+    sig = inspect.signature(plugin_class.__init__)
+    if "n_results" in sig.parameters:
+        deps["n_results"] = config.retrieval_n_results
+    if "score_threshold" in sig.parameters:
+        deps["score_threshold"] = config.retrieval_score_threshold
     plugin = plugin_class(**deps)
 
     # Plugin lifecycle: startup
@@ -137,6 +144,8 @@ async def _run(config: BaseConfig) -> None:
         user=config.rabbitmq_user,
         password=config.rabbitmq_password,
         exchange_name=config.rabbitmq_exchange,
+        heartbeat=config.rabbitmq_heartbeat,
+        max_retries=config.rabbitmq_max_retries,
     )
     await transport.connect()
 

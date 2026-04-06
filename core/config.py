@@ -37,6 +37,8 @@ class BaseConfig(BaseSettings):
         default="event-bus", validation_alias="RABBITMQ_EVENT_BUS_EXCHANGE"
     )
     rabbitmq_result_routing_key: str = "invoke-engine-result"
+    rabbitmq_heartbeat: int = 300
+    rabbitmq_max_retries: int = 3
 
     # ChromaDB / Vector DB
     vector_db_host: str | None = None
@@ -92,6 +94,14 @@ class BaseConfig(BaseSettings):
             raise ValueError(
                 f"LLM_TIMEOUT must be greater than 0, got {self.llm_timeout}"
             )
+        if self.rabbitmq_heartbeat < 0:
+            raise ValueError(
+                f"RABBITMQ_HEARTBEAT must be >= 0, got {self.rabbitmq_heartbeat}"
+            )
+        if self.rabbitmq_max_retries < 1:
+            raise ValueError(
+                f"RABBITMQ_MAX_RETRIES must be >= 1, got {self.rabbitmq_max_retries}"
+            )
 
         return self
 
@@ -99,6 +109,10 @@ class BaseConfig(BaseSettings):
     embeddings_api_key: str | None = None
     embeddings_endpoint: str | None = None
     embeddings_model_name: str | None = None
+
+    # Retrieval
+    retrieval_n_results: int = 5
+    retrieval_score_threshold: float = 0.3
 
     # Ingest pipeline
     chunk_size: int = 2000

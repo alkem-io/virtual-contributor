@@ -45,6 +45,7 @@ def create_llm_adapter(config: BaseConfig) -> LangChainLLMAdapter:
     kwargs: dict[str, Any] = {
         "model": model_name,
         "timeout": config.llm_timeout,
+        "max_retries": 0,
     }
 
     if config.llm_api_key:

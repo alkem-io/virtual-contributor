@@ -138,7 +138,7 @@ class PipelineStep(Protocol):
 
 - **Reads**: context.chunks
 - **Writes**: Appends summary Chunks to context.chunks; populates context.document_summaries
-- **Config**: summary_length (int, default 2000), concurrency (int, default 8)
+- **Config**: summary_length (int, default 10000), concurrency (int, default 8)
 - **Ports**: LLMPort (constructor injected)
 - **Behavior**: Groups chunks by document_id. For each document with >3 chunks, generates summary via refine pattern with rich prompts (FR-006) and progressive length budgeting (FR-007). Creates new Chunk with:
   - content = summary text
@@ -153,7 +153,7 @@ class PipelineStep(Protocol):
 
 - **Reads**: context.document_summaries, context.chunks
 - **Writes**: Appends one BoK summary Chunk to context.chunks
-- **Config**: summary_length (int, default 2000)
+- **Config**: summary_length (int, default 10000)
 - **Ports**: LLMPort (constructor injected)
 - **Behavior**: Identifies raw document chunks by filtering on `embedding_type != "summary"`. For each unique document_id in raw chunks:
   - If document_summaries has a summary for it, use that
@@ -182,7 +182,8 @@ class PipelineStep(Protocol):
 - **Ports**: KnowledgeStorePort (constructor injected)
 - **Behavior**: Processes chunks in batches. Builds metadata dict:
   - documentId, source, type, title, embeddingType, chunkIndex
-- Creates IDs as `{document_id}-{chunk_index}`.
+- Creates ChromaDB `documentId` as `{document_id}-chunk{chunk_index}` for raw chunks (matching original repo format), and uses the chunk's `document_id` as-is for summary/BoK entries.
+- Creates ChromaDB entry IDs as `{storage_id}-{chunk_index}`.
 - **Embedding requirement**: Only stores chunks that have precomputed embeddings. Chunks without embeddings are skipped with an error. The current ChromaDB adapter requires precomputed embeddings (`embedding_function=None`), making EmbedStep a required predecessor.
 - Calls knowledge_store_port.ingest() with precomputed embeddings.
 - Increments context.chunks_stored only on successful batch persistence.
