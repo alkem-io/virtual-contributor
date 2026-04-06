@@ -45,15 +45,23 @@ class LangChainLLMAdapter:
         self._llm = llm
         self._timeout = timeout
 
+    def _sync_invoke(self, lc_messages: list[BaseMessage]) -> str:
+        """Synchronous LLM call — runs in a thread to avoid blocking the event loop."""
+        result = self._llm.invoke(lc_messages)
+        return str(result.content)
+
     async def invoke(self, messages: list[dict]) -> str:
         lc_messages = _to_langchain_messages(messages)
         last_exc: Exception | None = None
         for attempt in range(MAX_RETRIES):
             try:
+                # Run sync invoke in a thread so the event loop stays free
+                # for RabbitMQ heartbeats and other async tasks
                 result = await asyncio.wait_for(
-                    self._llm.ainvoke(lc_messages), timeout=self._timeout
+                    asyncio.to_thread(self._sync_invoke, lc_messages),
+                    timeout=self._timeout,
                 )
-                return str(result.content)
+                return result
             except asyncio.TimeoutError:
                 last_exc = TimeoutError(
                     f"LLM call timed out after {self._timeout}s"
