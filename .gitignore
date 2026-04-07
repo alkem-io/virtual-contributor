@@ -32,5 +32,9 @@ ingestion_output.txt
 # Poetry
 poetry.lock
 
+# Evaluation results
+evaluations/
+!evaluations/.gitkeep
+
 # Specify
 .specify/specs/
