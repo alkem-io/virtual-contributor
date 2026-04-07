@@ -52,7 +52,7 @@ def load_test_set(path: Path = DEFAULT_TEST_SET_PATH) -> list[TestCase]:
             cases.append(case)
 
     if errors:
-        raise ValueError(f"Test set validation errors:\n" + "\n".join(errors))
+        raise ValueError("Test set validation errors:\n" + "\n".join(errors))
 
     if not cases:
         raise ValueError(f"Test set is empty: {path}")

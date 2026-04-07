@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -109,7 +108,7 @@ class TestEvaluationRunner:
             scorer=mock_scorer,
             output_dir=tmp_path,
         )
-        run = await runner.run(cases, plugin_type="guidance", label="baseline")
+        await runner.run(cases, plugin_type="guidance", label="baseline")
 
         result_files = list(tmp_path.glob("*.json"))
         assert len(result_files) == 1

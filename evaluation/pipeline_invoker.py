@@ -7,7 +7,6 @@ import logging
 from core.config import BaseConfig
 from core.container import Container
 from core.events.input import Input
-from core.events.response import Source
 from core.ports.knowledge_store import KnowledgeStorePort
 from core.ports.llm import LLMPort
 from core.provider_factory import create_llm_adapter
@@ -40,7 +39,6 @@ class PipelineInvoker:
     async def setup(self) -> None:
         """Initialize the pipeline: container, adapters, plugin."""
         from core.adapters.chromadb import ChromaDBAdapter
-        from core.adapters.openai_compatible_embeddings import OpenAICompatibleEmbeddingsAdapter
 
         # Create LLM adapter
         self._llm_adapter = create_llm_adapter(self._config)

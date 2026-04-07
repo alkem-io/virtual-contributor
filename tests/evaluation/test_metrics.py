@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-import pytest
 
 from evaluation.metrics import create_metrics, create_evaluator_llm, create_evaluator_embeddings
 
@@ -57,7 +56,7 @@ class TestCreateMetrics:
             mock_wrapper = MagicMock()
             MockLLMWrapper.return_value = mock_wrapper
             MockEmbWrapper.return_value = MagicMock()
-            metrics = create_metrics(mock_llm, mock_embeddings)
+            create_metrics(mock_llm, mock_embeddings)
 
         # Verify LLM wrapper was called with our model
         MockLLMWrapper.assert_called_once_with(mock_llm)
