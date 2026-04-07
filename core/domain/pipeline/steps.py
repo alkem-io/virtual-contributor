@@ -106,17 +106,22 @@ class ChunkStep:
 # ---------------------------------------------------------------------------
 
 class DocumentSummaryStep:
-    """Generate per-document summaries for docs with >3 chunks."""
+    """Generate per-document summaries for docs with >= chunk_threshold chunks."""
 
     def __init__(
         self,
         llm_port: LLMPort,
         summary_length: int = 10000,
         concurrency: int = 8,
+        chunk_threshold: int = 4,
     ) -> None:
         self._llm = llm_port
         self._summary_length = summary_length
         self._concurrency = concurrency
+        self._chunk_threshold = chunk_threshold
+        self._model_name = getattr(
+            getattr(llm_port, "_llm", None), "model", "unknown"
+        )
 
     @property
     def name(self) -> str:
@@ -131,12 +136,15 @@ class DocumentSummaryStep:
         docs_to_summarize = [
             (doc_id, doc_chunks)
             for doc_id, doc_chunks in chunks_by_doc.items()
-            if len(doc_chunks) > 3
+            if len(doc_chunks) >= self._chunk_threshold
         ]
 
         for doc_id, doc_chunks in docs_to_summarize:
             try:
-                logger.info("Summarizing document %s (%d chunks)", doc_id, len(doc_chunks))
+                logger.info(
+                    "Summarizing document %s (%d chunks) [model=%s]",
+                    doc_id, len(doc_chunks), self._model_name,
+                )
                 summary = await _refine_summarize(
                     [c.content for c in doc_chunks],
                     self._llm.invoke,
@@ -180,6 +188,9 @@ class BodyOfKnowledgeSummaryStep:
     ) -> None:
         self._llm = llm_port
         self._summary_length = summary_length
+        self._model_name = getattr(
+            getattr(llm_port, "_llm", None), "model", "unknown"
+        )
 
     @property
     def name(self) -> str:
@@ -213,6 +224,10 @@ class BodyOfKnowledgeSummaryStep:
             return
 
         try:
+            logger.info(
+                "Generating body-of-knowledge summary (%d sections) [model=%s]",
+                len(sections), self._model_name,
+            )
             bok_summary = await _refine_summarize(
                 sections,
                 self._llm.invoke,

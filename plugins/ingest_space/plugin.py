@@ -37,11 +37,16 @@ class IngestSpacePlugin:
         embeddings: EmbeddingsPort,
         knowledge_store: KnowledgeStorePort,
         graphql_client: Any = None,
+        *,
+        summarize_llm: LLMPort | None = None,
+        chunk_threshold: int = 4,
     ) -> None:
         self._llm = llm
         self._embeddings = embeddings
         self._knowledge_store = knowledge_store
         self._graphql_client = graphql_client
+        self._summarize_llm = summarize_llm
+        self._chunk_threshold = chunk_threshold
 
     async def startup(self) -> None:
         logger.info("IngestSpacePlugin started")
@@ -74,10 +79,14 @@ class IngestSpacePlugin:
             await self._knowledge_store.delete_collection(collection_name)
 
             # Run ingest pipeline with ingest-space specific settings
+            summary_llm = self._summarize_llm or self._llm
             engine = IngestEngine(steps=[
                 ChunkStep(chunk_size=9000, chunk_overlap=500),
-                DocumentSummaryStep(llm_port=self._llm),
-                BodyOfKnowledgeSummaryStep(llm_port=self._llm),
+                DocumentSummaryStep(
+                    llm_port=summary_llm,
+                    chunk_threshold=self._chunk_threshold,
+                ),
+                BodyOfKnowledgeSummaryStep(llm_port=summary_llm),
                 EmbedStep(embeddings_port=self._embeddings),
                 StoreStep(knowledge_store_port=self._knowledge_store),
             ])
