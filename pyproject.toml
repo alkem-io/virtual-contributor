@@ -5,7 +5,7 @@ description = "Alkemio Virtual Contributor — unified microkernel engine with p
 authors = ["Alkemio BV <info@alkem.io>"]
 license = "EUPL-1.2"
 readme = "README.md"
-packages = [{include = "core"}, {include = "plugins"}]
+packages = [{include = "core"}, {include = "plugins"}, {include = "evaluation"}]
 
 [tool.poetry.dependencies]
 python = "^3.12"
@@ -43,6 +43,10 @@ requests = "^2.32"
 pypdf = "^5.0"
 python-docx = "^1.1"
 openpyxl = "^3.1"
+
+# Evaluation
+ragas = "^0.2"
+click = "^8.1"
 
 [tool.poetry.group.dev.dependencies]
 flake8 = "^7.3.0"

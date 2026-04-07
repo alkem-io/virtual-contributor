@@ -7,10 +7,13 @@ from typing import Any
 
 from core.domain.pipeline import (
     BodyOfKnowledgeSummaryStep,
+    ChangeDetectionStep,
     ChunkStep,
+    ContentHashStep,
     DocumentSummaryStep,
     EmbedStep,
     IngestEngine,
+    OrphanCleanupStep,
     StoreStep,
 )
 from core.events.ingest_space import (
@@ -75,13 +78,12 @@ class IngestSpacePlugin:
                     result="success",
                 )
 
-            # Delete existing collection only after successful fetch
-            await self._knowledge_store.delete_collection(collection_name)
-
             # Run ingest pipeline with ingest-space specific settings
             summary_llm = self._summarize_llm or self._llm
             engine = IngestEngine(steps=[
                 ChunkStep(chunk_size=9000, chunk_overlap=500),
+                ContentHashStep(),
+                ChangeDetectionStep(knowledge_store_port=self._knowledge_store),
                 DocumentSummaryStep(
                     llm_port=summary_llm,
                     chunk_threshold=self._chunk_threshold,
@@ -89,6 +91,7 @@ class IngestSpacePlugin:
                 BodyOfKnowledgeSummaryStep(llm_port=summary_llm),
                 EmbedStep(embeddings_port=self._embeddings),
                 StoreStep(knowledge_store_port=self._knowledge_store),
+                OrphanCleanupStep(knowledge_store_port=self._knowledge_store),
             ])
             result = await engine.run(documents, collection_name)
 
