@@ -115,6 +115,8 @@ class DocumentSummaryStep:
         concurrency: int = 8,
         chunk_threshold: int = 4,
     ) -> None:
+        if chunk_threshold < 1:
+            raise ValueError("chunk_threshold must be >= 1")
         self._llm = llm_port
         self._summary_length = summary_length
         self._concurrency = concurrency

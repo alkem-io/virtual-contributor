@@ -125,9 +125,19 @@ This feature adds configuration fields only — no new database tables, no new e
 - Query calls use `self._n_results` instead of hardcoded `5`
 - Dedup limit uses `self._n_results` instead of hardcoded `5`
 
-## Entity: ExpertPlugin (unchanged)
+## Entity: ExpertPlugin (modified)
 
-Already accepts `n_results` and `score_threshold` in constructor. No changes needed.
+**File**: `plugins/expert/plugin.py`
+
+### New Constructor Parameter
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `max_context_chars` | `int` | `20000` | Max character budget for retrieved context. Existing `n_results` and `score_threshold` remain supported. |
+
+### Changed Behavior
+
+- After score filtering, enforces context budget by dropping lowest-scoring chunks until total chars are within `max_context_chars`
 
 ## Context Budget Enforcement (new behavior in both retrieval plugins)
 

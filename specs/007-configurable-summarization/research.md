@@ -102,7 +102,7 @@ Cross-plugin merging is architecturally impossible — plugins are isolated proc
 
 ### R5: SUMMARY_CHUNK_THRESHOLD — current behavior and configurability
 
-**Context**: FR-007 requires `SUMMARY_CHUNK_THRESHOLD` (default: 3). Currently `DocumentSummaryStep` hardcodes `if len(doc_chunks) > 3` (steps.py:134).
+**Context**: FR-007 requires `SUMMARY_CHUNK_THRESHOLD` (default: 4). Currently `DocumentSummaryStep` hardcodes `if len(doc_chunks) > 3` (steps.py:134). The default of 4 with `>=` preserves exact backward compatibility.
 
 **Findings**:
 

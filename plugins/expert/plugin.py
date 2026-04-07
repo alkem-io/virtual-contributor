@@ -91,8 +91,9 @@ class ExpertPlugin:
         self, docs: list[str], filtered_result: QueryResult,
     ) -> tuple[list[str], QueryResult]:
         """Drop lowest-scoring chunks if total chars exceed max_context_chars."""
-        total_chars = sum(len(d) for d in docs)
-        if total_chars <= self._max_context_chars:
+        raw_docs_check = filtered_result.documents[0] if filtered_result.documents else []
+        total_raw_chars = sum(len(d) for d in raw_docs_check)
+        if total_raw_chars <= self._max_context_chars:
             return docs, filtered_result
 
         # docs are already in score order from _filter_and_format
@@ -119,7 +120,7 @@ class ExpertPlugin:
             accumulated += len(raw_content)
 
         dropped = len(docs) - len(kept_formatted)
-        dropped_chars = total_chars - sum(len(d) for d in kept_formatted)
+        dropped_chars = total_raw_chars - accumulated
         logger.warning(
             "Context budget exceeded: dropped %d chunks (%d chars)",
             dropped, dropped_chars,

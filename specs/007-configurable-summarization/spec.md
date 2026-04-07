@@ -82,7 +82,7 @@ As a platform operator, I want to control the minimum number of chunks a documen
 - **FR-003**: System MUST allow the number of retrieved chunks for the expert plugin to be configured via `EXPERT_N_RESULTS` (default: 5).
 - **FR-004**: System MUST allow the number of retrieved chunks per collection for the guidance plugin to be configured via `GUIDANCE_N_RESULTS` (default: 5).
 - **FR-005**: System MUST allow per-plugin minimum retrieval score thresholds via `EXPERT_MIN_SCORE` (default: 0.3) and `GUIDANCE_MIN_SCORE` (default: 0.3). These defaults match the current `retrieval_score_threshold=0.3` behavior (FR-009). A score of 0.0 means no filtering.
-- **FR-006**: System MUST allow a maximum context character budget to be configured via `MAX_CONTEXT_CHARS` (default: 20,000). When the budget is exceeded, the system MUST merge all retrieved chunks from both expert and guidance plugins into a single pool and drop the lowest-scoring chunks globally until the total context fits within the budget.
+- **FR-006**: System MUST allow a maximum context character budget to be configured via `MAX_CONTEXT_CHARS` (default: 20,000). When the budget is exceeded, the active plugin MUST apply the budget within its own merged retrieval set and drop the lowest-scoring chunks until the total context fits within the budget. Each plugin enforces the budget independently (plugins run in isolated containers).
 - **FR-007**: System MUST allow the minimum chunk count for triggering summarization to be configured via `SUMMARY_CHUNK_THRESHOLD` (default: 4). Documents with chunk count `>= SUMMARY_CHUNK_THRESHOLD` are summarized. The default of 4 preserves the current `> 3` behavior exactly (FR-009).
 - **FR-008**: System MUST validate all configuration values at load time and reject invalid values with clear error messages.
 - **FR-009**: System MUST preserve existing behavior when none of the new environment variables are set (full backward compatibility).
@@ -121,12 +121,12 @@ As a platform operator, I want to control the minimum number of chunks a documen
 - Q: EXPERT_N_RESULTS default is 5 (FR-003) or 10 (User Story 2 scenario 5)? → A: Default is 5 (FR-003 is authoritative; User Story 2 scenario 5 corrected).
 - Q: When MAX_CONTEXT_CHARS is exceeded, how should the system truncate? → A: Drop lowest-scoring chunks first until under budget.
 - Q: Which providers must the summarization LLM support? → A: All providers the main LLM already supports (OpenAI, Mistral, Anthropic).
-- Q: Should the system log which model was used for each summarization call? → A: Yes, log model name + token count per call at INFO level.
+- Q: Should the system log which model was used for each summarization call? → A: Yes, log model name + document ID per call at INFO level. Token usage (input/output tokens) logged at DEBUG level per FR-011.
 - Q: When the summarization LLM call fails, what should the system do? → A: Retry up to 3 times, then skip summarization and continue ingestion without a summary for that document.
 - Q: When SUMMARIZE_LLM_TEMPERATURE is not set but the summarization LLM is otherwise configured, what temperature to use? → A: Default to 0.3 (low temperature suited for summarization), overridable via SUMMARIZE_LLM_TEMPERATURE.
 - Q: Should MIN_RETRIEVAL_SCORE be a single global threshold or per-plugin? → A: Per-plugin: EXPERT_MIN_SCORE and GUIDANCE_MIN_SCORE (no global).
 - Q: Should per-space/per-knowledge-base configuration be explicitly out of scope? → A: Yes, explicitly out of scope — this feature uses global env vars only.
-- Q: When MAX_CONTEXT_CHARS is exceeded and chunks come from both expert and guidance plugins, how does the dropping strategy operate? → A: Merged pool — combine all retrieved chunks from both plugins, drop lowest-scoring globally until under budget.
+- Q: When MAX_CONTEXT_CHARS is exceeded and chunks come from both expert and guidance plugins, how does the dropping strategy operate? → A: Budget is enforced per-plugin within the active plugin's merged retrieval set (plugins run in isolated containers). Each plugin drops its lowest-scoring chunks until under budget.
 - Q: Should the summarization LLM have its own timeout configuration? → A: Yes, separate `SUMMARIZE_LLM_TIMEOUT` env var, falls back to the main LLM timeout if unset.
 - Q: What is the minimum set of SUMMARIZE_LLM_* variables required to activate the separate summarization LLM? → A: All three required: SUMMARIZE_LLM_PROVIDER + SUMMARIZE_LLM_MODEL + SUMMARIZE_LLM_API_KEY. Any subset triggers fallback to the main LLM with a warning.
 - Q: Should the system log all resolved configuration values at startup? → A: Yes, log all new env var values at INFO level with API keys masked (e.g., `sk-****`).

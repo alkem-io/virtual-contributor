@@ -82,8 +82,16 @@ class TestGuidanceMinScore:
 
 
 class TestMaxContextChars:
-    """Test max_context_chars default."""
+    """Test max_context_chars validation."""
 
     def test_default_is_20000(self) -> None:
         config = BaseConfig(llm_api_key="key")
         assert config.max_context_chars == 20000
+
+    def test_rejects_zero(self) -> None:
+        with pytest.raises(ValueError, match="MAX_CONTEXT_CHARS"):
+            BaseConfig(llm_api_key="key", max_context_chars=0)
+
+    def test_rejects_negative(self) -> None:
+        with pytest.raises(ValueError, match="MAX_CONTEXT_CHARS"):
+            BaseConfig(llm_api_key="key", max_context_chars=-1)
