@@ -32,7 +32,7 @@ Build an evaluation framework that measures RAG pipeline quality using four core
 | P5 Best Available Infrastructure | N/A | CLI tool, not CI pipeline (CI deferred to US5) |
 | P6 Spec-Driven Development | PASS | Following SDD workflow now |
 | P7 No Filling Tests | PASS | Tests will validate meaningful evaluation paths — metric computation, dataset loading, comparison logic |
-| P8 ADR Required | ACTION | New external dependency (RAGAS) requires ADR per constitution. ADR to be created during implementation |
+| P8 ADR Required | PASS | ADR `0006-ragas-evaluation-framework.md` created — documents RAGAS selection rationale |
 | Microkernel Architecture | JUSTIFIED DEVIATION | Evaluation framework is a top-level `evaluation/` module, not a plugin or core domain logic. Justified: evaluation is an auxiliary development tool that invokes the pipeline but doesn't participate in runtime message processing |
 | Hexagonal Boundaries | PASS | Uses existing `LLMPort` and `KnowledgeStorePort` via tracing wrapper (Decorator pattern) — no adapter imports |
 | Plugin Contract | PASS | No modifications to plugin contract |
@@ -75,7 +75,7 @@ evaluations/             # Run results directory (gitignored)
 └── <timestamp>_<label>.json
 
 docs/adr/
-└── NNNN-ragas-evaluation-framework.md  # ADR for RAGAS dependency selection
+└── 0006-ragas-evaluation-framework.md  # ADR for RAGAS dependency selection
 
 tests/
 └── evaluation/
@@ -98,7 +98,7 @@ All gates from the initial check continue to pass after design completion. Speci
 | P2 SOLID | PASS | TracingKnowledgeStore follows Decorator pattern (OCP). Modules have clear SRP: runner, metrics, dataset, report, generator. DIP maintained — depends on port interfaces only |
 | P3 No Vendor Lock-in | PASS | RAGAS accepts any LangChain `BaseChatModel` via `LangchainLLMWrapper`. Swapping LLM providers requires zero evaluation code changes |
 | P4 Feedback Loops | PASS | Tests planned for all evaluation modules (runner, dataset, metrics, report, generator) |
-| P8 ADR | ACTION | ADR `NNNN-ragas-evaluation-framework.md` to be created during implementation phase. Decision: RAGAS over DeepEval/custom; rationale documented in research.md R1 |
+| P8 ADR | PASS | ADR `0006-ragas-evaluation-framework.md` created. Decision: RAGAS over DeepEval/custom; rationale documented in research.md R1 |
 | Hexagonal Boundaries | PASS | Data model uses Pydantic models independent of any adapter. Pipeline invoked via port-injected plugin instances |
 | Simplicity | PASS | 9 source files in `evaluation/`, 4 CLI commands mapping directly to user stories. No speculative abstractions |
 

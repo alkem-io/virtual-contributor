@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import math
+import re
 import statistics
 import time
 from datetime import datetime, timezone
@@ -50,14 +53,15 @@ class Scorer:
         )
         dataset = EvaluationDataset(samples=[sample])
 
-        result = evaluate(dataset=dataset, metrics=self._metrics)
+        result = await asyncio.to_thread(evaluate, dataset=dataset, metrics=self._metrics)
         df = result.to_pandas()
 
         scores: dict[str, float] = {}
         for name in METRIC_NAMES:
             if name in df.columns:
                 val = df[name].iloc[0]
-                scores[name] = float(val) if val is not None else 0.0
+                numeric = float(val) if val is not None else 0.0
+                scores[name] = numeric if math.isfinite(numeric) else 0.0
 
         return scores
 
@@ -90,7 +94,12 @@ class EvaluationRunner:
         run_start = time.monotonic()
         ts = datetime.now(timezone.utc)
         ts_str = ts.strftime("%Y%m%dT%H%M%S")
-        run_id = f"{ts_str}_{label}" if label else ts_str
+        safe_label = (
+            re.sub(r"[^A-Za-z0-9._-]+", "-", label).strip("-")
+            if label
+            else ""
+        )
+        run_id = f"{ts_str}_{safe_label}" if safe_label else ts_str
 
         cases: list[EvaluationCase] = []
         success_count = 0
@@ -102,11 +111,29 @@ class EvaluationRunner:
             logger.info("[%d/%d] Evaluating: \"%s\"", idx + 1, total, q_short)
 
             case_start = time.monotonic()
-            try:
-                # Invoke pipeline
-                answer, contexts, sources_meta = await self._invoker.invoke(tc.question)
+            answer: str | None = None
+            contexts: list[str] = []
+            sources_meta: list[dict] = []
 
-                # Score with RAGAS
+            try:
+                answer, contexts, sources_meta = await self._invoker.invoke(tc.question)
+            except Exception as exc:
+                case_duration = time.monotonic() - case_start
+                logger.warning(
+                    "[%d/%d] FAILED (%.1fs): %s", idx + 1, total, case_duration, exc
+                )
+                cases.append(EvaluationCase(
+                    index=idx,
+                    question=tc.question,
+                    expected_answer=tc.expected_answer,
+                    relevant_documents=tc.relevant_documents,
+                    error=str(exc),
+                    duration_seconds=case_duration,
+                ))
+                failure_count += 1
+                continue
+
+            try:
                 scores_dict = await self._scorer.score(
                     question=tc.question,
                     answer=answer,
@@ -138,13 +165,20 @@ class EvaluationRunner:
             except Exception as exc:
                 case_duration = time.monotonic() - case_start
                 logger.warning(
-                    "[%d/%d] FAILED (%.1fs): %s", idx + 1, total, case_duration, exc
+                    "[%d/%d] scoring FAILED (%.1fs): %s", idx + 1, total, case_duration, exc
                 )
+                sources = [
+                    SourceInfo(uri=s.get("uri"), title=s.get("title"), score=s.get("score"))
+                    for s in sources_meta
+                ]
                 cases.append(EvaluationCase(
                     index=idx,
                     question=tc.question,
                     expected_answer=tc.expected_answer,
                     relevant_documents=tc.relevant_documents,
+                    pipeline_answer=answer,
+                    retrieved_contexts=contexts,
+                    retrieved_sources=sources,
                     error=str(exc),
                     duration_seconds=case_duration,
                 ))

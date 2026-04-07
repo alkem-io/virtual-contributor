@@ -33,7 +33,7 @@ ingestion_output.txt
 poetry.lock
 
 # Evaluation results
-evaluations/
+evaluations/*
 !evaluations/.gitkeep
 
 # Specify
