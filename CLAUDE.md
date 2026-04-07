@@ -1,45 +1,93 @@
-# virtual-contributor Development Guidelines
+# CLAUDE.md
 
-Auto-generated from all feature plans. Last updated: 2026-04-06
-
-## Active Technologies
-- Python 3.12 + langchain ^1.1.0, langchain-openai ^1.1.0, langchain-mistralai ^1.1.0, langchain-anthropic (NEW — to add), langgraph ^1.0.4, pydantic ^2.11, pydantic-settings ^2.11.0, aio-pika 9.5.7 (002-multi-provider-llm)
-- ChromaDB (vector store via chromadb-client ^1.5.0), RabbitMQ (message transport) (002-multi-provider-llm)
-- Python 3.12 + langchain ^1.1.0, langchain-openai ^1.1.0, langchain-mistralai ^1.1.0, langgraph ^1.0.4, pydantic ^2.11, httpx ^0.27.2, aio-pika 9.5.7, chromadb-client ^1.5.0, beautifulsoup4 ^4.14 (003-async-perf-optimize)
-- ChromaDB (vector store), RabbitMQ (message transport) (003-async-perf-optimize)
-- ChromaDB (vector store via HTTP client) (004-pipeline-engine-redesign)
-- Python 3.12 + langchain ^1.1.0, langchain-text-splitters ^0.3.8, chromadb-client ^1.5.0, pydantic ^2.11, aio-pika 9.5.7, hashlib (stdlib) (006-content-hash-dedup)
-- Python 3.12 (Poetry) + langchain ^1.1.0, langchain-openai ^1.1.0, langchain-mistralai ^1.1.0, langchain-anthropic ^0.3, langgraph ^1.0.4, pydantic ^2.11, pydantic-settings ^2.11.0, aio-pika 9.5.7, chromadb-client ^1.5.0, httpx ^0.27.2 (007-configurable-summarization)
-- ChromaDB (vector store via HTTP client), RabbitMQ (message transport) (007-configurable-summarization)
-
-- Python 3.12 + aio-pika 9.5.7, pydantic ^2.11, langchain ^1.1.0 + langgraph ^1.0.4, openai ^1.109, chromadb-client ^1.5.0, httpx ^0.27.2, beautifulsoup4 ^4.14
-
-## Project Structure
-
-```text
-core/
-plugins/
-tests/
-```
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Commands
 
 ```bash
-poetry run pytest                          # Run tests
-poetry run ruff check core/ plugins/ tests/  # Lint
-poetry run pyright core/ plugins/           # Type check
+# Dependencies
+poetry install
+
+# Run a specific plugin locally
+PLUGIN_TYPE=generic poetry run python main.py
+
+# Tests
+poetry run pytest                                              # All tests
+poetry run pytest tests/plugins/test_expert.py                 # Single file
+poetry run pytest tests/plugins/test_expert.py::test_handle    # Single test
+poetry run pytest --cov=core --cov=plugins --cov-report=term-missing  # Coverage
+
+# Lint & type check
+poetry run ruff check core/ plugins/ tests/
+poetry run pyright core/ plugins/
 ```
 
-## Code Style
+Tests use `asyncio_mode = "auto"` (pyproject.toml) — async test functions run automatically without `@pytest.mark.asyncio`.
 
-Python 3.12: Follow standard conventions
+## Architecture
 
-## Recent Changes
-- 007-configurable-summarization: Added Python 3.12 (Poetry) + langchain ^1.1.0, langchain-openai ^1.1.0, langchain-mistralai ^1.1.0, langchain-anthropic ^0.3, langgraph ^1.0.4, pydantic ^2.11, pydantic-settings ^2.11.0, aio-pika 9.5.7, chromadb-client ^1.5.0, httpx ^0.27.2
-- 006-content-hash-dedup: Added Python 3.12 + langchain ^1.1.0, langchain-text-splitters ^0.3.8, chromadb-client ^1.5.0, pydantic ^2.11, aio-pika 9.5.7, hashlib (stdlib)
-- 004-pipeline-engine-redesign: Added Python 3.12 + langchain ^1.1.0, langchain-openai ^1.1.0, langchain-mistralai ^1.1.0, langgraph ^1.0.4, pydantic ^2.11, httpx ^0.27.2, aio-pika 9.5.7, chromadb-client ^1.5.0, beautifulsoup4 ^4.14
-- 003-async-perf-optimize: Added Python 3.12 + langchain ^1.1.0, langchain-openai ^1.1.0, langchain-mistralai ^1.1.0, langgraph ^1.0.4, pydantic ^2.11, httpx ^0.27.2, aio-pika 9.5.7, chromadb-client ^1.5.0, beautifulsoup4 ^4.14
+**Microkernel + Hexagonal (Ports and Adapters)**. Consolidates 7 formerly standalone services into one Python 3.12 codebase.
 
+### Core (`core/`)
 
-<!-- MANUAL ADDITIONS START -->
-<!-- MANUAL ADDITIONS END -->
+- **Ports** (`core/ports/`): `@runtime_checkable` Protocol classes — `LLMPort`, `EmbeddingsPort`, `KnowledgeStorePort`, `TransportPort`. Plugins depend on these, never on concrete adapters.
+- **Adapters** (`core/adapters/`): Concrete implementations — `LangChainLLMAdapter` (Mistral/OpenAI/Anthropic via `core/provider_factory.py`), `ChromaDBAdapter`, `RabbitMQAdapter`, embedding adapters.
+- **Container** (`core/container.py`): IoC container. `resolve_for_plugin(plugin_class)` introspects `__init__` type hints to auto-inject only the ports a plugin needs.
+- **Registry** (`core/registry.py`): Discovers plugins by importing `plugins.{plugin_type}.plugin` and finding the class with `name` + `event_type` attributes.
+- **Router** (`core/router.py`): Content-based message routing — `parse_event()` dispatches to the correct Pydantic event model, `build_response_envelope()` wraps the response.
+- **Config** (`core/config.py`): Pydantic Settings with env var binding. Per-plugin LLM overrides via `{PLUGIN_NAME}_LLM_*` env var prefix. Separate `summarize_llm_*` settings for ingest pipelines.
+
+### Plugins (`plugins/`)
+
+No base class — duck-typed `PluginContract` protocol:
+```python
+class PluginContract(Protocol):
+    name: str
+    event_type: type
+    async def startup() -> None: ...
+    async def shutdown() -> None: ...
+    async def handle(event) -> Response: ...
+```
+
+| Plugin | Purpose |
+|--------|---------|
+| `expert` | PromptGraph (LangGraph) + single-collection RAG retrieval |
+| `generic` | Direct LLM with optional history condensation |
+| `guidance` | Multi-collection RAG (3 Alkemio knowledge bases in parallel) |
+| `openai_assistant` | OpenAI Assistants API with thread management |
+| `ingest_website` | Web crawler → chunk → hash → embed → store pipeline |
+| `ingest_space` | Alkemio GraphQL space tree → same ingest pipeline |
+
+### Message Flow
+
+```
+RabbitMQ → Router.parse_event(body) → Plugin.handle(event) → Router.build_response_envelope() → RabbitMQ
+```
+
+### Domain (`core/domain/`)
+
+- **Pipeline engine** (`pipeline/engine.py`): Ordered step executor for ingest. Steps (`pipeline/steps.py`): Chunk → ContentHash → ChangeDetection → Summarize → Embed → Store → OrphanCleanup.
+- **PromptGraph** (`prompt_graph.py`): Compiles JSON graph definitions into LangGraph `StateGraph`. Nodes have prompt templates, input variables, and optional Pydantic output schemas.
+- **Ingest models** (`ingest_pipeline.py`): `Document`, `Chunk`, `DocumentMetadata`, `IngestResult`.
+
+### Events (`core/events/`)
+
+Pydantic models with camelCase aliases (wire format). Key types: `Input` (queries), `Response` + `Source` (answers), `IngestWebsite`, `IngestBodyOfKnowledge`.
+
+### Startup (`main.py`)
+
+Config → logging → plugin discovery → adapter wiring (via container) → plugin startup → RabbitMQ consume loop → health server on `:8080` (`/healthz`, `/readyz`).
+
+## Testing Conventions
+
+- Mock ports in `tests/conftest.py`: `MockLLMPort`, `MockEmbeddingsPort`, `MockKnowledgeStorePort` — in-memory implementations with call tracking.
+- Event factories: `make_input(...)`, `make_ingest_website(...)` for building test events with sensible defaults.
+- Plugin tests instantiate with mock ports, call `handle()`, and assert on LLM calls, knowledge store queries, and response content.
+
+## Key Design Decisions
+
+- `docs/adr/` contains Architecture Decision Records (microkernel, plugin contract, unified LLM adapter, content hash dedup).
+- All I/O is async; sync LangChain LLM calls are wrapped with `asyncio.to_thread`.
+- LLM retries: 3 attempts with exponential backoff (1s base).
+- RAG context budget: `max_context_chars` (default 20000) drops lowest-scoring chunks first.
+- Content deduplication: SHA-256 hashes on chunks, with change detection and orphan cleanup during ingest.
