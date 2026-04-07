@@ -48,6 +48,14 @@ class LangChainLLMAdapter:
     def _sync_invoke(self, lc_messages: list[BaseMessage]) -> str:
         """Synchronous LLM call — runs in a thread to avoid blocking the event loop."""
         result = self._llm.invoke(lc_messages)
+        # Log token usage if available (FR-011)
+        usage = getattr(result, "usage_metadata", None)
+        if usage:
+            logger.debug(
+                "Token usage — input: %s, output: %s",
+                usage.get("input_tokens", "N/A"),
+                usage.get("output_tokens", "N/A"),
+            )
         return str(result.content)
 
     async def invoke(self, messages: list[dict]) -> str:

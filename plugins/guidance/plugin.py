@@ -37,11 +37,15 @@ class GuidancePlugin:
         llm: LLMPort,
         knowledge_store: KnowledgeStorePort,
         *,
+        n_results: int = 5,
         score_threshold: float = 0.3,
+        max_context_chars: int = 20000,
     ) -> None:
         self._llm = llm
         self._knowledge_store = knowledge_store
+        self._n_results = n_results
         self._score_threshold = score_threshold
+        self._max_context_chars = max_context_chars
 
     async def startup(self) -> None:
         logger.info("GuidancePlugin started")
@@ -68,11 +72,13 @@ class GuidancePlugin:
             question = condensed
 
         # Query multiple collections in parallel
+        n_results = self._n_results
+
         async def _query_collection(collection: str):
             docs, sources = [], []
             try:
                 result = await self._knowledge_store.query(
-                    collection=collection, query_texts=[question], n_results=5,
+                    collection=collection, query_texts=[question], n_results=n_results,
                 )
                 if result.documents:
                     for i, doc in enumerate(result.documents[0]):
@@ -116,7 +122,25 @@ class GuidancePlugin:
                 seen_sources.add(key)
                 deduped.append((doc, src))
 
-        deduped = deduped[:5]
+        deduped = deduped[:self._n_results]
+
+        # Context budget enforcement — drop lowest-scoring chunks if over budget
+        total_chars = sum(len(doc) for doc, _ in deduped)
+        if total_chars > self._max_context_chars:
+            kept: list[tuple[str, Source]] = []
+            accumulated = 0
+            for doc, src in deduped:
+                if accumulated + len(doc) > self._max_context_chars:
+                    break
+                kept.append((doc, src))
+                accumulated += len(doc)
+            dropped = len(deduped) - len(kept)
+            dropped_chars = total_chars - accumulated
+            logger.warning(
+                "Context budget exceeded: dropped %d chunks (%d chars)",
+                dropped, dropped_chars,
+            )
+            deduped = kept
 
         all_docs = [doc for doc, _ in deduped]
         all_sources = [src for _, src in deduped]

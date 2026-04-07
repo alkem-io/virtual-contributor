@@ -2,8 +2,12 @@ from __future__ import annotations
 
 from enum import Enum
 
+import logging
+
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings
+
+logger = logging.getLogger(__name__)
 
 
 class LLMProvider(str, Enum):
@@ -103,6 +107,77 @@ class BaseConfig(BaseSettings):
                 f"RABBITMQ_MAX_RETRIES must be >= 1, got {self.rabbitmq_max_retries}"
             )
 
+        # Summarization LLM validation
+        if self.summarize_llm_temperature is not None and not (
+            0.0 <= self.summarize_llm_temperature <= 2.0
+        ):
+            raise ValueError(
+                f"SUMMARIZE_LLM_TEMPERATURE must be between 0.0 and 2.0, "
+                f"got {self.summarize_llm_temperature}"
+            )
+        if self.summarize_llm_timeout is not None and self.summarize_llm_timeout <= 0:
+            raise ValueError(
+                f"SUMMARIZE_LLM_TIMEOUT must be greater than 0, "
+                f"got {self.summarize_llm_timeout}"
+            )
+
+        # Per-plugin retrieval validation
+        if self.expert_n_results <= 0:
+            raise ValueError(
+                f"EXPERT_N_RESULTS must be greater than 0, got {self.expert_n_results}"
+            )
+        if self.guidance_n_results <= 0:
+            raise ValueError(
+                f"GUIDANCE_N_RESULTS must be greater than 0, got {self.guidance_n_results}"
+            )
+        if not (0.0 <= self.expert_min_score <= 1.0):
+            raise ValueError(
+                f"EXPERT_MIN_SCORE must be between 0.0 and 1.0, got {self.expert_min_score}"
+            )
+        if not (0.0 <= self.guidance_min_score <= 1.0):
+            raise ValueError(
+                f"GUIDANCE_MIN_SCORE must be between 0.0 and 1.0, got {self.guidance_min_score}"
+            )
+
+        # Context budget validation
+        if self.max_context_chars <= 0:
+            raise ValueError(
+                f"MAX_CONTEXT_CHARS must be greater than 0, got {self.max_context_chars}"
+            )
+        if self.max_context_chars < 1000:
+            logger.warning(
+                "MAX_CONTEXT_CHARS=%d is very low — may cause excessive chunk dropping",
+                self.max_context_chars,
+            )
+
+        # Chunk threshold validation
+        if self.summary_chunk_threshold <= 0:
+            raise ValueError(
+                f"SUMMARY_CHUNK_THRESHOLD must be greater than 0, "
+                f"got {self.summary_chunk_threshold}"
+            )
+
+        # Partial summarize config warning
+        summarize_fields = [
+            self.summarize_llm_provider,
+            self.summarize_llm_model,
+            self.summarize_llm_api_key,
+        ]
+        set_count = sum(1 for f in summarize_fields if f is not None)
+        if 0 < set_count < 3:
+            missing = []
+            if self.summarize_llm_provider is None:
+                missing.append("SUMMARIZE_LLM_PROVIDER")
+            if self.summarize_llm_model is None:
+                missing.append("SUMMARIZE_LLM_MODEL")
+            if self.summarize_llm_api_key is None:
+                missing.append("SUMMARIZE_LLM_API_KEY")
+            logger.warning(
+                "Partial summarization LLM config — missing: %s. "
+                "Falling back to main LLM for summarization.",
+                ", ".join(missing),
+            )
+
         return self
 
     # Embeddings
@@ -110,7 +185,26 @@ class BaseConfig(BaseSettings):
     embeddings_endpoint: str | None = None
     embeddings_model_name: str | None = None
 
-    # Retrieval
+    # Summarization LLM — optional separate model for summarization tasks
+    summarize_llm_provider: LLMProvider | None = None
+    summarize_llm_model: str | None = None
+    summarize_llm_api_key: str | None = None
+    summarize_llm_temperature: float | None = None
+    summarize_llm_timeout: int | None = None
+
+    # Retrieval — per-plugin parameters
+    expert_n_results: int = 5
+    expert_min_score: float = 0.3
+    guidance_n_results: int = 5
+    guidance_min_score: float = 0.3
+
+    # Context budget
+    max_context_chars: int = 20000
+
+    # Summarization threshold
+    summary_chunk_threshold: int = 4
+
+    # Retrieval — deprecated global fields (kept for backward compat)
     retrieval_n_results: int = 5
     retrieval_score_threshold: float = 0.3
 

@@ -62,11 +62,13 @@ class ExpertPlugin:
         *,
         n_results: int = 5,
         score_threshold: float = 0.3,
+        max_context_chars: int = 20000,
     ) -> None:
         self._llm = llm
         self._knowledge_store = knowledge_store
         self._n_results = n_results
         self._score_threshold = score_threshold
+        self._max_context_chars = max_context_chars
 
     async def startup(self) -> None:
         logger.info("ExpertPlugin started")
@@ -85,6 +87,53 @@ class ExpertPlugin:
         # Fallback: simple RAG
         return await self._handle_simple(event, collection)
 
+    def _enforce_context_budget(
+        self, docs: list[str], filtered_result: QueryResult,
+    ) -> tuple[list[str], QueryResult]:
+        """Drop lowest-scoring chunks if total chars exceed max_context_chars."""
+        raw_docs_check = filtered_result.documents[0] if filtered_result.documents else []
+        total_raw_chars = sum(len(d) for d in raw_docs_check)
+        if total_raw_chars <= self._max_context_chars:
+            return docs, filtered_result
+
+        # docs are already in score order from _filter_and_format
+        kept_docs, kept_distances, kept_metadatas, kept_ids = [], [], [], []
+        accumulated = 0
+        raw_docs = filtered_result.documents[0] if filtered_result.documents else []
+        raw_distances = filtered_result.distances[0] if filtered_result.distances else []
+        raw_metadatas = filtered_result.metadatas[0] if filtered_result.metadatas else []
+        raw_ids = filtered_result.ids[0] if filtered_result.ids else []
+
+        kept_formatted = []
+        for i, doc in enumerate(docs):
+            raw_content = raw_docs[i] if i < len(raw_docs) else ""
+            if accumulated + len(raw_content) > self._max_context_chars:
+                break
+            kept_formatted.append(doc)
+            kept_docs.append(raw_content)
+            if i < len(raw_distances):
+                kept_distances.append(raw_distances[i])
+            if i < len(raw_metadatas):
+                kept_metadatas.append(raw_metadatas[i])
+            if i < len(raw_ids):
+                kept_ids.append(raw_ids[i])
+            accumulated += len(raw_content)
+
+        dropped = len(docs) - len(kept_formatted)
+        dropped_chars = total_raw_chars - accumulated
+        logger.warning(
+            "Context budget exceeded: dropped %d chunks (%d chars)",
+            dropped, dropped_chars,
+        )
+
+        new_result = QueryResult(
+            documents=[kept_docs],
+            metadatas=[kept_metadatas],
+            distances=[kept_distances],
+            ids=[kept_ids],
+        )
+        return kept_formatted, new_result
+
     async def _handle_with_graph(self, event: Input, collection: str) -> Response:
         from core.domain.prompt_graph import PromptGraph
 
@@ -93,6 +142,7 @@ class ExpertPlugin:
         # Create retrieve special node
         n_results = self._n_results
         score_threshold = self._score_threshold
+        enforce_budget = self._enforce_context_budget
 
         async def retrieve_node(state: dict) -> dict:
             query = state.get("current_question", event.message)
@@ -100,6 +150,7 @@ class ExpertPlugin:
                 collection=collection, query_texts=[query], n_results=n_results,
             )
             docs, filtered_result = _filter_and_format(result, score_threshold)
+            docs, filtered_result = enforce_budget(docs, filtered_result)
             knowledge = "\n".join(docs)
             return {"knowledge": knowledge, "sources": filtered_result}
 
@@ -134,6 +185,7 @@ class ExpertPlugin:
             collection=collection, query_texts=[event.message], n_results=self._n_results,
         )
         docs, result = _filter_and_format(result, self._score_threshold)
+        docs, result = self._enforce_context_budget(docs, result)
         knowledge = "\n".join(docs)
 
         from plugins.expert.prompts import combined_expert_prompt

@@ -38,10 +38,15 @@ class IngestWebsitePlugin:
         llm: LLMPort,
         embeddings: EmbeddingsPort,
         knowledge_store: KnowledgeStorePort,
+        *,
+        summarize_llm: LLMPort | None = None,
+        chunk_threshold: int = 4,
     ) -> None:
         self._llm = llm
         self._embeddings = embeddings
         self._knowledge_store = knowledge_store
+        self._summarize_llm = summarize_llm
+        self._chunk_threshold = chunk_threshold
         self._page_limit = 20  # Default, can be overridden by config
 
     async def startup(self) -> None:
@@ -86,14 +91,19 @@ class IngestWebsitePlugin:
             # Run ingest pipeline
             from core.config import BaseConfig
             config = BaseConfig()
+            summary_llm = self._summarize_llm or self._llm
             steps: list = [
                 ChunkStep(chunk_size=2000),
                 ContentHashStep(),
                 ChangeDetectionStep(knowledge_store_port=self._knowledge_store),
             ]
             if config.summarize_concurrency > 0:
-                steps.append(DocumentSummaryStep(llm_port=self._llm, concurrency=config.summarize_concurrency))
-                steps.append(BodyOfKnowledgeSummaryStep(llm_port=self._llm))
+                steps.append(DocumentSummaryStep(
+                    llm_port=summary_llm,
+                    concurrency=config.summarize_concurrency,
+                    chunk_threshold=self._chunk_threshold,
+                ))
+                steps.append(BodyOfKnowledgeSummaryStep(llm_port=summary_llm))
             steps.append(EmbedStep(embeddings_port=self._embeddings))
             steps.append(StoreStep(knowledge_store_port=self._knowledge_store))
             steps.append(OrphanCleanupStep(knowledge_store_port=self._knowledge_store))
