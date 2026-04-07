@@ -84,6 +84,10 @@ async def _run_evaluation(
         await invoker.setup()
     except Exception as exc:
         click.echo(f"Pipeline initialization failed: {exc}", err=True)
+        try:
+            await invoker.shutdown()
+        except Exception:
+            pass
         sys.exit(1)
 
     # Configure RAGAS metrics with pipeline's own LLM
@@ -137,8 +141,12 @@ def compare(baseline_id: str, current_id: str):
         click.echo(f"Current run not found: {current_path}", err=True)
         sys.exit(1)
 
-    baseline = EvaluationRun.model_validate_json(baseline_path.read_text())
-    current = EvaluationRun.model_validate_json(current_path.read_text())
+    try:
+        baseline = EvaluationRun.model_validate_json(baseline_path.read_text())
+        current = EvaluationRun.model_validate_json(current_path.read_text())
+    except (ValueError, OSError) as exc:
+        click.echo(f"Failed to load run files: {exc}", err=True)
+        sys.exit(1)
 
     report = compute_comparison(baseline, current)
     click.echo(format_comparison(report))

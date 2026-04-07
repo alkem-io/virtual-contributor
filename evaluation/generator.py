@@ -55,16 +55,17 @@ async def generate_synthetic_test_set(
 
     click.echo(f"Synthetic Generation: {collection}")
 
-    # Get all documents from the collection (use a broad query)
+    # Get documents from the collection using a broad retrieval query
     result = await ks.query(
         collection=collection,
-        query_texts=[""],
+        query_texts=["knowledge information overview"],
         n_results=min(500, count * 10),
     )
 
     if not result.documents or not result.documents[0]:
-        click.echo("Error: No documents found in collection", err=True)
-        return
+        raise click.ClickException(
+            f"No documents found in collection '{collection}'"
+        )
 
     docs = result.documents[0]
     metadatas = result.metadatas[0] if result.metadatas else [{}] * len(docs)
@@ -94,23 +95,32 @@ async def generate_synthetic_test_set(
     # Convert RAGAS testset to our TestCase format
     cases: list[TestCase] = []
     for sample in testset.samples:
-        # Extract source documents from the sample's reference contexts
-        relevant_docs = []
+        question = sample.user_input or ""
+        expected_answer = sample.reference or sample.response or ""
+        if not question or not expected_answer:
+            continue
+
+        # Extract source URIs from sample metadata
+        relevant_docs: list[str] = []
         if hasattr(sample, "reference_contexts") and sample.reference_contexts:
             for ctx in sample.reference_contexts:
                 if isinstance(ctx, str) and ctx.startswith("http"):
                     relevant_docs.append(ctx)
         if not relevant_docs:
-            relevant_docs = [collection]
+            # Fall back to source metadata from the original documents
+            for lc_doc in lc_documents:
+                src = lc_doc.metadata.get("source", "")
+                if src and src not in relevant_docs:
+                    relevant_docs.append(src)
+                    break
+        if not relevant_docs:
+            continue  # Drop samples without traceable source URIs
 
         cases.append(TestCase(
-            question=sample.user_input or "",
-            expected_answer=sample.reference or sample.response or "",
+            question=question,
+            expected_answer=expected_answer,
             relevant_documents=relevant_docs,
         ))
-
-    # Filter out empty cases
-    cases = [c for c in cases if c.question and c.expected_answer]
 
     _write_synthetic_cases(cases, output)
 

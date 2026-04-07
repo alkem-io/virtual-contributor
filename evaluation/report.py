@@ -86,7 +86,7 @@ class ComparisonReport(BaseModel):
 METRIC_NAMES = ["faithfulness", "answer_relevancy", "context_precision", "context_recall"]
 
 
-def format_run_summary(run: EvaluationRun) -> str:
+def format_run_summary(run: EvaluationRun, output_path: str | None = None) -> str:
     """Format a human-readable summary for a completed evaluation run."""
     duration_min = int(run.duration_seconds // 60)
     duration_sec = int(run.duration_seconds % 60)
@@ -115,7 +115,8 @@ def format_run_summary(run: EvaluationRun) -> str:
         lines.append(f'  [{c.index}] "{q_short}" — {c.error}')
 
     lines.append("")
-    lines.append(f"Results saved: evaluations/{run.id}.json")
+    saved_path = output_path or f"evaluations/{run.id}.json"
+    lines.append(f"Results saved: {saved_path}")
 
     return "\n".join(lines)
 

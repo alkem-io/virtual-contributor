@@ -17,7 +17,7 @@ poetry run python -m evaluation run --plugin guidance --label baseline
 ```
 
 This will:
-- Load the 50+ test cases from `evaluation/golden/test_set.jsonl`
+- Load the curated test cases from `evaluation/golden/test_set.jsonl`
 - Query the pipeline with each test question (in-process, no server needed)
 - Score each response using RAGAS metrics with the local LLM as judge
 - Save results to `evaluations/20260406T143022_baseline.json`

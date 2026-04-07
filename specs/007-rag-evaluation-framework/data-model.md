@@ -147,7 +147,7 @@ class ComparisonReport(BaseModel):
 
 ## Entity Relationships
 
-```
+```text
 TestCase (JSONL file)
     │
     │ loaded by dataset.py
@@ -171,7 +171,7 @@ ComparisonReport (stdout / JSON)
 
 ### EvaluationCase lifecycle
 
-```
+```text
 PENDING → RUNNING → COMPLETED (scores populated)
                   → FAILED (error populated, scores null)
 ```
@@ -183,7 +183,7 @@ PENDING → RUNNING → COMPLETED (scores populated)
 
 ### EvaluationRun lifecycle
 
-```
+```text
 CREATED → RUNNING → COMPLETED (file persisted)
 ```
 
