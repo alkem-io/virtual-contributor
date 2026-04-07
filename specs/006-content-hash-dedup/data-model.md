@@ -166,10 +166,11 @@ class IngestResult:
 **Responsibility**: Delete orphaned chunks and chunks from removed documents.
 
 **Behavior**:
-1. If `context.orphan_ids` is non-empty, call `knowledge_store.delete(collection, ids=list(orphan_ids))`.
-2. For each `doc_id` in `context.removed_document_ids`, call `knowledge_store.delete(collection, where={"documentId": doc_id})`.
-3. Update `context.chunks_deleted` with the total count.
-4. Log deletion counts at INFO level.
+1. If any `StoreStep` errors exist in `context.errors`, skip cleanup entirely (avoid deleting orphans when replacements may not have been stored).
+2. If `context.orphan_ids` is non-empty, call `knowledge_store.delete(collection, ids=list(orphan_ids))`.
+3. For each `doc_id` in `context.removed_document_ids`, call `knowledge_store.delete(collection, where={"documentId": doc_id})` for content chunks and `knowledge_store.delete(collection, where={"documentId": f"{doc_id}-summary"})` for summary chunks.
+4. Update `context.chunks_deleted` with the total count.
+5. Log deletion counts at INFO level.
 
 **Dependencies**: `KnowledgeStorePort` (injected via constructor).
 

@@ -827,6 +827,27 @@ class TestOrphanCleanupStep:
         assert len(store.collections["coll"]) == 1
         assert len(ctx.errors) == 0
 
+    async def test_skips_cleanup_on_store_step_errors(self):
+        """Cleanup is skipped when StoreStep had write failures."""
+        store = MockKnowledgeStorePort()
+        store.collections["coll"] = [
+            {"id": "orphan-1", "metadata": {"documentId": "doc-1"}, "document": "old"},
+        ]
+
+        ctx = PipelineContext(
+            collection_name="coll",
+            documents=[],
+            orphan_ids={"orphan-1"},
+            errors=["StoreStep: storage failed for batch 0: connection refused"],
+        )
+        await OrphanCleanupStep(knowledge_store_port=store).execute(ctx)
+
+        # Orphan should NOT have been deleted
+        remaining_ids = [it["id"] for it in store.collections["coll"]]
+        assert "orphan-1" in remaining_ids
+        assert ctx.chunks_deleted == 0
+        assert any("skipped cleanup" in e for e in ctx.errors)
+
     async def test_step_name(self):
         store = MockKnowledgeStorePort()
         assert OrphanCleanupStep(knowledge_store_port=store).name == "orphan_cleanup"
