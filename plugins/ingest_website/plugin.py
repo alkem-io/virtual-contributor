@@ -8,10 +8,13 @@ from urllib.parse import urlparse
 from core.domain.ingest_pipeline import Document, DocumentMetadata
 from core.domain.pipeline import (
     BodyOfKnowledgeSummaryStep,
+    ChangeDetectionStep,
     ChunkStep,
+    ContentHashStep,
     DocumentSummaryStep,
     EmbedStep,
     IngestEngine,
+    OrphanCleanupStep,
     StoreStep,
 )
 from core.events.ingest_website import IngestWebsite, IngestWebsiteResult, IngestionResult
@@ -53,9 +56,6 @@ class IngestWebsitePlugin:
             netloc = urlparse(event.base_url).netloc.replace(":", "-")
             collection_name = f"{netloc}-knowledge"
 
-            # Delete existing collection for re-ingestion
-            await self._knowledge_store.delete_collection(collection_name)
-
             # Crawl
             pages = await crawl(event.base_url, page_limit=self._page_limit)
 
@@ -86,12 +86,17 @@ class IngestWebsitePlugin:
             # Run ingest pipeline
             from core.config import BaseConfig
             config = BaseConfig()
-            steps = [ChunkStep(chunk_size=2000)]
+            steps: list = [
+                ChunkStep(chunk_size=2000),
+                ContentHashStep(),
+                ChangeDetectionStep(knowledge_store_port=self._knowledge_store),
+            ]
             if config.summarize_concurrency > 0:
                 steps.append(DocumentSummaryStep(llm_port=self._llm, concurrency=config.summarize_concurrency))
                 steps.append(BodyOfKnowledgeSummaryStep(llm_port=self._llm))
             steps.append(EmbedStep(embeddings_port=self._embeddings))
             steps.append(StoreStep(knowledge_store_port=self._knowledge_store))
+            steps.append(OrphanCleanupStep(knowledge_store_port=self._knowledge_store))
             engine = IngestEngine(steps=steps)
             result = await engine.run(documents, collection_name)
 

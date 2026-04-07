@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from dataclasses import replace
 
@@ -102,6 +103,138 @@ class ChunkStep:
 
 
 # ---------------------------------------------------------------------------
+# ContentHashStep
+# ---------------------------------------------------------------------------
+
+
+class ContentHashStep:
+    """Compute SHA-256 content fingerprint for each content chunk."""
+
+    @property
+    def name(self) -> str:
+        return "content_hash"
+
+    async def execute(self, context: PipelineContext) -> None:
+        for chunk in context.chunks:
+            if chunk.metadata.embedding_type != "chunk":
+                continue
+            canonical = "\0".join([
+                chunk.content,
+                chunk.metadata.title,
+                chunk.metadata.source,
+                chunk.metadata.type,
+                chunk.metadata.document_id,
+            ])
+            chunk.content_hash = hashlib.sha256(
+                canonical.encode("utf-8")
+            ).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# ChangeDetectionStep
+# ---------------------------------------------------------------------------
+
+
+class ChangeDetectionStep:
+    """Query store for existing chunks, mark unchanged, identify orphans."""
+
+    def __init__(self, knowledge_store_port: KnowledgeStorePort) -> None:
+        self._store = knowledge_store_port
+
+    @property
+    def name(self) -> str:
+        return "change_detection"
+
+    async def execute(self, context: PipelineContext) -> None:
+        try:
+            await self._detect(context)
+        except Exception as exc:
+            logger.warning(
+                "Change detection failed, treating all chunks as new: %s", exc
+            )
+            context.unchanged_chunk_hashes.clear()
+            context.orphan_ids.clear()
+            context.removed_document_ids.clear()
+            context.changed_document_ids.clear()
+            context.chunks_skipped = 0
+            for chunk in context.chunks:
+                if chunk.metadata.embedding_type == "chunk":
+                    chunk.embedding = None
+
+    async def _detect(self, context: PipelineContext) -> None:
+        # Collect current document IDs from content chunks
+        current_doc_ids: set[str] = set()
+        chunks_by_doc: dict[str, list] = {}
+        for chunk in context.chunks:
+            if chunk.metadata.embedding_type != "chunk":
+                continue
+            doc_id = chunk.metadata.document_id
+            current_doc_ids.add(doc_id)
+            chunks_by_doc.setdefault(doc_id, []).append(chunk)
+
+        # Get all existing document IDs from store (content chunks only)
+        all_existing = await self._store.get(
+            collection=context.collection_name,
+            include=["metadatas"],
+        )
+        existing_doc_ids: set[str] = set()
+        if all_existing.metadatas:
+            for meta in all_existing.metadatas:
+                if meta.get("embeddingType") != "chunk":
+                    continue
+                doc_id_val = meta.get("documentId")
+                if doc_id_val:
+                    existing_doc_ids.add(doc_id_val)
+
+        # Detect removed documents
+        context.removed_document_ids = existing_doc_ids - current_doc_ids
+
+        # Per-document change detection
+        for doc_id, doc_chunks in chunks_by_doc.items():
+            existing = await self._store.get(
+                collection=context.collection_name,
+                where={"documentId": doc_id},
+                include=["metadatas", "embeddings"],
+            )
+
+            existing_ids = set(existing.ids)
+            existing_embeddings: dict[str, list[float]] = {}
+            if existing.embeddings:
+                for eid, emb in zip(existing.ids, existing.embeddings):
+                    existing_embeddings[eid] = emb
+
+            new_hashes: set[str] = set()
+            for chunk in doc_chunks:
+                h = chunk.content_hash
+                if h is None:
+                    continue
+                new_hashes.add(h)
+                if h in existing_ids:
+                    # Unchanged — pre-load embedding so EmbedStep skips it
+                    if h in existing_embeddings:
+                        chunk.embedding = existing_embeddings[h]
+                    context.unchanged_chunk_hashes.add(h)
+                    context.chunks_skipped += 1
+                else:
+                    context.changed_document_ids.add(doc_id)
+
+            # Orphan detection for this document
+            orphans = existing_ids - new_hashes
+            if orphans:
+                context.changed_document_ids.add(doc_id)
+            context.orphan_ids.update(orphans)
+
+        context.change_detection_ran = True
+        logger.info(
+            "Change detection: %d skipped, %d changed docs, %d orphans, %d removed docs",
+            context.chunks_skipped,
+            len(context.changed_document_ids),
+            len(context.orphan_ids),
+            len(context.removed_document_ids),
+        )
+
+
+# ---------------------------------------------------------------------------
 # DocumentSummaryStep
 # ---------------------------------------------------------------------------
 
@@ -132,6 +265,10 @@ class DocumentSummaryStep:
             (doc_id, doc_chunks)
             for doc_id, doc_chunks in chunks_by_doc.items()
             if len(doc_chunks) > 3
+            and (
+                not context.change_detection_ran
+                or doc_id in context.changed_document_ids
+            )
         ]
 
         for doc_id, doc_chunks in docs_to_summarize:
@@ -186,6 +323,14 @@ class BodyOfKnowledgeSummaryStep:
         return "body_of_knowledge_summary"
 
     async def execute(self, context: PipelineContext) -> None:
+        # Skip if change detection ran and found no changes or removals
+        if (
+            context.change_detection_ran
+            and not context.changed_document_ids
+            and not context.removed_document_ids
+        ):
+            return
+
         # Collect unique document IDs from raw chunks (exclude summaries)
         seen_doc_ids: list[str] = []
         for chunk in context.chunks:
@@ -307,21 +452,24 @@ class StoreStep:
             metadatas = []
             ids = []
             for c in batch:
-                # Raw chunks get "{id}-chunk{i}" format matching the original repo.
-                # Summary and BoK chunks keep their document_id as-is.
-                if c.metadata.embedding_type == "chunk":
-                    storage_id = f"{c.metadata.document_id}-chunk{c.chunk_index}"
+                if c.metadata.embedding_type == "chunk" and c.content_hash:
+                    # Content-addressable: use content hash as storage ID
+                    storage_id = c.content_hash
+                elif c.metadata.embedding_type == "summary":
+                    # Deterministic summary ID
+                    storage_id = f"{c.metadata.document_id}-{c.chunk_index}"
                 else:
-                    storage_id = c.metadata.document_id
+                    # BoK summary or fallback
+                    storage_id = f"{c.metadata.document_id}-{c.chunk_index}"
                 metadatas.append({
-                    "documentId": storage_id,
+                    "documentId": c.metadata.document_id,
                     "source": c.metadata.source,
                     "type": c.metadata.type,
                     "title": c.metadata.title,
                     "embeddingType": c.metadata.embedding_type,
                     "chunkIndex": c.chunk_index,
                 })
-                ids.append(f"{storage_id}-{c.chunk_index}")
+                ids.append(storage_id)
             batch_embeddings = [c.embedding for c in batch]
 
             try:
@@ -337,4 +485,68 @@ class StoreStep:
                 context.errors.append(
                     f"StoreStep: storage failed for batch {i // self._batch_size}: {exc}"
                 )
+
+
+# ---------------------------------------------------------------------------
+# OrphanCleanupStep
+# ---------------------------------------------------------------------------
+
+
+class OrphanCleanupStep:
+    """Delete orphaned chunks and chunks from removed documents."""
+
+    def __init__(self, knowledge_store_port: KnowledgeStorePort) -> None:
+        self._store = knowledge_store_port
+
+    @property
+    def name(self) -> str:
+        return "orphan_cleanup"
+
+    async def execute(self, context: PipelineContext) -> None:
+        if any(e.startswith("StoreStep:") for e in context.errors):
+            context.errors.append(
+                "OrphanCleanupStep: skipped cleanup because earlier storage writes failed"
+            )
+            return
+
+        deleted = 0
+
+        # Delete orphan chunk IDs
+        if context.orphan_ids:
+            try:
+                await self._store.delete(
+                    collection=context.collection_name,
+                    ids=list(context.orphan_ids),
+                )
+                deleted += len(context.orphan_ids)
+            except Exception as exc:
+                context.errors.append(
+                    f"OrphanCleanupStep: failed to delete orphan chunks: {exc}"
+                )
+
+        # Delete all chunks for removed documents (content + summary)
+        for doc_id in context.removed_document_ids:
+            try:
+                await self._store.delete(
+                    collection=context.collection_name,
+                    where={"documentId": doc_id},
+                )
+                # Also delete the document's summary chunks
+                await self._store.delete(
+                    collection=context.collection_name,
+                    where={"documentId": f"{doc_id}-summary"},
+                )
+                deleted += 1
+            except Exception as exc:
+                context.errors.append(
+                    f"OrphanCleanupStep: failed to delete chunks for removed document {doc_id}: {exc}"
+                )
+
+        context.chunks_deleted = deleted
+        if deleted > 0:
+            logger.info(
+                "Orphan cleanup: deleted %d orphan chunks, cleaned %d removed documents",
+                len(context.orphan_ids),
+                len(context.removed_document_ids),
+            )
 

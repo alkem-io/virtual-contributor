@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
@@ -157,13 +157,20 @@ class TestIngestWebsitePlugin:
         )
 
     async def test_pipeline_composition(self, plugin):
-        """Verify IngestEngine is used and old collection is replaced."""
+        """Verify IngestEngine is used with incremental dedup (no delete_collection)."""
         event = make_ingest_website()
         mock_pages = [{"url": "https://example.com", "html": "<p>Content for ingestion test.</p>"}]
-        with patch("plugins.ingest_website.plugin.crawl", return_value=mock_pages):
+
+        mock_config = MagicMock()
+        mock_config.summarize_concurrency = 0
+
+        with patch("plugins.ingest_website.plugin.crawl", return_value=mock_pages), \
+             patch("core.config.BaseConfig", return_value=mock_config):
             result = await plugin.handle(event)
         assert isinstance(result, IngestWebsiteResult)
-        assert "example.com-knowledge" in plugin._knowledge_store.deleted
+        # delete_collection is no longer called — incremental dedup replaces it
+        assert plugin._knowledge_store.deleted == []
+        assert "example.com-knowledge" in plugin._knowledge_store.collections
 
     async def test_unsupported_content_skip(self, plugin):
         """Empty crawl results should still succeed."""

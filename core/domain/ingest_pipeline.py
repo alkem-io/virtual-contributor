@@ -38,6 +38,7 @@ class Chunk:
     chunk_index: int
     summary: str | None = None
     embedding: list[float] | None = None
+    content_hash: str | None = None
 
 
 @dataclass
@@ -54,3 +55,5 @@ class IngestResult:
     chunks_stored: int
     errors: list[str] = field(default_factory=list)
     success: bool = True
+    chunks_skipped: int = 0
+    chunks_deleted: int = 0

@@ -6,7 +6,7 @@ from typing import Any, Protocol
 
 import chromadb
 
-from core.ports.knowledge_store import QueryResult
+from core.ports.knowledge_store import GetResult, QueryResult
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +109,59 @@ class ChromaDBAdapter:
                 raise
 
         await self._retry(_delete)
+
+    async def get(
+        self,
+        collection: str,
+        ids: list[str] | None = None,
+        where: dict | None = None,
+        include: list[str] | None = None,
+    ) -> GetResult:
+        def _get():
+            col = self._client.get_or_create_collection(
+                collection, embedding_function=None
+            )
+            kwargs: dict = {}
+            if ids is not None:
+                kwargs["ids"] = ids
+            if where is not None:
+                kwargs["where"] = where
+            if include is not None:
+                kwargs["include"] = include
+            result = col.get(**kwargs)
+            return GetResult(
+                ids=result.get("ids", []),
+                metadatas=result.get("metadatas"),
+                documents=result.get("documents"),
+                embeddings=result.get("embeddings"),
+            )
+
+        return await self._retry(_get)
+
+    async def delete(
+        self,
+        collection: str,
+        ids: list[str] | None = None,
+        where: dict | None = None,
+    ) -> None:
+        def _delete_items():
+            try:
+                col = self._client.get_or_create_collection(
+                    collection, embedding_function=None
+                )
+                kwargs: dict = {}
+                if ids is not None:
+                    kwargs["ids"] = ids
+                if where is not None:
+                    kwargs["where"] = where
+                col.delete(**kwargs)
+            except Exception as exc:
+                msg = str(exc).lower()
+                if "not found" in msg or "does not exist" in msg:
+                    return
+                raise
+
+        await self._retry(_delete_items)
 
     @staticmethod
     async def _retry(fn, max_retries: int = MAX_RETRIES) -> Any:
