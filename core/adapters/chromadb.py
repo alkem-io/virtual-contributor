@@ -28,6 +28,7 @@ class ChromaDBAdapter:
         port: int = 8765,
         credentials: str | None = None,
         embeddings: EmbedFn | None = None,
+        distance_fn: str = "cosine",
     ) -> None:
         settings = chromadb.config.Settings()
         if credentials:
@@ -41,6 +42,7 @@ class ChromaDBAdapter:
             settings=settings,
         )
         self._embeddings = embeddings
+        self._distance_fn = distance_fn
 
     async def query(
         self,
@@ -57,7 +59,9 @@ class ChromaDBAdapter:
 
         def _query():
             col = self._client.get_or_create_collection(
-                collection, embedding_function=None
+                collection,
+                embedding_function=None,
+                metadata={"hnsw:space": self._distance_fn},
             )
             results = col.query(
                 query_embeddings=query_embeddings, n_results=n_results
@@ -86,7 +90,9 @@ class ChromaDBAdapter:
 
         def _ingest():
             col = self._client.get_or_create_collection(
-                collection, embedding_function=None
+                collection,
+                embedding_function=None,
+                metadata={"hnsw:space": self._distance_fn},
             )
             col.upsert(
                 documents=documents,
@@ -119,7 +125,9 @@ class ChromaDBAdapter:
     ) -> GetResult:
         def _get():
             col = self._client.get_or_create_collection(
-                collection, embedding_function=None
+                collection,
+                embedding_function=None,
+                metadata={"hnsw:space": self._distance_fn},
             )
             kwargs: dict = {}
             if ids is not None:
