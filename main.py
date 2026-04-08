@@ -130,6 +130,7 @@ def _create_adapters(config: BaseConfig, container: Container) -> None:
                 port=config.vector_db_port,
                 credentials=config.vector_db_credentials,
                 embeddings=embeddings_adapter,
+                distance_fn=config.vector_db_distance_fn,
             ),
         )
 

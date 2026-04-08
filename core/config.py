@@ -48,6 +48,7 @@ class BaseConfig(BaseSettings):
     vector_db_host: str | None = None
     vector_db_port: int = 8765
     vector_db_credentials: str | None = None
+    vector_db_distance_fn: str = "cosine"  # cosine, l2, or ip
 
     # LLM — provider-agnostic configuration
     llm_provider: LLMProvider = LLMProvider.mistral
@@ -105,6 +106,14 @@ class BaseConfig(BaseSettings):
         if self.rabbitmq_max_retries < 1:
             raise ValueError(
                 f"RABBITMQ_MAX_RETRIES must be >= 1, got {self.rabbitmq_max_retries}"
+            )
+
+        # Vector DB distance function validation
+        valid_distance_fns = {"cosine", "l2", "ip"}
+        if self.vector_db_distance_fn not in valid_distance_fns:
+            raise ValueError(
+                f"VECTOR_DB_DISTANCE_FN must be one of {valid_distance_fns}, "
+                f"got '{self.vector_db_distance_fn}'"
             )
 
         # Summarization LLM validation
