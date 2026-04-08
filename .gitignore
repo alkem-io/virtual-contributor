@@ -38,3 +38,5 @@ evaluations/*
 
 # Specify
 .specify/specs/
+.claude/triage-logs/
+.claude/*.scheduled
