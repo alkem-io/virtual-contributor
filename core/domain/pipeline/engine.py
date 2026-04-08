@@ -65,6 +65,23 @@ class IngestEngine:
         for step in self._steps:
             items_before = len(context.chunks)
             errors_before = len(context.errors)
+
+            # Skip destructive steps when the pipeline already has errors
+            if getattr(step, "destructive", False) and context.errors:
+                skip_msg = (
+                    f"{step.name}: skipped (destructive step cannot run "
+                    "when pipeline has errors)"
+                )
+                context.errors.append(skip_msg)
+                logger.warning(skip_msg)
+                context.metrics[step.name] = StepMetrics(
+                    duration=0.0,
+                    items_in=items_before,
+                    items_out=items_before,
+                    error_count=1,
+                )
+                continue
+
             start = time.monotonic()
 
             try:
