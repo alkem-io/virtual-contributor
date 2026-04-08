@@ -15,7 +15,7 @@ You are orchestrating autonomous Spec-Driven Development across every open story
 <owner>/<repo>#<epic-issue-number> [base-branch] [concurrency]
 ```
 
-Defaults: `base-branch=develop`, `concurrency=4`.
+Defaults: `base-branch=develop`, `concurrency=16`.
 
 ## Phase 0 — Epic expansion
 
