@@ -172,7 +172,7 @@ class TestIngestWebsitePlugin:
         assert plugin._knowledge_store.deleted == []
         assert "example.com-knowledge" in plugin._knowledge_store.collections
 
-    async def test_unsupported_content_skip(self, plugin):
+    async def test_empty_crawl_still_succeeds(self, plugin):
         """Empty crawl results should still succeed."""
         event = make_ingest_website()
         with patch("plugins.ingest_website.plugin.crawl", return_value=[]):
@@ -182,3 +182,70 @@ class TestIngestWebsitePlugin:
     async def test_startup_shutdown(self, plugin):
         await plugin.startup()
         await plugin.shutdown()
+
+    async def test_empty_corpus_cleanup_deletes_existing_chunks(self):
+        """When crawl returns [] and no documents are produced, previously-stored chunks are deleted."""
+        store = MockKnowledgeStorePort()
+        collection_name = "example.com-knowledge"
+
+        # Seed the store with pre-existing chunks
+        await store.ingest(
+            collection=collection_name,
+            documents=["old web content 1", "old web content 2"],
+            metadatas=[
+                {"documentId": "https://example.com/page1", "source": "https://example.com/page1",
+                 "type": "knowledge", "title": "Page 1", "embeddingType": "chunk", "chunkIndex": 0},
+                {"documentId": "https://example.com/page2", "source": "https://example.com/page2",
+                 "type": "knowledge", "title": "Page 2", "embeddingType": "chunk", "chunkIndex": 0},
+            ],
+            ids=["hash-aaa", "hash-bbb"],
+            embeddings=[[0.1] * 384, [0.2] * 384],
+        )
+        assert len(store.collections[collection_name]) == 2
+
+        plugin = IngestWebsitePlugin(
+            llm=MockLLMPort(),
+            embeddings=MockEmbeddingsPort(),
+            knowledge_store=store,
+        )
+
+        event = make_ingest_website()
+        with patch("plugins.ingest_website.plugin.crawl", return_value=[]):
+            result = await plugin.handle(event)
+
+        assert isinstance(result, IngestWebsiteResult)
+        assert result.result == "success"
+        # All previously-stored chunks should be deleted
+        assert len(store.collections.get(collection_name, [])) == 0
+
+    async def test_crawl_failure_preserves_existing_chunks(self):
+        """When crawl() raises an exception, existing chunks are NOT deleted."""
+        store = MockKnowledgeStorePort()
+        collection_name = "example.com-knowledge"
+
+        # Seed the store with pre-existing chunks
+        await store.ingest(
+            collection=collection_name,
+            documents=["old web content"],
+            metadatas=[
+                {"documentId": "https://example.com/page1", "source": "https://example.com/page1",
+                 "type": "knowledge", "title": "Page 1", "embeddingType": "chunk", "chunkIndex": 0},
+            ],
+            ids=["hash-aaa"],
+            embeddings=[[0.1] * 384],
+        )
+        assert len(store.collections[collection_name]) == 1
+
+        plugin = IngestWebsitePlugin(
+            llm=MockLLMPort(),
+            embeddings=MockEmbeddingsPort(),
+            knowledge_store=store,
+        )
+
+        event = make_ingest_website()
+        with patch("plugins.ingest_website.plugin.crawl", side_effect=RuntimeError("Connection failed")):
+            result = await plugin.handle(event)
+
+        assert result.result == "failure"
+        # Chunks must be preserved on crawl failure
+        assert len(store.collections[collection_name]) == 1

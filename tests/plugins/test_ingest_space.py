@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock, patch
+
 import pytest
 
 from core.events.ingest_space import IngestBodyOfKnowledgeResult
@@ -102,3 +104,80 @@ class TestIngestSpacePlugin:
     async def test_startup_shutdown(self, plugin):
         await plugin.startup()
         await plugin.shutdown()
+
+    async def test_empty_corpus_cleanup_deletes_existing_chunks(self):
+        """When read_space_tree returns [], previously-stored chunks are deleted."""
+        store = MockKnowledgeStorePort()
+        collection_name = "bok-123-knowledge"
+
+        # Seed the store with pre-existing chunks
+        await store.ingest(
+            collection=collection_name,
+            documents=["old content 1", "old content 2"],
+            metadatas=[
+                {"documentId": "doc-1", "source": "s", "type": "knowledge",
+                 "title": "t", "embeddingType": "chunk", "chunkIndex": 0},
+                {"documentId": "doc-1", "source": "s", "type": "knowledge",
+                 "title": "t", "embeddingType": "chunk", "chunkIndex": 1},
+            ],
+            ids=["hash-aaa", "hash-bbb"],
+            embeddings=[[0.1] * 384, [0.2] * 384],
+        )
+        assert len(store.collections[collection_name]) == 2
+
+        plugin = IngestSpacePlugin(
+            llm=MockLLMPort(),
+            embeddings=MockEmbeddingsPort(),
+            knowledge_store=store,
+            graphql_client=object(),  # non-None so the client check passes
+        )
+
+        event = make_ingest_body_of_knowledge()
+        with patch(
+            "plugins.ingest_space.space_reader.read_space_tree",
+            new_callable=AsyncMock,
+            return_value=[],
+        ):
+            result = await plugin.handle(event)
+
+        assert isinstance(result, IngestBodyOfKnowledgeResult)
+        assert result.result == "success"
+        # All previously-stored chunks should be deleted
+        assert len(store.collections.get(collection_name, [])) == 0
+
+    async def test_fetch_failure_preserves_existing_chunks(self):
+        """When read_space_tree raises, existing chunks are NOT deleted."""
+        store = MockKnowledgeStorePort()
+        collection_name = "bok-123-knowledge"
+
+        # Seed the store with pre-existing chunks
+        await store.ingest(
+            collection=collection_name,
+            documents=["old content"],
+            metadatas=[
+                {"documentId": "doc-1", "source": "s", "type": "knowledge",
+                 "title": "t", "embeddingType": "chunk", "chunkIndex": 0},
+            ],
+            ids=["hash-aaa"],
+            embeddings=[[0.1] * 384],
+        )
+        assert len(store.collections[collection_name]) == 1
+
+        plugin = IngestSpacePlugin(
+            llm=MockLLMPort(),
+            embeddings=MockEmbeddingsPort(),
+            knowledge_store=store,
+            graphql_client=object(),
+        )
+
+        event = make_ingest_body_of_knowledge()
+        with patch(
+            "plugins.ingest_space.space_reader.read_space_tree",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("GraphQL timeout"),
+        ):
+            result = await plugin.handle(event)
+
+        assert result.result == "failure"
+        # Chunks must be preserved on fetch failure
+        assert len(store.collections[collection_name]) == 1
