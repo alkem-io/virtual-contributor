@@ -76,7 +76,7 @@ Proceed with generating specs? (Y/n)
 
 Wait for user confirmation unless `$ARGUMENTS` contains `--yes` or `-y`. If `--dry-run` was specified, stop here.
 
-### Step 4: Determine Spec Numbering
+### Step 4: Determine Spec Numbering and Create Worktrees
 
 For each spec to be created:
 
@@ -84,12 +84,15 @@ For each spec to be created:
 2. Also check git branches for the highest feature number.
 3. Assign the next sequential number(s): if creating 2 specs and highest existing is `008`, use `009` and `010`.
 4. Generate a short name (2-4 words, kebab-case) for each spec from its responsibility title.
-
-**Do NOT create feature branches** — the code already exists on the current branch. Only create spec directories.
+5. **Create a git worktree and branch** for each spec:
+   ```bash
+   git worktree add ../worktrees/NNN-short-name -b NNN-short-name HEAD
+   ```
+6. **Apply only the relevant code changes** to each worktree. For each spec, apply only the diff hunks that belong to that spec's responsibility. Use targeted file edits in the worktree — do not copy the full modified files from the main working tree (they contain changes from other specs). Use subagents in parallel (one per worktree) to apply changes concurrently.
 
 ### Step 5: Generate All SDD Artifacts
 
-For each spec, create the directory `specs/NNN-short-name/` and generate ALL of the following artifacts. Each artifact must be populated with concrete content derived from the actual code changes — not templates or placeholders.
+For each spec, working **inside its worktree**, create the directory `specs/NNN-short-name/` and generate ALL of the following artifacts. Each artifact must be populated with concrete content derived from the actual code changes — not templates or placeholders.
 
 #### 5.1: spec.md (Feature Specification)
 
@@ -228,10 +231,10 @@ After generating all specs, report:
 
 ### Generated Specs
 
-| # | Spec | Directory | Artifacts | Tasks |
-|---|------|-----------|-----------|-------|
-| 1 | [Title] | `specs/NNN-short-name/` | spec, plan, research, data-model, quickstart, tasks, checklist | N tasks |
-| 2 | [Title] | `specs/NNN-short-name/` | spec, plan, research, data-model, tasks, checklist | N tasks |
+| # | Spec | Worktree | Branch | Files | Lines |
+|---|------|----------|--------|-------|-------|
+| 1 | [Title] | `../worktrees/NNN-short-name/` | `NNN-short-name` | N changed + spec dir | +X / -Y |
+| 2 | [Title] | `../worktrees/NNN-short-name/` | `NNN-short-name` | N changed + spec dir | +X / -Y |
 
 ### Change Coverage
 
@@ -242,6 +245,7 @@ After generating all specs, report:
 
 - Review generated specs for accuracy
 - Run `/speckit.analyze` for cross-artifact consistency check
+- Commit, push, and open PRs from each worktree
 ```
 
 ## Key Rules
@@ -251,7 +255,6 @@ After generating all specs, report:
 - **Retrospective voice**: Write specs as if they were written before implementation, but informed by what was actually built. They should read as natural specifications.
 - **Complete artifact set**: Every spec gets spec.md, plan.md, research.md, data-model.md, quickstart.md, tasks.md, and checklists/requirements.md. Skip contracts/ only when no external interfaces changed.
 - **Tasks are complete**: All tasks in tasks.md are marked `[X]` because the code already exists.
-- **No branch creation**: Do not create git branches. Only create spec directories under `specs/`.
-- **Worktree-isolated delivery**: Each generated spec is intended to be delivered in isolation in its own git worktree. The decomposition MUST ensure that each spec's file set is self-contained — a spec's changes must be cherry-pickable or applicable independently without requiring changes from another spec. If two concerns share a file, either co-locate them in one spec or split the file changes so each spec's portion is independently viable.
+- **Worktree-isolated delivery**: Each spec MUST be created in its own git worktree with its own branch (`git worktree add ../worktrees/NNN-short-name -b NNN-short-name HEAD`). Only that spec's code changes and spec directory are applied to the worktree. The decomposition MUST ensure that each spec's file set is self-contained — a spec's changes must be cherry-pickable or applicable independently without requiring changes from another spec. If two concerns share a file, either co-locate them in one spec or split the file changes so each spec's portion is independently viable. Use parallel subagents to apply changes to worktrees concurrently.
 - **Constitution awareness**: The plan.md must include a constitution check against `.specify/memory/constitution.md`.
 - **Preserve existing numbering**: Spec numbers continue sequentially from the highest existing spec number.
