@@ -89,6 +89,7 @@ class IngestSpacePlugin:
                 DocumentSummaryStep(
                     llm_port=summary_llm,
                     chunk_threshold=self._chunk_threshold,
+                    embeddings_port=self._embeddings,
                 ),
                 BodyOfKnowledgeSummaryStep(llm_port=self._bok_llm or summary_llm),
                 EmbedStep(embeddings_port=self._embeddings),

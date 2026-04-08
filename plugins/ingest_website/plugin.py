@@ -104,6 +104,7 @@ class IngestWebsitePlugin:
                     llm_port=summary_llm,
                     concurrency=config.summarize_concurrency,
                     chunk_threshold=self._chunk_threshold,
+                    embeddings_port=self._embeddings,
                 ))
                 bok_llm = self._bok_llm or summary_llm
                 steps.append(BodyOfKnowledgeSummaryStep(llm_port=bok_llm))
