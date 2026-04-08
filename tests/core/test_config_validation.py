@@ -154,6 +154,26 @@ class TestPerPluginOverride:
         assert resolved is config
 
 
+class TestPipelineTimeoutValidation:
+    """Test pipeline_timeout config validation."""
+
+    def test_default_pipeline_timeout(self) -> None:
+        config = BaseConfig(llm_api_key="key")
+        assert config.pipeline_timeout == 3600
+
+    def test_pipeline_timeout_zero_raises(self) -> None:
+        with pytest.raises(ValueError, match="PIPELINE_TIMEOUT"):
+            BaseConfig(llm_api_key="key", pipeline_timeout=0)
+
+    def test_pipeline_timeout_negative_raises(self) -> None:
+        with pytest.raises(ValueError, match="PIPELINE_TIMEOUT"):
+            BaseConfig(llm_api_key="key", pipeline_timeout=-1)
+
+    def test_pipeline_timeout_custom_value(self) -> None:
+        config = BaseConfig(llm_api_key="key", pipeline_timeout=7200)
+        assert config.pipeline_timeout == 7200
+
+
 class TestUnsupportedProvider:
     """Test unsupported provider fail-fast (FR-008)."""
 

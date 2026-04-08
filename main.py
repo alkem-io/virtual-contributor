@@ -44,6 +44,7 @@ def _log_config(config: BaseConfig) -> None:
         "guidance_min_score",
         "max_context_chars",
         "summary_chunk_threshold",
+        "pipeline_timeout",
     ]
     for name in fields:
         value = getattr(config, name, None)
@@ -230,13 +231,39 @@ async def _run(config: BaseConfig) -> None:
     # Router
     router = Router(plugin_type=config.plugin_type)
 
-    # Message handler
+    # Message handler — runs as a background asyncio task (early ACK).
+    # The outer asyncio.wait_for enforces a pipeline-level timeout to
+    # prevent runaway processing (see spec 008).
     async def on_message(body: dict) -> None:
         event = None
         try:
             event = router.parse_event(body)
-            response = await plugin.handle(event)
+            response = await asyncio.wait_for(
+                plugin.handle(event),
+                timeout=config.pipeline_timeout,
+            )
             envelope = router.build_response_envelope(response, event)
+            await transport.publish(
+                config.rabbitmq_exchange,
+                config.rabbitmq_result_routing_key,
+                json.dumps(envelope).encode("utf-8"),
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "Pipeline timeout after %d seconds for event: %s",
+                config.pipeline_timeout,
+                type(event).__name__ if event else "unknown",
+            )
+            from core.events.response import Response
+
+            error_response = Response(
+                result=f"Error: pipeline timed out after {config.pipeline_timeout}s"
+            )
+            envelope = (
+                router.build_response_envelope(error_response, event)
+                if event
+                else {"response": error_response.model_dump()}
+            )
             await transport.publish(
                 config.rabbitmq_exchange,
                 config.rabbitmq_result_routing_key,
@@ -278,9 +305,10 @@ async def _run(config: BaseConfig) -> None:
 
     await stop_event.wait()
 
-    # Graceful shutdown
+    # Graceful shutdown — drain in-flight tasks before closing transport
     logger.info("Shutting down...")
     await health.stop()
+    await transport.drain()
     await plugin.shutdown()
     await transport.close()
     logger.info("Shutdown complete")

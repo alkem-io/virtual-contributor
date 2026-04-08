@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Callable
@@ -14,6 +15,9 @@ class RabbitMQAdapter:
     """RabbitMQ transport adapter using aio-pika.
 
     Implements the TransportPort protocol for message consumption and publishing.
+    Uses early ACK: messages are acknowledged after successful JSON parsing,
+    before the application callback runs. Processing continues as an asyncio
+    background task, decoupling pipeline duration from RabbitMQ consumer_timeout.
     """
 
     def __init__(
@@ -36,6 +40,7 @@ class RabbitMQAdapter:
         self._connection: aio_pika.abc.AbstractRobustConnection | None = None
         self._channel: aio_pika.abc.AbstractChannel | None = None
         self._exchange: aio_pika.abc.AbstractExchange | None = None
+        self._tasks: set[asyncio.Task] = set()
 
     async def connect(self) -> None:
         """Establish connection and channel."""
@@ -66,9 +71,12 @@ class RabbitMQAdapter:
     async def consume(self, queue: str, callback: Callable) -> None:
         """Start consuming messages from a queue.
 
-        The callback receives the parsed JSON body as a dict.
-        Exceptions from the callback escape the process() context so
-        aio-pika rejects/requeues the message (dead-letter on repeated failure).
+        Messages are ACKed immediately after successful JSON parsing (early ACK).
+        The application callback then runs as an asyncio background task,
+        decoupling processing time from RabbitMQ's consumer_timeout.
+
+        JSON parse failures use retry-with-header logic up to max_retries,
+        then reject the message.
         """
         if self._channel is None or self._exchange is None:
             raise RuntimeError("Not connected to RabbitMQ")
@@ -86,15 +94,13 @@ class RabbitMQAdapter:
             headers = message.headers or {}
             retry_count = int(headers.get("x-retry-count", 0))
 
+            # Phase 1: Parse JSON. On failure, retry/reject (pre-ACK).
             try:
                 body = json.loads(message.body.decode("utf-8"))
-                logger.info("Received message on queue %s (attempt %d/%d)", queue, retry_count + 1, max_retries)
-                await callback(body)
-                await message.ack()
             except Exception as exc:
                 if retry_count < max_retries - 1:
                     logger.warning(
-                        "Message failed (attempt %d/%d), requeuing: %s",
+                        "JSON parse failed (attempt %d/%d), requeuing: %s",
                         retry_count + 1, max_retries, exc,
                     )
                     new_headers = dict(headers)
@@ -111,13 +117,68 @@ class RabbitMQAdapter:
                     await message.reject(requeue=False)
                 else:
                     logger.error(
-                        "Message failed after %d attempts, discarding: %s",
+                        "JSON parse failed after %d attempts, discarding: %s",
                         max_retries, exc,
                     )
                     await message.reject(requeue=False)
+                return
+
+            # Phase 2: Early ACK — message is valid JSON, acknowledge immediately.
+            logger.info(
+                "Received message on queue %s (attempt %d/%d), ACKing early",
+                queue, retry_count + 1, max_retries,
+            )
+            await message.ack()
+
+            # Phase 3: Dispatch callback as background task.
+            task = asyncio.create_task(callback(body))
+            self._tasks.add(task)
+            task.add_done_callback(self._task_done)
 
         await q.consume(on_message)
         logger.info("Consuming from queue: %s", queue)
+
+    def _task_done(self, task: asyncio.Task) -> None:
+        """Done-callback for background processing tasks.
+
+        Removes the task from the tracking set and logs any unhandled exception.
+        """
+        self._tasks.discard(task)
+        if task.cancelled():
+            logger.warning("Background processing task was cancelled")
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error(
+                "Unhandled exception in background processing task: %s", exc,
+                exc_info=exc,
+            )
+
+    async def drain(self, timeout: float = 30.0) -> None:
+        """Wait for all in-flight processing tasks to complete.
+
+        Args:
+            timeout: Maximum seconds to wait. After expiry, remaining tasks
+                     are cancelled.
+        """
+        if not self._tasks:
+            logger.info("No in-flight tasks to drain")
+            return
+
+        logger.info("Draining %d in-flight task(s) (timeout=%.1fs)", len(self._tasks), timeout)
+        tasks = list(self._tasks)
+        done, pending = await asyncio.wait(tasks, timeout=timeout)
+
+        if pending:
+            logger.warning(
+                "Drain timeout: cancelling %d remaining task(s)", len(pending),
+            )
+            for task in pending:
+                task.cancel()
+            # Wait briefly for cancellation to propagate
+            await asyncio.wait(pending, timeout=5.0)
+
+        logger.info("Drain complete: %d done, %d cancelled", len(done), len(pending))
 
     async def publish(self, exchange: str, routing_key: str, message: bytes) -> None:
         """Publish a message to the exchange with the given routing key."""

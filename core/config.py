@@ -106,6 +106,10 @@ class BaseConfig(BaseSettings):
             raise ValueError(
                 f"RABBITMQ_MAX_RETRIES must be >= 1, got {self.rabbitmq_max_retries}"
             )
+        if self.pipeline_timeout <= 0:
+            raise ValueError(
+                f"PIPELINE_TIMEOUT must be greater than 0, got {self.pipeline_timeout}"
+            )
 
         # Summarization LLM validation
         if self.summarize_llm_temperature is not None and not (
@@ -207,6 +211,9 @@ class BaseConfig(BaseSettings):
     # Retrieval — deprecated global fields (kept for backward compat)
     retrieval_n_results: int = 5
     retrieval_score_threshold: float = 0.3
+
+    # Pipeline timeout (seconds) — outer timeout for the entire plugin.handle() call
+    pipeline_timeout: int = 3600
 
     # Ingest pipeline
     chunk_size: int = 2000
