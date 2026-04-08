@@ -36,8 +36,13 @@ def _log_config(config: BaseConfig) -> None:
         "summarize_llm_provider",
         "summarize_llm_model",
         "summarize_llm_api_key",
+        "summarize_llm_base_url",
         "summarize_llm_temperature",
         "summarize_llm_timeout",
+        "bok_llm_provider",
+        "bok_llm_model",
+        "bok_llm_api_key",
+        "bok_llm_base_url",
         "expert_n_results",
         "expert_min_score",
         "guidance_n_results",
@@ -172,13 +177,49 @@ async def _run(config: BaseConfig) -> None:
             if config.summarize_llm_temperature is not None
             else 0.3
         )
+        if config.summarize_llm_base_url is not None:
+            synth_data["llm_base_url"] = config.summarize_llm_base_url
         if config.summarize_llm_timeout is not None:
             synth_data["llm_timeout"] = config.summarize_llm_timeout
-        summarize_llm = create_llm_adapter(BaseConfig(**synth_data))
+        summarize_llm = create_llm_adapter(
+            BaseConfig(**synth_data), disable_thinking=True
+        )
         logger.info(
-            "Summarization LLM configured: provider=%s, model=%s",
+            "Summarization LLM configured: provider=%s, model=%s, base_url=%s",
             config.summarize_llm_provider.value,
             config.summarize_llm_model,
+            config.summarize_llm_base_url or "(inherited from main LLM)",
+        )
+
+    # Create BoK LLM adapter if fully configured (needs large context window)
+    bok_llm = None
+    bok_fields = [
+        config.bok_llm_provider,
+        config.bok_llm_model,
+        config.bok_llm_api_key,
+    ]
+    if all(f is not None for f in bok_fields):
+        from core.provider_factory import create_llm_adapter as _create_bok
+
+        synth_data = config.model_dump()
+        synth_data["llm_provider"] = config.bok_llm_provider
+        synth_data["llm_model"] = config.bok_llm_model
+        synth_data["llm_api_key"] = config.bok_llm_api_key
+        synth_data["llm_temperature"] = (
+            config.bok_llm_temperature
+            if config.bok_llm_temperature is not None
+            else 0.3
+        )
+        if config.bok_llm_base_url is not None:
+            synth_data["llm_base_url"] = config.bok_llm_base_url
+        if config.bok_llm_timeout is not None:
+            synth_data["llm_timeout"] = config.bok_llm_timeout
+        bok_llm = _create_bok(BaseConfig(**synth_data), disable_thinking=True)
+        logger.info(
+            "BoK LLM configured: provider=%s, model=%s, base_url=%s",
+            config.bok_llm_provider.value,
+            config.bok_llm_model,
+            config.bok_llm_base_url or "(inherited from main LLM)",
         )
 
     # Construct plugin with dependencies
@@ -206,6 +247,9 @@ async def _run(config: BaseConfig) -> None:
     # Inject summarization LLM for ingest plugins
     if "summarize_llm" in sig.parameters:
         deps["summarize_llm"] = summarize_llm
+    # Inject BoK LLM for ingest plugins (large-context model for BoK summary)
+    if "bok_llm" in sig.parameters:
+        deps["bok_llm"] = bok_llm
     # Inject chunk threshold for ingest plugins
     if "chunk_threshold" in sig.parameters:
         deps["chunk_threshold"] = config.summary_chunk_threshold

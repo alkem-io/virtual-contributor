@@ -189,8 +189,18 @@ class BaseConfig(BaseSettings):
     summarize_llm_provider: LLMProvider | None = None
     summarize_llm_model: str | None = None
     summarize_llm_api_key: str | None = None
+    summarize_llm_base_url: str | None = None
     summarize_llm_temperature: float | None = None
     summarize_llm_timeout: int | None = None
+
+    # BoK LLM — optional separate model for body-of-knowledge summarization
+    # (needs large context window; falls back to summarize LLM, then main LLM)
+    bok_llm_provider: LLMProvider | None = None
+    bok_llm_model: str | None = None
+    bok_llm_api_key: str | None = None
+    bok_llm_base_url: str | None = None
+    bok_llm_temperature: float | None = None
+    bok_llm_timeout: int | None = None
 
     # Retrieval — per-plugin parameters
     expert_n_results: int = 5
