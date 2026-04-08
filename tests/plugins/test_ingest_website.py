@@ -182,3 +182,70 @@ class TestIngestWebsitePlugin:
     async def test_startup_shutdown(self, plugin):
         await plugin.startup()
         await plugin.shutdown()
+
+    async def test_empty_corpus_cleanup_deletes_stale_chunks(self):
+        """When crawl returns empty, cleanup pipeline removes all stored chunks."""
+        store = MockKnowledgeStorePort()
+        collection = "example.com-knowledge"
+
+        # Pre-populate the store with existing chunks
+        await store.ingest(
+            collection=collection,
+            documents=["old page content 1", "old page content 2"],
+            metadatas=[
+                {"documentId": "https://example.com/page1", "embeddingType": "chunk", "source": "s", "type": "t", "title": "Page 1"},
+                {"documentId": "https://example.com/page2", "embeddingType": "chunk", "source": "s", "type": "t", "title": "Page 2"},
+            ],
+            ids=["hash-111", "hash-222"],
+            embeddings=[[0.1] * 384, [0.2] * 384],
+        )
+        assert len(store.collections[collection]) == 2
+
+        plugin = IngestWebsitePlugin(
+            llm=MockLLMPort(),
+            embeddings=MockEmbeddingsPort(),
+            knowledge_store=store,
+        )
+        event = make_ingest_website()
+
+        with patch("plugins.ingest_website.plugin.crawl", return_value=[]):
+            result = await plugin.handle(event)
+
+        assert isinstance(result, IngestWebsiteResult)
+        assert result.result == "success"
+        # All previously stored chunks should be deleted
+        assert len(store.collections.get(collection, [])) == 0
+
+    async def test_empty_pages_cleanup(self):
+        """When crawl returns pages with no extractable text, cleanup runs."""
+        store = MockKnowledgeStorePort()
+        collection = "example.com-knowledge"
+
+        # Pre-populate the store
+        await store.ingest(
+            collection=collection,
+            documents=["stale content"],
+            metadatas=[
+                {"documentId": "https://example.com/old", "embeddingType": "chunk", "source": "s", "type": "t", "title": "Old"},
+            ],
+            ids=["hash-333"],
+            embeddings=[[0.1] * 384],
+        )
+
+        plugin = IngestWebsitePlugin(
+            llm=MockLLMPort(),
+            embeddings=MockEmbeddingsPort(),
+            knowledge_store=store,
+        )
+        event = make_ingest_website()
+
+        # Crawl returns pages but all have empty text
+        empty_pages = [
+            {"url": "https://example.com/empty", "html": "<html><body>   </body></html>"},
+        ]
+        with patch("plugins.ingest_website.plugin.crawl", return_value=empty_pages):
+            result = await plugin.handle(event)
+
+        assert result.result == "success"
+        # Stale chunks should be deleted
+        assert len(store.collections.get(collection, [])) == 0

@@ -83,9 +83,18 @@ class IngestWebsitePlugin:
                 documents.append(doc)
 
             if not documents:
+                logger.info(
+                    "No documents found; running cleanup-only pipeline for collection %s",
+                    collection_name,
+                )
+                cleanup_engine = IngestEngine(steps=[
+                    ChangeDetectionStep(knowledge_store_port=self._knowledge_store),
+                    OrphanCleanupStep(knowledge_store_port=self._knowledge_store),
+                ])
+                cleanup_result = await cleanup_engine.run([], collection_name)
                 return IngestWebsiteResult(
-                    result=IngestionResult.SUCCESS,
-                    error="No content extracted",
+                    result=IngestionResult.SUCCESS if cleanup_result.success else IngestionResult.FAILURE,
+                    error="; ".join(cleanup_result.errors) if cleanup_result.errors else "",
                 )
 
             # Run ingest pipeline
