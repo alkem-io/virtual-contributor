@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 from dataclasses import replace
@@ -278,8 +279,15 @@ class DocumentSummaryStep:
             )
         ]
 
-        for doc_id, doc_chunks in docs_to_summarize:
-            try:
+        if not docs_to_summarize:
+            return
+
+        sem = asyncio.Semaphore(self._concurrency)
+
+        async def _summarize_one(
+            doc_id: str, doc_chunks: list[Chunk],
+        ) -> tuple[str, str, Chunk]:
+            async with sem:
                 logger.info(
                     "Summarizing document %s (%d chunks) [model=%s]",
                     doc_id, len(doc_chunks), self._model_name,
@@ -292,8 +300,6 @@ class DocumentSummaryStep:
                     DOCUMENT_REFINE_INITIAL,
                     DOCUMENT_REFINE_SUBSEQUENT,
                 )
-                context.document_summaries[doc_id] = summary
-
                 source_meta = doc_chunks[0].metadata
                 summary_meta = DocumentMetadata(
                     document_id=f"{doc_id}-summary",
@@ -302,15 +308,28 @@ class DocumentSummaryStep:
                     title=source_meta.title,
                     embedding_type="summary",
                 )
-                context.chunks.append(
-                    Chunk(content=summary, metadata=summary_meta, chunk_index=0)
+                summary_chunk = Chunk(
+                    content=summary, metadata=summary_meta, chunk_index=0,
                 )
                 logger.info("Summarized document %s", doc_id)
-            except Exception as exc:
-                logger.warning("Summarization failed for %s: %s", doc_id, exc)
+                return (doc_id, summary, summary_chunk)
+
+        results = await asyncio.gather(
+            *[_summarize_one(d, c) for d, c in docs_to_summarize],
+            return_exceptions=True,
+        )
+
+        for i, result in enumerate(results):
+            if isinstance(result, BaseException):
+                doc_id = docs_to_summarize[i][0]
+                logger.warning("Summarization failed for %s: %s", doc_id, result)
                 context.errors.append(
-                    f"DocumentSummaryStep: summarization failed for {doc_id}: {exc}"
+                    f"DocumentSummaryStep: summarization failed for {doc_id}: {result}"
                 )
+            else:
+                doc_id, summary, summary_chunk = result
+                context.document_summaries[doc_id] = summary
+                context.chunks.append(summary_chunk)
 
 
 # ---------------------------------------------------------------------------

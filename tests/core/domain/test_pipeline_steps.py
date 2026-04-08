@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from core.domain.ingest_pipeline import Chunk, Document, DocumentMetadata, IngestResult
 from core.domain.pipeline.engine import IngestEngine, PipelineContext
 from core.ports.knowledge_store import GetResult
@@ -237,6 +239,170 @@ class TestDocumentSummaryStep:
     async def test_step_name(self):
         llm = MockLLMPort()
         assert DocumentSummaryStep(llm_port=llm).name == "document_summary"
+
+
+# ---------------------------------------------------------------------------
+# T024b: DocumentSummaryStep concurrency tests (story #1823)
+# ---------------------------------------------------------------------------
+
+class TestDocumentSummaryConcurrency:
+    """Tests for concurrent execution in DocumentSummaryStep."""
+
+    def _make_multi_doc_context(self, num_docs: int = 3) -> PipelineContext:
+        """Create a context with multiple documents, each producing enough chunks."""
+        chunks: list[Chunk] = []
+        for d in range(num_docs):
+            doc_id = f"doc-{d}"
+            # Create 5 chunks per document (above default threshold of 4)
+            for i in range(5):
+                meta = DocumentMetadata(
+                    document_id=doc_id,
+                    source=f"source-{d}",
+                    type="knowledge",
+                    title=f"Doc {d}",
+                    embedding_type="chunk",
+                )
+                chunks.append(
+                    Chunk(content=f"Content for doc {d} chunk {i}", metadata=meta, chunk_index=i)
+                )
+        return PipelineContext(
+            collection_name="test-collection",
+            documents=[],
+            chunks=chunks,
+        )
+
+    async def test_concurrent_execution_multiple_docs(self):
+        """Multiple documents are all summarized and produce summary chunks."""
+        llm = MockLLMPort(response="Concurrent summary")
+        ctx = self._make_multi_doc_context(num_docs=3)
+        chunks_before = len(ctx.chunks)
+
+        step = DocumentSummaryStep(llm_port=llm, concurrency=4)
+        await step.execute(ctx)
+
+        # All 3 documents should have summaries
+        assert len(ctx.document_summaries) == 3
+        for d in range(3):
+            assert f"doc-{d}" in ctx.document_summaries
+            assert ctx.document_summaries[f"doc-{d}"] == "Concurrent summary"
+
+        # 3 summary chunks should have been appended
+        summary_chunks = [c for c in ctx.chunks if c.metadata.embedding_type == "summary"]
+        assert len(summary_chunks) == 3
+        assert len(ctx.chunks) == chunks_before + 3
+
+        # Each summary chunk should have the correct document_id
+        summary_doc_ids = {c.metadata.document_id for c in summary_chunks}
+        assert summary_doc_ids == {"doc-0-summary", "doc-1-summary", "doc-2-summary"}
+
+    async def test_concurrent_error_isolation(self):
+        """Failure in one document does not prevent summarization of others."""
+        call_count = 0
+
+        class SelectiveFailLLM:
+            async def invoke(self, messages):
+                nonlocal call_count
+                call_count += 1
+                # The second document's first LLM call triggers a failure.
+                # Each doc has 5 chunks, so doc-1 starts at call 6.
+                # We fail any call whose prompt contains "doc 1".
+                human_msg = messages[-1]["content"]
+                if "doc 1" in human_msg:
+                    raise RuntimeError("LLM failed for doc-1")
+                return "Good summary"
+
+            async def stream(self, messages):
+                yield ""
+
+        ctx = self._make_multi_doc_context(num_docs=3)
+        step = DocumentSummaryStep(llm_port=SelectiveFailLLM(), concurrency=8)  # type: ignore[arg-type]
+        await step.execute(ctx)
+
+        # doc-0 and doc-2 should have summaries
+        assert "doc-0" in ctx.document_summaries
+        assert "doc-2" in ctx.document_summaries
+        # doc-1 should NOT have a summary
+        assert "doc-1" not in ctx.document_summaries
+
+        # Error should be recorded for doc-1
+        assert any("doc-1" in e and "DocumentSummaryStep" in e for e in ctx.errors)
+
+        # Summary chunks for doc-0 and doc-2 should exist
+        summary_chunks = [c for c in ctx.chunks if c.metadata.embedding_type == "summary"]
+        summary_doc_ids = {c.metadata.document_id for c in summary_chunks}
+        assert "doc-0-summary" in summary_doc_ids
+        assert "doc-2-summary" in summary_doc_ids
+        assert "doc-1-summary" not in summary_doc_ids
+
+    async def test_concurrency_1_sequential_behavior(self):
+        """concurrency=1 produces correct results (no parallelism)."""
+        invocation_order: list[str] = []
+
+        class OrderTrackingLLM:
+            async def invoke(self, messages):
+                human_msg = messages[-1]["content"]
+                # Extract doc identifier from content
+                for d in range(3):
+                    if f"doc {d}" in human_msg:
+                        invocation_order.append(f"doc-{d}")
+                        break
+                return "Sequential summary"
+
+            async def stream(self, messages):
+                yield ""
+
+        ctx = self._make_multi_doc_context(num_docs=3)
+        step = DocumentSummaryStep(
+            llm_port=OrderTrackingLLM(), concurrency=1,  # type: ignore[arg-type]
+        )
+        await step.execute(ctx)
+
+        # All 3 documents should have summaries
+        assert len(ctx.document_summaries) == 3
+        for d in range(3):
+            assert f"doc-{d}" in ctx.document_summaries
+
+        # Should have had invocations (5 chunks per doc = 5 LLM calls per doc)
+        assert len(invocation_order) > 0
+
+    async def test_concurrent_semaphore_bounds_parallelism(self):
+        """Semaphore correctly limits the number of concurrent summarizations."""
+        current_concurrent = 0
+        max_concurrent = 0
+        lock = asyncio.Lock()
+
+        class ConcurrencyTrackingLLM:
+            async def invoke(self, messages):
+                nonlocal current_concurrent, max_concurrent
+                async with lock:
+                    current_concurrent += 1
+                    if current_concurrent > max_concurrent:
+                        max_concurrent = current_concurrent
+
+                # Simulate async work to allow interleaving
+                await asyncio.sleep(0.01)
+
+                async with lock:
+                    current_concurrent -= 1
+
+                return "Bounded summary"
+
+            async def stream(self, messages):
+                yield ""
+
+        ctx = self._make_multi_doc_context(num_docs=4)
+        step = DocumentSummaryStep(
+            llm_port=ConcurrencyTrackingLLM(), concurrency=2,  # type: ignore[arg-type]
+        )
+        await step.execute(ctx)
+
+        # All 4 documents should have summaries
+        assert len(ctx.document_summaries) == 4
+
+        # Max concurrent should not exceed 2 (the semaphore bound)
+        assert max_concurrent <= 2
+        # Max concurrent should be at least 1 (something ran)
+        assert max_concurrent >= 1
 
 
 # ---------------------------------------------------------------------------
