@@ -178,6 +178,41 @@ class BaseConfig(BaseSettings):
                 ", ".join(missing),
             )
 
+        # BoK LLM validation
+        if self.bok_llm_temperature is not None and not (
+            0.0 <= self.bok_llm_temperature <= 2.0
+        ):
+            raise ValueError(
+                f"BOK_LLM_TEMPERATURE must be between 0.0 and 2.0, "
+                f"got {self.bok_llm_temperature}"
+            )
+        if self.bok_llm_timeout is not None and self.bok_llm_timeout <= 0:
+            raise ValueError(
+                f"BOK_LLM_TIMEOUT must be greater than 0, "
+                f"got {self.bok_llm_timeout}"
+            )
+
+        # Partial BoK config warning
+        bok_fields = [
+            self.bok_llm_provider,
+            self.bok_llm_model,
+            self.bok_llm_api_key,
+        ]
+        bok_set_count = sum(1 for f in bok_fields if f is not None)
+        if 0 < bok_set_count < 3:
+            missing = []
+            if self.bok_llm_provider is None:
+                missing.append("BOK_LLM_PROVIDER")
+            if self.bok_llm_model is None:
+                missing.append("BOK_LLM_MODEL")
+            if self.bok_llm_api_key is None:
+                missing.append("BOK_LLM_API_KEY")
+            logger.warning(
+                "Partial BoK LLM config — missing: %s. "
+                "Falling back to summarize/main LLM for BoK summarization.",
+                ", ".join(missing),
+            )
+
         return self
 
     # Embeddings

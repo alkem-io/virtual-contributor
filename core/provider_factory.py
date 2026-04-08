@@ -62,7 +62,7 @@ def create_llm_adapter(
         kwargs["max_tokens"] = config.llm_max_tokens
     if config.llm_top_p is not None:
         kwargs["top_p"] = config.llm_top_p
-    if disable_thinking:
+    if disable_thinking and provider == LLMProvider.openai:
         kwargs["extra_body"] = {
             "chat_template_kwargs": {"enable_thinking": False}
         }

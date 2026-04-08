@@ -199,8 +199,6 @@ async def _run(config: BaseConfig) -> None:
         config.bok_llm_api_key,
     ]
     if all(f is not None for f in bok_fields):
-        from core.provider_factory import create_llm_adapter as _create_bok
-
         synth_data = config.model_dump()
         synth_data["llm_provider"] = config.bok_llm_provider
         synth_data["llm_model"] = config.bok_llm_model
@@ -214,7 +212,7 @@ async def _run(config: BaseConfig) -> None:
             synth_data["llm_base_url"] = config.bok_llm_base_url
         if config.bok_llm_timeout is not None:
             synth_data["llm_timeout"] = config.bok_llm_timeout
-        bok_llm = _create_bok(BaseConfig(**synth_data), disable_thinking=True)
+        bok_llm = create_llm_adapter(BaseConfig(**synth_data), disable_thinking=True)
         logger.info(
             "BoK LLM configured: provider=%s, model=%s, base_url=%s",
             config.bok_llm_provider.value,
