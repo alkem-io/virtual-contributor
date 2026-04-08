@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 import httpx
 import pytest
 
+from core.domain.pipeline import IngestEngine
 from core.events.ingest_website import IngestWebsiteResult
 from plugins.ingest_website.crawler import _is_same_domain, _normalize_url, _should_skip_url, crawl
 from plugins.ingest_website.html_parser import extract_text, extract_title
@@ -162,7 +163,7 @@ class TestIngestWebsitePlugin:
         mock_pages = [{"url": "https://example.com", "html": "<p>Content for ingestion test.</p>"}]
 
         mock_config = MagicMock()
-        mock_config.summarize_concurrency = 0
+        mock_config.summarize_enabled = False
 
         with patch("plugins.ingest_website.plugin.crawl", return_value=mock_pages), \
              patch("core.config.BaseConfig", return_value=mock_config):
@@ -178,6 +179,80 @@ class TestIngestWebsitePlugin:
         with patch("plugins.ingest_website.plugin.crawl", return_value=[]):
             result = await plugin.handle(event)
         assert result.result == "success"
+
+    async def test_pipeline_includes_summary_steps_when_enabled(self, plugin):
+        """When summarize_enabled=True, pipeline includes both summary steps."""
+        event = make_ingest_website()
+        mock_pages = [{"url": "https://example.com", "html": "<p>Content for summarization test.</p>"}]
+
+        mock_config = MagicMock()
+        mock_config.summarize_enabled = True
+        mock_config.summarize_concurrency = 8
+
+        captured_steps = []
+
+        def capture_engine_init(self_engine, steps, **kwargs):
+            captured_steps.extend(steps)
+            self_engine._steps = steps
+
+        with patch("plugins.ingest_website.plugin.crawl", return_value=mock_pages), \
+             patch("core.config.BaseConfig", return_value=mock_config), \
+             patch.object(IngestEngine, "__init__", capture_engine_init), \
+             patch.object(IngestEngine, "run", return_value=MagicMock(success=True, errors=[])):
+            await plugin.handle(event)
+
+        step_names = [type(s).__name__ for s in captured_steps]
+        assert "DocumentSummaryStep" in step_names
+        assert "BodyOfKnowledgeSummaryStep" in step_names
+
+    async def test_pipeline_excludes_summary_steps_when_disabled(self, plugin):
+        """When summarize_enabled=False, pipeline omits both summary steps."""
+        event = make_ingest_website()
+        mock_pages = [{"url": "https://example.com", "html": "<p>Content for summarization test.</p>"}]
+
+        mock_config = MagicMock()
+        mock_config.summarize_enabled = False
+
+        captured_steps = []
+
+        def capture_engine_init(self_engine, steps, **kwargs):
+            captured_steps.extend(steps)
+            self_engine._steps = steps
+
+        with patch("plugins.ingest_website.plugin.crawl", return_value=mock_pages), \
+             patch("core.config.BaseConfig", return_value=mock_config), \
+             patch.object(IngestEngine, "__init__", capture_engine_init), \
+             patch.object(IngestEngine, "run", return_value=MagicMock(success=True, errors=[])):
+            await plugin.handle(event)
+
+        step_names = [type(s).__name__ for s in captured_steps]
+        assert "DocumentSummaryStep" not in step_names
+        assert "BodyOfKnowledgeSummaryStep" not in step_names
+
+    async def test_pipeline_coerces_zero_concurrency(self, plugin):
+        """When summarize_concurrency=0 and summarize_enabled=True, concurrency defaults to 8."""
+        event = make_ingest_website()
+        mock_pages = [{"url": "https://example.com", "html": "<p>Content for concurrency test.</p>"}]
+
+        mock_config = MagicMock()
+        mock_config.summarize_enabled = True
+        mock_config.summarize_concurrency = 0
+
+        captured_steps = []
+
+        def capture_engine_init(self_engine, steps, **kwargs):
+            captured_steps.extend(steps)
+            self_engine._steps = steps
+
+        with patch("plugins.ingest_website.plugin.crawl", return_value=mock_pages), \
+             patch("core.config.BaseConfig", return_value=mock_config), \
+             patch.object(IngestEngine, "__init__", capture_engine_init), \
+             patch.object(IngestEngine, "run", return_value=MagicMock(success=True, errors=[])):
+            await plugin.handle(event)
+
+        doc_summary_steps = [s for s in captured_steps if type(s).__name__ == "DocumentSummaryStep"]
+        assert len(doc_summary_steps) == 1
+        assert doc_summary_steps[0]._concurrency == 8
 
     async def test_startup_shutdown(self, plugin):
         await plugin.startup()

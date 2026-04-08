@@ -99,10 +99,11 @@ class IngestWebsitePlugin:
                 ContentHashStep(),
                 ChangeDetectionStep(knowledge_store_port=self._knowledge_store),
             ]
-            if config.summarize_concurrency > 0:
+            if config.summarize_enabled:
+                concurrency = config.summarize_concurrency if config.summarize_concurrency > 0 else 8
                 steps.append(DocumentSummaryStep(
                     llm_port=summary_llm,
-                    concurrency=config.summarize_concurrency,
+                    concurrency=concurrency,
                     chunk_threshold=self._chunk_threshold,
                 ))
                 bok_llm = self._bok_llm or summary_llm

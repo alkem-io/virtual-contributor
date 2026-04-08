@@ -81,20 +81,27 @@ class IngestSpacePlugin:
                 )
 
             # Run ingest pipeline with ingest-space specific settings
+            from core.config import BaseConfig
+            config = BaseConfig()
+
             summary_llm = self._summarize_llm or self._llm
-            engine = IngestEngine(steps=[
+            steps: list = [
                 ChunkStep(chunk_size=9000, chunk_overlap=500),
                 ContentHashStep(),
                 ChangeDetectionStep(knowledge_store_port=self._knowledge_store),
-                DocumentSummaryStep(
+            ]
+            if config.summarize_enabled:
+                concurrency = config.summarize_concurrency if config.summarize_concurrency > 0 else 8
+                steps.append(DocumentSummaryStep(
                     llm_port=summary_llm,
+                    concurrency=concurrency,
                     chunk_threshold=self._chunk_threshold,
-                ),
-                BodyOfKnowledgeSummaryStep(llm_port=self._bok_llm or summary_llm),
-                EmbedStep(embeddings_port=self._embeddings),
-                StoreStep(knowledge_store_port=self._knowledge_store),
-                OrphanCleanupStep(knowledge_store_port=self._knowledge_store),
-            ])
+                ))
+                steps.append(BodyOfKnowledgeSummaryStep(llm_port=self._bok_llm or summary_llm))
+            steps.append(EmbedStep(embeddings_port=self._embeddings))
+            steps.append(StoreStep(knowledge_store_port=self._knowledge_store))
+            steps.append(OrphanCleanupStep(knowledge_store_port=self._knowledge_store))
+            engine = IngestEngine(steps=steps)
             result = await engine.run(documents, collection_name)
 
             return IngestBodyOfKnowledgeResult(
