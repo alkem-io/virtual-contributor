@@ -765,6 +765,129 @@ class TestStoreStepDedup:
 
 
 # ---------------------------------------------------------------------------
+# Story #1825: StoreStep unchanged-chunk skip tests
+# ---------------------------------------------------------------------------
+
+
+class TestStoreStepUnchangedSkip:
+    async def test_skips_unchanged_content_chunks(self):
+        """Unchanged content chunks (hash in unchanged_chunk_hashes) are not stored."""
+        store = MockKnowledgeStorePort()
+        meta = DocumentMetadata(document_id="doc-1", source="s", type="knowledge", title="T", embedding_type="chunk")
+        chunks = [
+            Chunk(content="changed", metadata=meta, chunk_index=0, embedding=[0.1], content_hash="hash-new"),
+            Chunk(content="unchanged-1", metadata=meta, chunk_index=1, embedding=[0.2], content_hash="hash-old-1"),
+            Chunk(content="unchanged-2", metadata=meta, chunk_index=2, embedding=[0.3], content_hash="hash-old-2"),
+        ]
+
+        ctx = PipelineContext(
+            collection_name="coll",
+            documents=[],
+            chunks=chunks,
+            unchanged_chunk_hashes={"hash-old-1", "hash-old-2"},
+        )
+        await StoreStep(knowledge_store_port=store).execute(ctx)
+
+        assert ctx.chunks_stored == 1
+        assert len(store.collections["coll"]) == 1
+        assert store.collections["coll"][0]["document"] == "changed"
+        assert store.collections["coll"][0]["id"] == "hash-new"
+
+    async def test_stores_summary_chunks_despite_unchanged_hashes(self):
+        """Summary chunks are always stored, even when unchanged_chunk_hashes is populated."""
+        store = MockKnowledgeStorePort()
+        chunk_meta = DocumentMetadata(
+            document_id="doc-1", source="s", type="knowledge", title="T", embedding_type="chunk",
+        )
+        summary_meta = DocumentMetadata(
+            document_id="doc-1-summary", source="s", type="knowledge", title="T", embedding_type="summary",
+        )
+        chunks = [
+            Chunk(content="unchanged", metadata=chunk_meta, chunk_index=0, embedding=[0.1], content_hash="hash-old"),
+            Chunk(content="doc summary", metadata=summary_meta, chunk_index=0, embedding=[0.2]),
+        ]
+
+        ctx = PipelineContext(
+            collection_name="coll",
+            documents=[],
+            chunks=chunks,
+            unchanged_chunk_hashes={"hash-old"},
+        )
+        await StoreStep(knowledge_store_port=store).execute(ctx)
+
+        assert ctx.chunks_stored == 1
+        stored_docs = [it["document"] for it in store.collections["coll"]]
+        assert "doc summary" in stored_docs
+        assert "unchanged" not in stored_docs
+
+    async def test_stores_all_when_unchanged_hashes_empty(self):
+        """When unchanged_chunk_hashes is empty, all embedded chunks are stored (backward compat)."""
+        store = MockKnowledgeStorePort()
+        meta = DocumentMetadata(document_id="doc-1", source="s", type="knowledge", title="T", embedding_type="chunk")
+        chunks = [
+            Chunk(content="a", metadata=meta, chunk_index=0, embedding=[0.1], content_hash="hash-a"),
+            Chunk(content="b", metadata=meta, chunk_index=1, embedding=[0.2], content_hash="hash-b"),
+        ]
+
+        ctx = PipelineContext(
+            collection_name="coll",
+            documents=[],
+            chunks=chunks,
+            # unchanged_chunk_hashes defaults to empty set
+        )
+        await StoreStep(knowledge_store_port=store).execute(ctx)
+
+        assert ctx.chunks_stored == 2
+        assert len(store.collections["coll"]) == 2
+
+    async def test_unchanged_excluded_from_chunks_stored_count(self):
+        """chunks_stored only counts chunks that were actually upserted."""
+        store = MockKnowledgeStorePort()
+        meta = DocumentMetadata(document_id="doc-1", source="s", type="knowledge", title="T", embedding_type="chunk")
+        chunks = [
+            Chunk(content="new", metadata=meta, chunk_index=0, embedding=[0.1], content_hash="hash-new"),
+            Chunk(content="old-1", metadata=meta, chunk_index=1, embedding=[0.2], content_hash="hash-old-1"),
+            Chunk(content="old-2", metadata=meta, chunk_index=2, embedding=[0.3], content_hash="hash-old-2"),
+            Chunk(content="old-3", metadata=meta, chunk_index=3, embedding=[0.4], content_hash="hash-old-3"),
+        ]
+
+        ctx = PipelineContext(
+            collection_name="coll",
+            documents=[],
+            chunks=chunks,
+            unchanged_chunk_hashes={"hash-old-1", "hash-old-2", "hash-old-3"},
+        )
+        await StoreStep(knowledge_store_port=store).execute(ctx)
+
+        assert ctx.chunks_stored == 1  # Only hash-new was stored
+
+    async def test_unchanged_and_unembedded_reported_separately(self):
+        """Unembedded and unchanged are separate categories; error only reports unembedded."""
+        store = MockKnowledgeStorePort()
+        meta = DocumentMetadata(document_id="doc-1", source="s", type="knowledge", title="T", embedding_type="chunk")
+        chunks = [
+            Chunk(content="no-emb", metadata=meta, chunk_index=0),  # no embedding
+            Chunk(content="unchanged", metadata=meta, chunk_index=1, embedding=[0.2], content_hash="hash-old"),
+            Chunk(content="new", metadata=meta, chunk_index=2, embedding=[0.3], content_hash="hash-new"),
+        ]
+
+        ctx = PipelineContext(
+            collection_name="coll",
+            documents=[],
+            chunks=chunks,
+            unchanged_chunk_hashes={"hash-old"},
+        )
+        await StoreStep(knowledge_store_port=store).execute(ctx)
+
+        # Only the unembedded chunk reported as error
+        assert any("skipped 1 chunks without embeddings" in e for e in ctx.errors)
+        # Only the new chunk was stored
+        assert ctx.chunks_stored == 1
+        assert len(store.collections["coll"]) == 1
+        assert store.collections["coll"][0]["document"] == "new"
+
+
+# ---------------------------------------------------------------------------
 # T013: OrphanCleanupStep tests
 # ---------------------------------------------------------------------------
 
