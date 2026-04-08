@@ -358,6 +358,102 @@ class TestStoreStep:
 
 
 # ---------------------------------------------------------------------------
+# T1825: StoreStep unchanged-chunk filtering tests
+# ---------------------------------------------------------------------------
+
+
+class TestStoreStepUnchangedFiltering:
+    async def test_skips_unchanged_chunks(self):
+        """Chunks whose content_hash is in unchanged_chunk_hashes are not stored."""
+        store = MockKnowledgeStorePort()
+        meta = DocumentMetadata(document_id="doc-1", source="s", type="knowledge", title="T", embedding_type="chunk")
+        chunk = Chunk(content="unchanged text", metadata=meta, chunk_index=0, embedding=[0.1], content_hash="hash-unchanged")
+
+        ctx = PipelineContext(
+            collection_name="coll",
+            documents=[],
+            chunks=[chunk],
+            unchanged_chunk_hashes={"hash-unchanged"},
+        )
+        await StoreStep(knowledge_store_port=store).execute(ctx)
+
+        assert ctx.chunks_stored == 0
+        assert "coll" not in store.collections or len(store.collections["coll"]) == 0
+
+    async def test_stores_changed_chunks_alongside_unchanged(self):
+        """Only changed chunks are stored; unchanged ones are skipped."""
+        store = MockKnowledgeStorePort()
+        meta = DocumentMetadata(document_id="doc-1", source="s", type="knowledge", title="T", embedding_type="chunk")
+        unchanged = Chunk(content="old text", metadata=meta, chunk_index=0, embedding=[0.1], content_hash="hash-old")
+        changed = Chunk(content="new text", metadata=meta, chunk_index=1, embedding=[0.2], content_hash="hash-new")
+
+        ctx = PipelineContext(
+            collection_name="coll",
+            documents=[],
+            chunks=[unchanged, changed],
+            unchanged_chunk_hashes={"hash-old"},
+        )
+        await StoreStep(knowledge_store_port=store).execute(ctx)
+
+        assert ctx.chunks_stored == 1
+        assert len(store.collections["coll"]) == 1
+        assert store.collections["coll"][0]["document"] == "new text"
+
+    async def test_always_stores_summary_chunks_when_unchanged_set_populated(self):
+        """Summary chunks (content_hash=None) are stored even when unchanged set is non-empty."""
+        store = MockKnowledgeStorePort()
+        chunk_meta = DocumentMetadata(document_id="doc-1", source="s", type="knowledge", title="T", embedding_type="chunk")
+        summary_meta = DocumentMetadata(document_id="doc-1-summary", source="s", type="knowledge", title="T", embedding_type="summary")
+        unchanged = Chunk(content="old", metadata=chunk_meta, chunk_index=0, embedding=[0.1], content_hash="hash-old")
+        summary = Chunk(content="summary text", metadata=summary_meta, chunk_index=0, embedding=[0.3])
+
+        ctx = PipelineContext(
+            collection_name="coll",
+            documents=[],
+            chunks=[unchanged, summary],
+            unchanged_chunk_hashes={"hash-old"},
+        )
+        await StoreStep(knowledge_store_port=store).execute(ctx)
+
+        assert ctx.chunks_stored == 1
+        assert len(store.collections["coll"]) == 1
+        assert store.collections["coll"][0]["document"] == "summary text"
+
+    async def test_unchanged_not_counted_as_missing_embeddings(self):
+        """Unchanged chunks with embeddings should not trigger 'skipped N chunks without embeddings' error."""
+        store = MockKnowledgeStorePort()
+        meta = DocumentMetadata(document_id="doc-1", source="s", type="knowledge", title="T", embedding_type="chunk")
+        unchanged = Chunk(content="text", metadata=meta, chunk_index=0, embedding=[0.1], content_hash="hash-unch")
+
+        ctx = PipelineContext(
+            collection_name="coll",
+            documents=[],
+            chunks=[unchanged],
+            unchanged_chunk_hashes={"hash-unch"},
+        )
+        await StoreStep(knowledge_store_port=store).execute(ctx)
+
+        # No error about skipped chunks without embeddings
+        assert not any("skipped" in e and "without embeddings" in e for e in ctx.errors)
+
+    async def test_backward_compat_empty_unchanged_set(self):
+        """When unchanged_chunk_hashes is empty, all embedded chunks are stored."""
+        store = MockKnowledgeStorePort()
+        meta = DocumentMetadata(document_id="doc-1", source="s", type="knowledge", title="T", embedding_type="chunk")
+        chunk = Chunk(content="text", metadata=meta, chunk_index=0, embedding=[0.1], content_hash="hash-123")
+
+        ctx = PipelineContext(
+            collection_name="coll",
+            documents=[],
+            chunks=[chunk],
+        )
+        await StoreStep(knowledge_store_port=store).execute(ctx)
+
+        assert ctx.chunks_stored == 1
+        assert len(store.collections["coll"]) == 1
+
+
+# ---------------------------------------------------------------------------
 # T026: BodyOfKnowledgeSummaryStep tests
 # ---------------------------------------------------------------------------
 
