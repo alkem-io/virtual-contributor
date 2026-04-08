@@ -42,6 +42,7 @@ class IngestSpacePlugin:
         graphql_client: Any = None,
         *,
         summarize_llm: LLMPort | None = None,
+        bok_llm: LLMPort | None = None,
         chunk_threshold: int = 4,
     ) -> None:
         self._llm = llm
@@ -49,6 +50,7 @@ class IngestSpacePlugin:
         self._knowledge_store = knowledge_store
         self._graphql_client = graphql_client
         self._summarize_llm = summarize_llm
+        self._bok_llm = bok_llm
         self._chunk_threshold = chunk_threshold
 
     async def startup(self) -> None:
@@ -88,7 +90,7 @@ class IngestSpacePlugin:
                     llm_port=summary_llm,
                     chunk_threshold=self._chunk_threshold,
                 ),
-                BodyOfKnowledgeSummaryStep(llm_port=summary_llm),
+                BodyOfKnowledgeSummaryStep(llm_port=self._bok_llm or summary_llm),
                 EmbedStep(embeddings_port=self._embeddings),
                 StoreStep(knowledge_store_port=self._knowledge_store),
                 OrphanCleanupStep(knowledge_store_port=self._knowledge_store),

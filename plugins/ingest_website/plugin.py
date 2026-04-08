@@ -40,12 +40,14 @@ class IngestWebsitePlugin:
         knowledge_store: KnowledgeStorePort,
         *,
         summarize_llm: LLMPort | None = None,
+        bok_llm: LLMPort | None = None,
         chunk_threshold: int = 4,
     ) -> None:
         self._llm = llm
         self._embeddings = embeddings
         self._knowledge_store = knowledge_store
         self._summarize_llm = summarize_llm
+        self._bok_llm = bok_llm
         self._chunk_threshold = chunk_threshold
         self._page_limit = 20  # Default, can be overridden by config
 
@@ -103,7 +105,8 @@ class IngestWebsitePlugin:
                     concurrency=config.summarize_concurrency,
                     chunk_threshold=self._chunk_threshold,
                 ))
-                steps.append(BodyOfKnowledgeSummaryStep(llm_port=summary_llm))
+                bok_llm = self._bok_llm or summary_llm
+                steps.append(BodyOfKnowledgeSummaryStep(llm_port=bok_llm))
             steps.append(EmbedStep(embeddings_port=self._embeddings))
             steps.append(StoreStep(knowledge_store_port=self._knowledge_store))
             steps.append(OrphanCleanupStep(knowledge_store_port=self._knowledge_store))

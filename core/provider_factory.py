@@ -32,10 +32,14 @@ def _get_model_class(provider: LLMProvider) -> type:
     raise ValueError(f"Unsupported provider: {provider}")
 
 
-def create_llm_adapter(config: BaseConfig) -> LangChainLLMAdapter:
+def create_llm_adapter(
+    config: BaseConfig, *, disable_thinking: bool = False
+) -> LangChainLLMAdapter:
     """Create a LangChainLLMAdapter for the configured provider.
 
     Reads provider, model, API key, and generation parameters from config.
+    When *disable_thinking* is True, sends ``enable_thinking: false`` via
+    ``extra_body`` to suppress Qwen3-style chain-of-thought reasoning.
     Returns a ready-to-use adapter implementing LLMPort.
     """
     provider = config.llm_provider
@@ -58,15 +62,20 @@ def create_llm_adapter(config: BaseConfig) -> LangChainLLMAdapter:
         kwargs["max_tokens"] = config.llm_max_tokens
     if config.llm_top_p is not None:
         kwargs["top_p"] = config.llm_top_p
+    if disable_thinking and provider == LLMProvider.openai:
+        kwargs["extra_body"] = {
+            "chat_template_kwargs": {"enable_thinking": False}
+        }
 
     llm = model_cls(**kwargs)
 
     # Disable keep-alive to prevent stale connections to local LLM servers.
     # Must be done post-construction since ChatMistralAI serializes constructor kwargs.
-    if config.llm_base_url:
+    # Only applies to Mistral SDK client (httpx-based); ChatOpenAI uses a different client.
+    if config.llm_base_url and provider == LLMProvider.mistral:
         import httpx
         no_keepalive = httpx.Limits(max_keepalive_connections=0)
-        if hasattr(llm, "async_client") and llm.async_client:
+        if hasattr(llm, "async_client") and hasattr(llm.async_client, "headers"):
             llm.async_client = httpx.AsyncClient(
                 base_url=config.llm_base_url,
                 limits=no_keepalive,
