@@ -172,12 +172,89 @@ class TestIngestWebsitePlugin:
         assert plugin._knowledge_store.deleted == []
         assert "example.com-knowledge" in plugin._knowledge_store.collections
 
-    async def test_unsupported_content_skip(self, plugin):
-        """Empty crawl results should still succeed."""
+    async def test_empty_crawl_runs_cleanup_pipeline(self):
+        """Empty crawl results trigger cleanup pipeline, not bare success."""
+        store = MockKnowledgeStorePort()
+        plugin = IngestWebsitePlugin(
+            llm=MockLLMPort(),
+            embeddings=MockEmbeddingsPort(),
+            knowledge_store=store,
+        )
         event = make_ingest_website()
         with patch("plugins.ingest_website.plugin.crawl", return_value=[]):
             result = await plugin.handle(event)
+        assert isinstance(result, IngestWebsiteResult)
         assert result.result == "success"
+
+    async def test_empty_documents_deletes_preexisting_chunks(self):
+        """Pre-existing chunks are deleted when crawl returns zero extractable pages."""
+        store = MockKnowledgeStorePort()
+        collection = "example.com-knowledge"
+
+        # Pre-populate store with chunks from a previous ingestion
+        await store.ingest(
+            collection=collection,
+            documents=["old page content"],
+            metadatas=[
+                {"documentId": "https://example.com/old",
+                 "embeddingType": "chunk",
+                 "source": "https://example.com/old",
+                 "type": "knowledge", "title": "Old Page", "chunkIndex": 0},
+            ],
+            ids=["hash-old"],
+            embeddings=[[0.1] * 384],
+        )
+        assert len(store.collections[collection]) == 1
+
+        plugin = IngestWebsitePlugin(
+            llm=MockLLMPort(),
+            embeddings=MockEmbeddingsPort(),
+            knowledge_store=store,
+        )
+        event = make_ingest_website()
+
+        with patch("plugins.ingest_website.plugin.crawl", return_value=[]):
+            result = await plugin.handle(event)
+
+        assert result.result == "success"
+        # All pre-existing chunks should be deleted
+        remaining = store.collections.get(collection, [])
+        assert len(remaining) == 0
+
+    async def test_whitespace_only_pages_runs_cleanup(self):
+        """Pages with only whitespace content produce zero documents, triggering cleanup."""
+        store = MockKnowledgeStorePort()
+        collection = "example.com-knowledge"
+
+        # Pre-populate
+        await store.ingest(
+            collection=collection,
+            documents=["old content"],
+            metadatas=[
+                {"documentId": "https://example.com/old",
+                 "embeddingType": "chunk",
+                 "source": "https://example.com/old",
+                 "type": "knowledge", "title": "Old", "chunkIndex": 0},
+            ],
+            ids=["hash-old"],
+            embeddings=[[0.1] * 384],
+        )
+
+        plugin = IngestWebsitePlugin(
+            llm=MockLLMPort(),
+            embeddings=MockEmbeddingsPort(),
+            knowledge_store=store,
+        )
+        event = make_ingest_website()
+
+        # Crawl returns pages but all have whitespace-only content
+        mock_pages = [{"url": "https://example.com", "html": "<html><body>   </body></html>"}]
+        with patch("plugins.ingest_website.plugin.crawl", return_value=mock_pages):
+            result = await plugin.handle(event)
+
+        assert result.result == "success"
+        remaining = store.collections.get(collection, [])
+        assert len(remaining) == 0
 
     async def test_startup_shutdown(self, plugin):
         await plugin.startup()

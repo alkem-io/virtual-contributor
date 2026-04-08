@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock, patch
+
 import pytest
 
 from core.events.ingest_space import IngestBodyOfKnowledgeResult
@@ -102,3 +104,101 @@ class TestIngestSpacePlugin:
     async def test_startup_shutdown(self, plugin):
         await plugin.startup()
         await plugin.shutdown()
+
+    async def test_empty_documents_runs_cleanup_pipeline(self):
+        """Empty doc list from read_space_tree triggers cleanup pipeline, not bare success."""
+        store = MockKnowledgeStorePort()
+        plugin = IngestSpacePlugin(
+            llm=MockLLMPort(),
+            embeddings=MockEmbeddingsPort(),
+            knowledge_store=store,
+            graphql_client=object(),  # non-None so the check passes
+        )
+        event = make_ingest_body_of_knowledge()
+
+        with patch(
+            "plugins.ingest_space.space_reader.read_space_tree",
+            new_callable=AsyncMock,
+            return_value=[],
+        ):
+            result = await plugin.handle(event)
+
+        assert isinstance(result, IngestBodyOfKnowledgeResult)
+        assert result.result == "success"
+
+    async def test_empty_documents_deletes_preexisting_chunks(self):
+        """Pre-existing chunks are deleted when source returns zero documents."""
+        store = MockKnowledgeStorePort()
+        collection = "bok-123-knowledge"
+
+        # Pre-populate store with chunks that simulate previously ingested data
+        await store.ingest(
+            collection=collection,
+            documents=["old content 1", "old content 2"],
+            metadatas=[
+                {"documentId": "old-doc-1", "embeddingType": "chunk",
+                 "source": "s", "type": "knowledge", "title": "t", "chunkIndex": 0},
+                {"documentId": "old-doc-1", "embeddingType": "chunk",
+                 "source": "s", "type": "knowledge", "title": "t", "chunkIndex": 1},
+            ],
+            ids=["hash-a", "hash-b"],
+            embeddings=[[0.1] * 384, [0.2] * 384],
+        )
+        assert len(store.collections[collection]) == 2
+
+        plugin = IngestSpacePlugin(
+            llm=MockLLMPort(),
+            embeddings=MockEmbeddingsPort(),
+            knowledge_store=store,
+            graphql_client=object(),
+        )
+        event = make_ingest_body_of_knowledge()
+
+        with patch(
+            "plugins.ingest_space.space_reader.read_space_tree",
+            new_callable=AsyncMock,
+            return_value=[],
+        ):
+            result = await plugin.handle(event)
+
+        assert result.result == "success"
+        # All pre-existing chunks should be deleted
+        remaining = store.collections.get(collection, [])
+        assert len(remaining) == 0
+
+    async def test_fetch_failure_does_not_cleanup(self):
+        """When read_space_tree raises, error path is taken -- no cleanup attempted."""
+        store = MockKnowledgeStorePort()
+        collection = "bok-123-knowledge"
+
+        # Pre-populate store
+        await store.ingest(
+            collection=collection,
+            documents=["old content"],
+            metadatas=[
+                {"documentId": "old-doc", "embeddingType": "chunk",
+                 "source": "s", "type": "knowledge", "title": "t", "chunkIndex": 0},
+            ],
+            ids=["hash-x"],
+            embeddings=[[0.1] * 384],
+        )
+
+        plugin = IngestSpacePlugin(
+            llm=MockLLMPort(),
+            embeddings=MockEmbeddingsPort(),
+            knowledge_store=store,
+            graphql_client=object(),
+        )
+        event = make_ingest_body_of_knowledge()
+
+        with patch(
+            "plugins.ingest_space.space_reader.read_space_tree",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("GraphQL timeout"),
+        ):
+            result = await plugin.handle(event)
+
+        assert result.result == "failure"
+        assert result.error is not None
+        # Pre-existing chunks should NOT be deleted
+        assert len(store.collections[collection]) == 1

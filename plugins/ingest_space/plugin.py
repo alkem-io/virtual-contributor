@@ -70,12 +70,24 @@ class IngestSpacePlugin:
             documents = await read_space_tree(self._graphql_client, bok_id)
 
             if not documents:
+                logger.info(
+                    "Empty document list for %s; running cleanup pipeline",
+                    collection_name,
+                )
+                cleanup_engine = IngestEngine(steps=[
+                    ChangeDetectionStep(knowledge_store_port=self._knowledge_store),
+                    OrphanCleanupStep(knowledge_store_port=self._knowledge_store),
+                ])
+                cleanup_result = await cleanup_engine.run([], collection_name)
                 return IngestBodyOfKnowledgeResult(
                     body_of_knowledge_id=bok_id,
                     type=event.type,
                     purpose=event.purpose,
                     persona_id=event.persona_id,
-                    result="success",
+                    result="success" if cleanup_result.success else "failure",
+                    error=ErrorDetail(message="; ".join(cleanup_result.errors))
+                    if cleanup_result.errors
+                    else None,
                 )
 
             # Run ingest pipeline with ingest-space specific settings
