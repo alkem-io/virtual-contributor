@@ -155,7 +155,9 @@ class ChromaDBAdapter:
         def _delete_items():
             try:
                 col = self._client.get_or_create_collection(
-                    collection, embedding_function=None
+                    collection,
+                    embedding_function=None,
+                    metadata={"hnsw:space": self._distance_fn},
                 )
                 kwargs: dict = {}
                 if ids is not None:
