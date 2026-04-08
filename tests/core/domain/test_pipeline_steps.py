@@ -922,6 +922,91 @@ class TestDocumentSummaryStepDedup:
 
         assert len(ctx.chunks) == chunks_before + 1
 
+    async def test_stale_summary_cleanup_on_threshold_drop(self):
+        """Changed document dropping below threshold adds summary ID to orphan_ids."""
+        llm = MockLLMPort(response="Summary")
+        meta = DocumentMetadata(
+            document_id="doc-1", source="s", type="knowledge",
+            title="T", embedding_type="chunk",
+        )
+        # Only 2 chunks — below default threshold of 4
+        ctx = PipelineContext(
+            collection_name="test",
+            documents=[],
+            chunks=[
+                Chunk(content="chunk 0", metadata=meta, chunk_index=0),
+                Chunk(content="chunk 1", metadata=meta, chunk_index=1),
+            ],
+        )
+        ctx.change_detection_ran = True
+        ctx.changed_document_ids = {"doc-1"}
+
+        await DocumentSummaryStep(llm_port=llm).execute(ctx)
+
+        assert "doc-1-summary-0" in ctx.orphan_ids
+        # No summary should be generated (below threshold)
+        assert "doc-1" not in ctx.document_summaries
+        assert len(llm.calls) == 0
+
+    async def test_no_stale_cleanup_when_above_threshold(self):
+        """Changed document at or above threshold is summarized, not orphaned."""
+        llm = MockLLMPort(response="Summary")
+        ctx = _make_context()
+        await ChunkStep(chunk_size=100, chunk_overlap=10).execute(ctx)
+        assert len(ctx.chunks) >= 4  # Above default threshold
+
+        ctx.change_detection_ran = True
+        ctx.changed_document_ids = {"doc-1"}
+
+        await DocumentSummaryStep(llm_port=llm).execute(ctx)
+
+        assert "doc-1-summary-0" not in ctx.orphan_ids
+        assert "doc-1" in ctx.document_summaries
+
+    async def test_no_stale_cleanup_without_change_detection(self):
+        """Without change detection, no stale cleanup occurs."""
+        llm = MockLLMPort(response="Summary")
+        meta = DocumentMetadata(
+            document_id="doc-1", source="s", type="knowledge",
+            title="T", embedding_type="chunk",
+        )
+        ctx = PipelineContext(
+            collection_name="test",
+            documents=[],
+            chunks=[
+                Chunk(content="chunk 0", metadata=meta, chunk_index=0),
+                Chunk(content="chunk 1", metadata=meta, chunk_index=1),
+            ],
+        )
+        assert ctx.change_detection_ran is False
+
+        await DocumentSummaryStep(llm_port=llm).execute(ctx)
+
+        assert len(ctx.orphan_ids) == 0
+
+    async def test_no_stale_cleanup_for_unchanged_doc(self):
+        """Unchanged documents below threshold do not trigger stale cleanup."""
+        llm = MockLLMPort(response="Summary")
+        meta = DocumentMetadata(
+            document_id="doc-1", source="s", type="knowledge",
+            title="T", embedding_type="chunk",
+        )
+        ctx = PipelineContext(
+            collection_name="test",
+            documents=[],
+            chunks=[
+                Chunk(content="chunk 0", metadata=meta, chunk_index=0),
+                Chunk(content="chunk 1", metadata=meta, chunk_index=1),
+            ],
+        )
+        ctx.change_detection_ran = True
+        # doc-1 is NOT in changed_document_ids
+        ctx.changed_document_ids = {"other-doc"}
+
+        await DocumentSummaryStep(llm_port=llm).execute(ctx)
+
+        assert len(ctx.orphan_ids) == 0
+
 
 # ---------------------------------------------------------------------------
 # BodyOfKnowledgeSummaryStep dedup tests
@@ -1017,6 +1102,49 @@ class TestBoKSummaryStepDedup:
 
         await BodyOfKnowledgeSummaryStep(llm_port=llm).execute(ctx)
 
+        bok = [c for c in ctx.chunks if c.metadata.document_id == "body-of-knowledge-summary"]
+        assert len(bok) == 1
+
+    async def test_bok_cleanup_on_empty_corpus(self):
+        """When all docs are removed and corpus is empty, BoK summary ID is orphaned."""
+        llm = MockLLMPort(response="BoK overview")
+        ctx = PipelineContext(
+            collection_name="test",
+            documents=[],
+            chunks=[],  # No content chunks — corpus is empty
+        )
+        ctx.change_detection_ran = True
+        ctx.removed_document_ids = {"doc-1", "doc-2"}
+
+        await BodyOfKnowledgeSummaryStep(llm_port=llm).execute(ctx)
+
+        assert "body-of-knowledge-summary-0" in ctx.orphan_ids
+        # No BoK summary should be generated
+        bok = [c for c in ctx.chunks if c.metadata.document_id == "body-of-knowledge-summary"]
+        assert len(bok) == 0
+        assert len(llm.calls) == 0
+
+    async def test_no_bok_cleanup_when_docs_remain(self):
+        """When some docs remain, BoK summary is regenerated, not orphaned."""
+        llm = MockLLMPort(response="Updated BoK")
+        ctx = PipelineContext(
+            collection_name="test",
+            documents=[],
+            chunks=[
+                Chunk(
+                    content="text",
+                    metadata=DocumentMetadata(document_id="d1", source="s", embedding_type="chunk"),
+                    chunk_index=0,
+                ),
+            ],
+        )
+        ctx.change_detection_ran = True
+        ctx.removed_document_ids = {"d2"}
+        ctx.changed_document_ids = set()
+
+        await BodyOfKnowledgeSummaryStep(llm_port=llm).execute(ctx)
+
+        assert "body-of-knowledge-summary-0" not in ctx.orphan_ids
         bok = [c for c in ctx.chunks if c.metadata.document_id == "body-of-knowledge-summary"]
         assert len(bok) == 1
 
