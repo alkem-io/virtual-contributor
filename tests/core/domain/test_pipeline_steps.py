@@ -234,6 +234,48 @@ class TestDocumentSummaryStep:
         await DocumentSummaryStep(llm_port=FailingLLM()).execute(ctx)  # type: ignore[arg-type]
         assert any("DocumentSummaryStep" in e for e in ctx.errors)
 
+    async def test_stale_summary_added_to_orphans(self):
+        """Changed doc below threshold should mark its summary for cleanup."""
+        llm = MockLLMPort()
+        doc = _make_doc(content="Short text.", doc_id="doc-shrunk")
+        ctx = _make_context([doc])
+        await ChunkStep(chunk_size=10000).execute(ctx)
+
+        # Precondition: doc produces fewer than 4 chunks
+        assert len(ctx.chunks) < 4
+
+        # Simulate change detection having run and flagging this doc as changed
+        ctx.change_detection_ran = True
+        ctx.changed_document_ids.add("doc-shrunk")
+
+        chunks_before = len(ctx.chunks)
+        await DocumentSummaryStep(llm_port=llm).execute(ctx)
+
+        # No summary should be generated (below threshold)
+        assert len(ctx.chunks) == chunks_before
+        assert len(llm.calls) == 0
+        # Stale summary should be marked as orphan
+        assert "doc-shrunk-summary-0" in ctx.orphan_ids
+
+    async def test_no_stale_orphan_for_unchanged_document(self):
+        """Unchanged doc below threshold should NOT produce an orphan."""
+        llm = MockLLMPort()
+        doc = _make_doc(content="Short text.", doc_id="doc-stable")
+        ctx = _make_context([doc])
+        await ChunkStep(chunk_size=10000).execute(ctx)
+
+        assert len(ctx.chunks) < 4
+
+        # Change detection ran but this doc is NOT changed
+        ctx.change_detection_ran = True
+
+        chunks_before = len(ctx.chunks)
+        await DocumentSummaryStep(llm_port=llm).execute(ctx)
+
+        assert len(ctx.chunks) == chunks_before
+        assert len(llm.calls) == 0
+        assert len(ctx.orphan_ids) == 0
+
     async def test_step_name(self):
         llm = MockLLMPort()
         assert DocumentSummaryStep(llm_port=llm).name == "document_summary"
@@ -448,6 +490,54 @@ class TestBodyOfKnowledgeSummaryStep:
         # The prompt should mention 2000 (100% budget), not 800 (40%)
         prompt_text = llm.calls[0][1]["content"]
         assert "2000" in prompt_text
+
+    async def test_empty_corpus_adds_bok_orphan(self):
+        """When all docs are removed and corpus is empty, BoK summary is marked for cleanup."""
+        llm = MockLLMPort()
+        ctx = PipelineContext(
+            collection_name="test",
+            documents=[],
+            chunks=[],
+            change_detection_ran=True,
+            removed_document_ids={"doc-1", "doc-2"},
+        )
+
+        await BodyOfKnowledgeSummaryStep(llm_port=llm).execute(ctx)
+
+        # No BoK summary should be generated
+        assert len(ctx.chunks) == 0
+        assert len(llm.calls) == 0
+        # BoK summary entry should be marked as orphan
+        assert "body-of-knowledge-summary-0" in ctx.orphan_ids
+
+    async def test_no_bok_orphan_when_docs_remain(self):
+        """When some docs are removed but others remain, BoK summary regenerates normally."""
+        llm = MockLLMPort(response="Updated BoK overview")
+        ctx = PipelineContext(
+            collection_name="test",
+            documents=[],
+            chunks=[
+                Chunk(
+                    content="remaining doc content",
+                    metadata=DocumentMetadata(
+                        document_id="doc-remaining", source="s", embedding_type="chunk",
+                    ),
+                    chunk_index=0,
+                ),
+            ],
+            change_detection_ran=True,
+            removed_document_ids={"doc-removed"},
+            changed_document_ids=set(),
+        )
+
+        await BodyOfKnowledgeSummaryStep(llm_port=llm).execute(ctx)
+
+        # BoK summary should be regenerated (docs still exist)
+        bok_chunks = [c for c in ctx.chunks if c.metadata.document_id == "body-of-knowledge-summary"]
+        assert len(bok_chunks) == 1
+        assert bok_chunks[0].content == "Updated BoK overview"
+        # No orphan should be added
+        assert "body-of-knowledge-summary-0" not in ctx.orphan_ids
 
     async def test_step_name(self):
         llm = MockLLMPort()
