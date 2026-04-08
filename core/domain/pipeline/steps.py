@@ -278,6 +278,22 @@ class DocumentSummaryStep:
             )
         ]
 
+        # Mark stale summaries for cleanup: changed documents that dropped
+        # below the summary threshold no longer qualify for summarization,
+        # so their existing summary entry must be orphaned.
+        if context.change_detection_ran:
+            for doc_id, doc_chunks in chunks_by_doc.items():
+                if (
+                    doc_id in context.changed_document_ids
+                    and len(doc_chunks) < self._chunk_threshold
+                ):
+                    stale_id = f"{doc_id}-summary-0"
+                    context.orphan_ids.add(stale_id)
+                    logger.info(
+                        "Marking stale summary %s for cleanup (doc has %d chunks, threshold %d)",
+                        stale_id, len(doc_chunks), self._chunk_threshold,
+                    )
+
         for doc_id, doc_chunks in docs_to_summarize:
             try:
                 logger.info(
@@ -352,6 +368,14 @@ class BodyOfKnowledgeSummaryStep:
                 seen_doc_ids.append(doc_id)
 
         if not seen_doc_ids:
+            # Corpus is empty: if documents were removed, the existing BoK
+            # summary is stale and must be cleaned up.
+            if context.removed_document_ids:
+                context.orphan_ids.add("body-of-knowledge-summary-0")
+                logger.info(
+                    "Corpus empty after removing %d documents; marking BoK summary for cleanup",
+                    len(context.removed_document_ids),
+                )
             return
 
         # For each doc: prefer document_summaries, else concatenate raw chunk content
