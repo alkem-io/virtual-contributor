@@ -154,6 +154,34 @@ class TestPerPluginOverride:
         assert resolved is config
 
 
+class TestSummarizeConcurrencyValidation:
+    """Test summarize_concurrency validation."""
+
+    def test_negative_concurrency_raises(self) -> None:
+        with pytest.raises(ValueError, match="SUMMARIZE_CONCURRENCY must be >= 0"):
+            BaseConfig(llm_api_key="key", summarize_concurrency=-1)
+
+    def test_zero_concurrency_is_valid(self) -> None:
+        config = BaseConfig(llm_api_key="key", summarize_concurrency=0)
+        assert config.summarize_concurrency == 0
+
+    def test_positive_concurrency_is_valid(self) -> None:
+        config = BaseConfig(llm_api_key="key", summarize_concurrency=4)
+        assert config.summarize_concurrency == 4
+
+
+class TestSummarizeEnabledConfig:
+    """Test summarize_enabled config flag."""
+
+    def test_default_is_true(self) -> None:
+        config = BaseConfig(llm_api_key="key")
+        assert config.summarize_enabled is True
+
+    def test_can_be_set_to_false(self) -> None:
+        config = BaseConfig(llm_api_key="key", summarize_enabled=False)
+        assert config.summarize_enabled is False
+
+
 class TestUnsupportedProvider:
     """Test unsupported provider fail-fast (FR-008)."""
 

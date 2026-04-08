@@ -91,18 +91,19 @@ class IngestWebsitePlugin:
                 )
 
             # Run ingest pipeline
-            from core.config import BaseConfig
-            config = BaseConfig()
+            from core.config import IngestWebsiteConfig
+            config = IngestWebsiteConfig()
             summary_llm = self._summarize_llm or self._llm
             steps: list = [
                 ChunkStep(chunk_size=2000),
                 ContentHashStep(),
                 ChangeDetectionStep(knowledge_store_port=self._knowledge_store),
             ]
-            if config.summarize_concurrency > 0:
+            if config.summarize_enabled:
+                effective_concurrency = max(config.summarize_concurrency, 1)
                 steps.append(DocumentSummaryStep(
                     llm_port=summary_llm,
-                    concurrency=config.summarize_concurrency,
+                    concurrency=effective_concurrency,
                     chunk_threshold=self._chunk_threshold,
                 ))
                 bok_llm = self._bok_llm or summary_llm
