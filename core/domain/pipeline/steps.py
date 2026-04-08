@@ -239,7 +239,15 @@ class ChangeDetectionStep:
 # ---------------------------------------------------------------------------
 
 class DocumentSummaryStep:
-    """Generate per-document summaries for docs with >= chunk_threshold chunks."""
+    """Generate per-document summaries for docs with >= chunk_threshold chunks.
+
+    When ``embeddings_port`` is provided, each document's content chunks and its
+    newly-created summary chunk are embedded immediately after summarization
+    completes, overlapping LLM-bound summarization I/O with GPU-bound embedding
+    I/O.  Chunks that already carry an embedding (e.g. pre-loaded by
+    ``ChangeDetectionStep``) are skipped.  If incremental embedding fails the
+    error is recorded and the chunks are left for ``EmbedStep`` to retry.
+    """
 
     def __init__(
         self,
@@ -247,6 +255,8 @@ class DocumentSummaryStep:
         summary_length: int = 10000,
         concurrency: int = 8,
         chunk_threshold: int = 4,
+        embeddings_port: EmbeddingsPort | None = None,
+        embed_batch_size: int = 50,
     ) -> None:
         if chunk_threshold < 1:
             raise ValueError("chunk_threshold must be >= 1")
@@ -254,6 +264,8 @@ class DocumentSummaryStep:
         self._summary_length = summary_length
         self._concurrency = concurrency
         self._chunk_threshold = chunk_threshold
+        self._embeddings = embeddings_port
+        self._embed_batch_size = embed_batch_size
         self._model_name = getattr(
             getattr(llm_port, "_llm", None), "model", "unknown"
         )
@@ -261,6 +273,31 @@ class DocumentSummaryStep:
     @property
     def name(self) -> str:
         return "document_summary"
+
+    async def _embed_chunks(
+        self,
+        chunks: list[Chunk],
+        context: PipelineContext,
+        doc_id: str,
+    ) -> None:
+        """Embed a list of chunks in batches using the embeddings port."""
+        assert self._embeddings is not None
+        to_embed = [c for c in chunks if c.embedding is None]
+        if not to_embed:
+            return
+
+        for i in range(0, len(to_embed), self._embed_batch_size):
+            batch = to_embed[i : i + self._embed_batch_size]
+            texts = [c.content for c in batch]
+            try:
+                embeddings = await self._embeddings.embed(texts)
+                for chunk, embedding in zip(batch, embeddings):
+                    chunk.embedding = embedding
+            except Exception as exc:
+                context.errors.append(
+                    f"DocumentSummaryStep: incremental embedding failed for "
+                    f"{doc_id} batch {i // self._embed_batch_size}: {exc}"
+                )
 
     async def execute(self, context: PipelineContext) -> None:
         # Group chunks by document_id
@@ -302,10 +339,16 @@ class DocumentSummaryStep:
                     title=source_meta.title,
                     embedding_type="summary",
                 )
-                context.chunks.append(
-                    Chunk(content=summary, metadata=summary_meta, chunk_index=0)
+                summary_chunk = Chunk(
+                    content=summary, metadata=summary_meta, chunk_index=0,
                 )
+                context.chunks.append(summary_chunk)
                 logger.info("Summarized document %s", doc_id)
+
+                # Incremental embedding: embed this document's chunks + summary
+                if self._embeddings is not None:
+                    embed_targets = list(doc_chunks) + [summary_chunk]
+                    await self._embed_chunks(embed_targets, context, doc_id)
             except Exception as exc:
                 logger.warning("Summarization failed for %s: %s", doc_id, exc)
                 context.errors.append(
