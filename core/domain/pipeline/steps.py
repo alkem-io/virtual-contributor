@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
@@ -278,39 +279,65 @@ class DocumentSummaryStep:
             )
         ]
 
-        for doc_id, doc_chunks in docs_to_summarize:
-            try:
-                logger.info(
-                    "Summarizing document %s (%d chunks) [model=%s]",
-                    doc_id, len(doc_chunks), self._model_name,
-                )
-                summary = await _refine_summarize(
-                    [c.content for c in doc_chunks],
-                    self._llm.invoke,
-                    self._summary_length,
-                    DOCUMENT_REFINE_SYSTEM,
-                    DOCUMENT_REFINE_INITIAL,
-                    DOCUMENT_REFINE_SUBSEQUENT,
-                )
-                context.document_summaries[doc_id] = summary
+        if not docs_to_summarize:
+            return
 
-                source_meta = doc_chunks[0].metadata
-                summary_meta = DocumentMetadata(
-                    document_id=f"{doc_id}-summary",
-                    source=source_meta.source,
-                    type=source_meta.type,
-                    title=source_meta.title,
-                    embedding_type="summary",
-                )
-                context.chunks.append(
-                    Chunk(content=summary, metadata=summary_meta, chunk_index=0)
-                )
-                logger.info("Summarized document %s", doc_id)
-            except Exception as exc:
-                logger.warning("Summarization failed for %s: %s", doc_id, exc)
-                context.errors.append(
-                    f"DocumentSummaryStep: summarization failed for {doc_id}: {exc}"
-                )
+        @dataclass
+        class _DocResult:
+            doc_id: str
+            summary: str
+            chunk: Chunk
+
+        sem = asyncio.Semaphore(self._concurrency)
+
+        async def _summarize_one(
+            doc_id: str, doc_chunks: list[Chunk],
+        ) -> _DocResult | str:
+            """Summarize a single document. Returns _DocResult on success, error string on failure."""
+            async with sem:
+                try:
+                    logger.info(
+                        "Summarizing document %s (%d chunks) [model=%s]",
+                        doc_id, len(doc_chunks), self._model_name,
+                    )
+                    summary = await _refine_summarize(
+                        [c.content for c in doc_chunks],
+                        self._llm.invoke,
+                        self._summary_length,
+                        DOCUMENT_REFINE_SYSTEM,
+                        DOCUMENT_REFINE_INITIAL,
+                        DOCUMENT_REFINE_SUBSEQUENT,
+                    )
+                    source_meta = doc_chunks[0].metadata
+                    summary_meta = DocumentMetadata(
+                        document_id=f"{doc_id}-summary",
+                        source=source_meta.source,
+                        type=source_meta.type,
+                        title=source_meta.title,
+                        embedding_type="summary",
+                    )
+                    summary_chunk = Chunk(
+                        content=summary, metadata=summary_meta, chunk_index=0,
+                    )
+                    logger.info("Summarized document %s", doc_id)
+                    return _DocResult(
+                        doc_id=doc_id, summary=summary, chunk=summary_chunk,
+                    )
+                except Exception as exc:
+                    logger.warning("Summarization failed for %s: %s", doc_id, exc)
+                    return f"DocumentSummaryStep: summarization failed for {doc_id}: {exc}"
+
+        outcomes = await asyncio.gather(
+            *[_summarize_one(d, c) for d, c in docs_to_summarize],
+        )
+
+        # Batch-apply results to context after all coroutines complete
+        for outcome in outcomes:
+            if isinstance(outcome, str):
+                context.errors.append(outcome)
+            else:
+                context.document_summaries[outcome.doc_id] = outcome.summary
+                context.chunks.append(outcome.chunk)
 
 
 # ---------------------------------------------------------------------------

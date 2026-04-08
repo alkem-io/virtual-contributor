@@ -240,6 +240,183 @@ class TestDocumentSummaryStep:
 
 
 # ---------------------------------------------------------------------------
+# T024b: DocumentSummaryStep concurrency tests
+# ---------------------------------------------------------------------------
+
+class TestDocumentSummaryConcurrency:
+    async def test_concurrent_multiple_documents(self):
+        """Multiple documents are all summarized when processed concurrently."""
+        llm = MockLLMPort(response="Concurrent summary")
+        docs = [
+            _make_doc(content="Test content. " * 100, doc_id=f"doc-{i}")
+            for i in range(4)
+        ]
+        ctx = _make_context(docs)
+        await ChunkStep(chunk_size=100, chunk_overlap=10).execute(ctx)
+
+        # All 4 docs should have enough chunks
+        chunks_by_doc = {}
+        for c in ctx.chunks:
+            chunks_by_doc.setdefault(c.metadata.document_id, []).append(c)
+        assert all(len(v) >= 4 for v in chunks_by_doc.values())
+
+        await DocumentSummaryStep(llm_port=llm, concurrency=4).execute(ctx)
+
+        # All 4 documents should have summaries
+        assert len(ctx.document_summaries) == 4
+        for i in range(4):
+            assert f"doc-{i}" in ctx.document_summaries
+            assert ctx.document_summaries[f"doc-{i}"] == "Concurrent summary"
+
+        # 4 summary chunks should be appended
+        summary_chunks = [c for c in ctx.chunks if c.metadata.embedding_type == "summary"]
+        assert len(summary_chunks) == 4
+        summary_doc_ids = {c.metadata.document_id for c in summary_chunks}
+        assert summary_doc_ids == {f"doc-{i}-summary" for i in range(4)}
+
+    async def test_concurrent_error_isolation(self):
+        """A failure in one document does not prevent others from succeeding."""
+        call_count = 0
+
+        class SelectiveFailLLM:
+            async def invoke(self, messages):
+                nonlocal call_count
+                call_count += 1
+                # Fail on every call that includes doc-1 content
+                # (check if "doc-1" is referenced via the system being called)
+                # We use a simpler approach: fail on the second document by tracking calls
+                return "Good summary"
+
+        # We need a more targeted approach: fail for a specific doc
+        class DocFailLLM:
+            def __init__(self):
+                self.calls = []
+                self.fail_doc_id = "doc-fail"
+
+            async def invoke(self, messages):
+                self.calls.append(messages)
+                # The content for each doc is different, but we can't easily detect
+                # which doc is being summarized from messages alone.
+                # Instead, we'll use a pattern where we raise on the known content.
+                human_msg = messages[-1]["content"]
+                if "FAIL_MARKER" in human_msg:
+                    raise RuntimeError("LLM unavailable for this doc")
+                return "Good summary"
+
+        llm = DocFailLLM()
+        docs = [
+            _make_doc(content="Normal content. " * 100, doc_id="doc-ok-1"),
+            _make_doc(content="FAIL_MARKER content. " * 100, doc_id="doc-fail"),
+            _make_doc(content="More normal content. " * 100, doc_id="doc-ok-2"),
+        ]
+        ctx = _make_context(docs)
+        await ChunkStep(chunk_size=100, chunk_overlap=10).execute(ctx)
+
+        await DocumentSummaryStep(llm_port=llm, concurrency=4).execute(ctx)  # type: ignore[arg-type]
+
+        # The failing doc should be in errors
+        assert any("doc-fail" in e for e in ctx.errors)
+        assert any("DocumentSummaryStep" in e for e in ctx.errors)
+
+        # The successful docs should have summaries
+        assert "doc-ok-1" in ctx.document_summaries
+        assert "doc-ok-2" in ctx.document_summaries
+        assert "doc-fail" not in ctx.document_summaries
+
+    async def test_concurrency_semaphore_bounds(self):
+        """The semaphore limits peak concurrency to the configured value."""
+        import asyncio
+
+        peak_concurrent = 0
+        current_concurrent = 0
+        lock = asyncio.Lock()
+
+        class TrackingLLM:
+            async def invoke(self, messages):
+                nonlocal peak_concurrent, current_concurrent
+                async with lock:
+                    current_concurrent += 1
+                    if current_concurrent > peak_concurrent:
+                        peak_concurrent = current_concurrent
+                # Yield control so other coroutines can run
+                await asyncio.sleep(0.01)
+                async with lock:
+                    current_concurrent -= 1
+                return "Summary"
+
+        docs = [
+            _make_doc(content="Test content. " * 100, doc_id=f"doc-{i}")
+            for i in range(6)
+        ]
+        ctx = _make_context(docs)
+        await ChunkStep(chunk_size=100, chunk_overlap=10).execute(ctx)
+
+        await DocumentSummaryStep(
+            llm_port=TrackingLLM(), concurrency=2,  # type: ignore[arg-type]
+        ).execute(ctx)
+
+        assert peak_concurrent <= 2
+        # All docs should still get summaries
+        assert len(ctx.document_summaries) == 6
+
+    async def test_concurrent_change_detection_respected(self):
+        """With change_detection_ran=True, only changed docs get summarized."""
+        llm = MockLLMPort(response="Changed summary")
+        docs = [
+            _make_doc(content="Test content. " * 100, doc_id=f"doc-{i}")
+            for i in range(3)
+        ]
+        ctx = _make_context(docs)
+        await ChunkStep(chunk_size=100, chunk_overlap=10).execute(ctx)
+
+        # Simulate change detection: only doc-1 changed
+        ctx.change_detection_ran = True
+        ctx.changed_document_ids = {"doc-1"}
+
+        await DocumentSummaryStep(llm_port=llm, concurrency=4).execute(ctx)
+
+        # Only doc-1 should have a summary
+        assert len(ctx.document_summaries) == 1
+        assert "doc-1" in ctx.document_summaries
+        assert "doc-0" not in ctx.document_summaries
+        assert "doc-2" not in ctx.document_summaries
+
+    async def test_concurrency_one_is_sequential(self):
+        """concurrency=1 should process documents one at a time."""
+        import asyncio
+
+        peak_concurrent = 0
+        current_concurrent = 0
+        lock = asyncio.Lock()
+
+        class TrackingLLM:
+            async def invoke(self, messages):
+                nonlocal peak_concurrent, current_concurrent
+                async with lock:
+                    current_concurrent += 1
+                    if current_concurrent > peak_concurrent:
+                        peak_concurrent = current_concurrent
+                await asyncio.sleep(0.01)
+                async with lock:
+                    current_concurrent -= 1
+                return "Summary"
+
+        docs = [
+            _make_doc(content="Test content. " * 100, doc_id=f"doc-{i}")
+            for i in range(3)
+        ]
+        ctx = _make_context(docs)
+        await ChunkStep(chunk_size=100, chunk_overlap=10).execute(ctx)
+
+        await DocumentSummaryStep(
+            llm_port=TrackingLLM(), concurrency=1,  # type: ignore[arg-type]
+        ).execute(ctx)
+
+        assert peak_concurrent == 1
+        assert len(ctx.document_summaries) == 3
+
+
+# ---------------------------------------------------------------------------
 # T025: StoreStep tests
 # ---------------------------------------------------------------------------
 

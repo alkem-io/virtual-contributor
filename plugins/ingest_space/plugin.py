@@ -81,6 +81,8 @@ class IngestSpacePlugin:
                 )
 
             # Run ingest pipeline with ingest-space specific settings
+            from core.config import BaseConfig
+            config = BaseConfig()
             summary_llm = self._summarize_llm or self._llm
             engine = IngestEngine(steps=[
                 ChunkStep(chunk_size=9000, chunk_overlap=500),
@@ -88,6 +90,7 @@ class IngestSpacePlugin:
                 ChangeDetectionStep(knowledge_store_port=self._knowledge_store),
                 DocumentSummaryStep(
                     llm_port=summary_llm,
+                    concurrency=config.summarize_concurrency,
                     chunk_threshold=self._chunk_threshold,
                 ),
                 BodyOfKnowledgeSummaryStep(llm_port=self._bok_llm or summary_llm),
