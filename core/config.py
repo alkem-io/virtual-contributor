@@ -157,6 +157,12 @@ class BaseConfig(BaseSettings):
                 f"got {self.summary_chunk_threshold}"
             )
 
+        # Summarize concurrency validation
+        if self.summarize_concurrency < 0:
+            raise ValueError(
+                f"SUMMARIZE_CONCURRENCY must be >= 0, got {self.summarize_concurrency}"
+            )
+
         # Partial summarize config warning
         summarize_fields = [
             self.summarize_llm_provider,
@@ -214,6 +220,7 @@ class BaseConfig(BaseSettings):
     batch_size: int = 20
     summary_length: int = 10000
     summarize_concurrency: int = 8
+    summarize_enabled: bool = True
 
     # Health
     health_port: int = 8080
