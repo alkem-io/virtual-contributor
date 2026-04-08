@@ -14,6 +14,20 @@ logger = logging.getLogger(__name__)
 
 @runtime_checkable
 class PipelineStep(Protocol):
+    """A single stage in the ingestion pipeline.
+
+    Required members:
+        name: Human-readable step identifier used in logs and metrics.
+        execute: Async method that receives the shared PipelineContext.
+
+    Optional class attribute:
+        destructive (bool): Set to ``True`` on steps that delete or remove
+        data from the knowledge store (e.g. OrphanCleanupStep).  The engine
+        will skip destructive steps when prior steps have recorded errors in
+        ``context.errors``, preventing data loss after partial write failures.
+        Steps that do not declare this attribute are treated as non-destructive.
+    """
+
     @property
     def name(self) -> str: ...
 
@@ -65,6 +79,23 @@ class IngestEngine:
         for step in self._steps:
             items_before = len(context.chunks)
             errors_before = len(context.errors)
+
+            # Gate destructive steps on prior errors to prevent data loss.
+            if getattr(step, "destructive", False) and context.errors:
+                msg = (
+                    f"{step.name}: skipped (destructive step gated by "
+                    f"{len(context.errors)} prior error(s))"
+                )
+                context.errors.append(msg)
+                logger.warning(msg)
+                context.metrics[step.name] = StepMetrics(
+                    duration=0.0,
+                    items_in=items_before,
+                    items_out=items_before,
+                    error_count=1,
+                )
+                continue
+
             start = time.monotonic()
 
             try:
