@@ -455,11 +455,23 @@ class StoreStep:
         return "store"
 
     async def execute(self, context: PipelineContext) -> None:
-        storable = [c for c in context.chunks if c.embedding is not None]
-        skipped = len(context.chunks) - len(storable)
-        if skipped > 0:
+        embedded = [c for c in context.chunks if c.embedding is not None]
+        no_embedding = len(context.chunks) - len(embedded)
+        if no_embedding > 0:
             context.errors.append(
-                f"StoreStep: skipped {skipped} chunks without embeddings"
+                f"StoreStep: skipped {no_embedding} chunks without embeddings"
+            )
+
+        # Filter out unchanged chunks already present in the store
+        storable = [
+            c for c in embedded
+            if c.content_hash is None
+            or c.content_hash not in context.unchanged_chunk_hashes
+        ]
+        unchanged_count = len(embedded) - len(storable)
+        if unchanged_count > 0:
+            logger.info(
+                "StoreStep: skipped %d unchanged chunks", unchanged_count,
             )
 
         for i in range(0, len(storable), self._batch_size):
