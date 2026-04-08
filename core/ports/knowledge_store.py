@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 
 @dataclass
@@ -69,4 +69,16 @@ class KnowledgeStorePort(Protocol):
         where: dict | None = None,
     ) -> None:
         """Delete chunks by ID list and/or metadata filter."""
+        ...
+
+    async def get_collection_metadata(
+        self, collection: str
+    ) -> dict[str, Any]:
+        """Read collection-level metadata (not chunk metadata)."""
+        ...
+
+    async def set_collection_metadata(
+        self, collection: str, metadata: dict[str, Any]
+    ) -> None:
+        """Write collection-level metadata (merges with existing)."""
         ...

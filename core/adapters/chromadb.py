@@ -173,6 +173,36 @@ class ChromaDBAdapter:
 
         await self._retry(_delete_items)
 
+    async def get_collection_metadata(self, collection: str) -> dict[str, Any]:
+        """Read collection-level metadata from ChromaDB."""
+
+        def _get_meta():
+            col = self._client.get_or_create_collection(
+                collection,
+                embedding_function=None,
+                metadata={"hnsw:space": self._distance_fn},
+            )
+            return dict(col.metadata or {})
+
+        return await self._retry(_get_meta)
+
+    async def set_collection_metadata(
+        self, collection: str, metadata: dict[str, Any]
+    ) -> None:
+        """Write collection-level metadata to ChromaDB (merges with existing)."""
+
+        def _set_meta():
+            col = self._client.get_or_create_collection(
+                collection,
+                embedding_function=None,
+                metadata={"hnsw:space": self._distance_fn},
+            )
+            existing = dict(col.metadata or {})
+            existing.update(metadata)
+            col.modify(metadata=existing)
+
+        await self._retry(_set_meta)
+
     @staticmethod
     async def _retry(fn, max_retries: int = MAX_RETRIES) -> Any:
         last_exc: Exception | None = None

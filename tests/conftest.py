@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
 import pytest
 
@@ -54,6 +54,7 @@ class MockKnowledgeStorePort:
 
     def __init__(self) -> None:
         self.collections: dict[str, list[dict]] = {}
+        self.collection_metadata: dict[str, dict[str, Any]] = {}
         self.query_calls: list[tuple] = []
         self.deleted: list[str] = []
 
@@ -133,6 +134,18 @@ class MockKnowledgeStorePort:
             documents=result_documents,
             embeddings=result_embeddings,
         )
+
+    async def get_collection_metadata(
+        self, collection: str
+    ) -> dict[str, Any]:
+        return dict(self.collection_metadata.get(collection, {}))
+
+    async def set_collection_metadata(
+        self, collection: str, metadata: dict[str, Any]
+    ) -> None:
+        existing = self.collection_metadata.get(collection, {})
+        existing.update(metadata)
+        self.collection_metadata[collection] = existing
 
     async def delete(
         self,

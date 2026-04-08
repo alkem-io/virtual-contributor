@@ -7,9 +7,12 @@ from core.events.ingest_space import (
     IngestBodyOfKnowledgeResult,
 )
 from core.events.ingest_website import (
+    IngestionMode,
     IngestionResult,
     IngestWebsite,
+    IngestWebsiteProgress,
     IngestWebsiteResult,
+    WebsiteSource,
 )
 from core.events.input import (
     ExternalConfig,
@@ -41,9 +44,12 @@ __all__ = [
     "Response",
     "Source",
     # ingest – website
+    "IngestionMode",
     "IngestionResult",
     "IngestWebsite",
+    "IngestWebsiteProgress",
     "IngestWebsiteResult",
+    "WebsiteSource",
     # ingest – space / body of knowledge
     "ErrorDetail",
     "IngestBodyOfKnowledge",
