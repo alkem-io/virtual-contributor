@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from unittest.mock import MagicMock, patch
+
 import pytest
 
 from core.events.ingest_space import IngestBodyOfKnowledgeResult
@@ -102,3 +104,94 @@ class TestIngestSpacePlugin:
     async def test_startup_shutdown(self, plugin):
         await plugin.startup()
         await plugin.shutdown()
+
+    async def test_pipeline_with_summarize_enabled(self):
+        """Summary steps are included when summarize_enabled=True."""
+        import asyncio
+        from core.domain.ingest_pipeline import Document, DocumentMetadata
+
+        plugin = IngestSpacePlugin(
+            llm=MockLLMPort(),
+            embeddings=MockEmbeddingsPort(),
+            knowledge_store=MockKnowledgeStorePort(),
+            graphql_client=MagicMock(),
+            summarize_enabled=True,
+            summarize_concurrency=4,
+        )
+        event = make_ingest_body_of_knowledge()
+        mock_docs = [
+            Document(
+                content="Test content for space ingestion.",
+                metadata=DocumentMetadata(
+                    document_id="doc-1",
+                    source="space-1",
+                    type="knowledge",
+                    title="Test Doc",
+                ),
+            )
+        ]
+
+        with patch("plugins.ingest_space.space_reader.read_space_tree", return_value=mock_docs), \
+             patch("plugins.ingest_space.plugin.IngestEngine") as mock_engine:
+            mock_engine.return_value.run = MagicMock(
+                side_effect=lambda *a, **kw: asyncio.coroutine(
+                    lambda: MagicMock(success=True, errors=[])
+                )()
+            )
+            await plugin.handle(event)
+
+        call_kwargs = mock_engine.call_args
+        steps = call_kwargs.kwargs.get("steps") or call_kwargs.args[0] if call_kwargs.args else call_kwargs.kwargs["steps"]
+        step_names = [s.name for s in steps]
+        assert "document_summary" in step_names
+        assert "body_of_knowledge_summary" in step_names
+
+    async def test_pipeline_with_summarize_disabled(self):
+        """Summary steps are excluded when summarize_enabled=False."""
+        import asyncio
+        from core.domain.ingest_pipeline import Document, DocumentMetadata
+
+        plugin = IngestSpacePlugin(
+            llm=MockLLMPort(),
+            embeddings=MockEmbeddingsPort(),
+            knowledge_store=MockKnowledgeStorePort(),
+            graphql_client=MagicMock(),
+            summarize_enabled=False,
+        )
+        event = make_ingest_body_of_knowledge()
+        mock_docs = [
+            Document(
+                content="Test content for space ingestion.",
+                metadata=DocumentMetadata(
+                    document_id="doc-1",
+                    source="space-1",
+                    type="knowledge",
+                    title="Test Doc",
+                ),
+            )
+        ]
+
+        with patch("plugins.ingest_space.space_reader.read_space_tree", return_value=mock_docs), \
+             patch("plugins.ingest_space.plugin.IngestEngine") as mock_engine:
+            mock_engine.return_value.run = MagicMock(
+                side_effect=lambda *a, **kw: asyncio.coroutine(
+                    lambda: MagicMock(success=True, errors=[])
+                )()
+            )
+            await plugin.handle(event)
+
+        call_kwargs = mock_engine.call_args
+        steps = call_kwargs.kwargs.get("steps") or call_kwargs.args[0] if call_kwargs.args else call_kwargs.kwargs["steps"]
+        step_names = [s.name for s in steps]
+        assert "document_summary" not in step_names
+        assert "body_of_knowledge_summary" not in step_names
+
+    async def test_concurrency_zero_normalizes_to_one(self):
+        """summarize_concurrency=0 is normalized to 1 (sequential)."""
+        plugin = IngestSpacePlugin(
+            llm=MockLLMPort(),
+            embeddings=MockEmbeddingsPort(),
+            knowledge_store=MockKnowledgeStorePort(),
+            summarize_concurrency=0,
+        )
+        assert plugin._summarize_concurrency == 1

@@ -209,6 +209,11 @@ async def _run(config: BaseConfig) -> None:
     # Inject chunk threshold for ingest plugins
     if "chunk_threshold" in sig.parameters:
         deps["chunk_threshold"] = config.summary_chunk_threshold
+    # Inject summarization control for ingest plugins
+    if "summarize_enabled" in sig.parameters:
+        deps["summarize_enabled"] = config.summarize_enabled
+    if "summarize_concurrency" in sig.parameters:
+        deps["summarize_concurrency"] = config.summarize_concurrency
     plugin = plugin_class(**deps)
 
     # Plugin lifecycle: startup
