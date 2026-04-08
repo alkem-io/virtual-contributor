@@ -512,6 +512,8 @@ class StoreStep:
 class OrphanCleanupStep:
     """Delete orphaned chunks and chunks from removed documents."""
 
+    destructive = True
+
     def __init__(self, knowledge_store_port: KnowledgeStorePort) -> None:
         self._store = knowledge_store_port
 
@@ -520,12 +522,6 @@ class OrphanCleanupStep:
         return "orphan_cleanup"
 
     async def execute(self, context: PipelineContext) -> None:
-        if any(e.startswith("StoreStep:") for e in context.errors):
-            context.errors.append(
-                "OrphanCleanupStep: skipped cleanup because earlier storage writes failed"
-            )
-            return
-
         deleted = 0
 
         # Delete orphan chunk IDs
