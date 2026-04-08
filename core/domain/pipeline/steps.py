@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 from dataclasses import replace
@@ -248,6 +249,8 @@ class DocumentSummaryStep:
         concurrency: int = 8,
         chunk_threshold: int = 4,
     ) -> None:
+        if concurrency < 1:
+            raise ValueError("concurrency must be >= 1")
         if chunk_threshold < 1:
             raise ValueError("chunk_threshold must be >= 1")
         self._llm = llm_port
@@ -268,49 +271,72 @@ class DocumentSummaryStep:
         for chunk in context.chunks:
             chunks_by_doc.setdefault(chunk.metadata.document_id, []).append(chunk)
 
-        docs_to_summarize = [
-            (doc_id, doc_chunks)
-            for doc_id, doc_chunks in chunks_by_doc.items()
-            if len(doc_chunks) >= self._chunk_threshold
-            and (
-                not context.change_detection_ran
-                or doc_id in context.changed_document_ids
-            )
-        ]
+        docs_to_summarize = sorted(
+            [
+                (doc_id, doc_chunks)
+                for doc_id, doc_chunks in chunks_by_doc.items()
+                if len(doc_chunks) >= self._chunk_threshold
+                and (
+                    not context.change_detection_ran
+                    or doc_id in context.changed_document_ids
+                )
+            ],
+            key=lambda item: item[0],
+        )
 
-        for doc_id, doc_chunks in docs_to_summarize:
-            try:
-                logger.info(
-                    "Summarizing document %s (%d chunks) [model=%s]",
-                    doc_id, len(doc_chunks), self._model_name,
-                )
-                summary = await _refine_summarize(
-                    [c.content for c in doc_chunks],
-                    self._llm.invoke,
-                    self._summary_length,
-                    DOCUMENT_REFINE_SYSTEM,
-                    DOCUMENT_REFINE_INITIAL,
-                    DOCUMENT_REFINE_SUBSEQUENT,
-                )
-                context.document_summaries[doc_id] = summary
+        if not docs_to_summarize:
+            return
 
-                source_meta = doc_chunks[0].metadata
-                summary_meta = DocumentMetadata(
-                    document_id=f"{doc_id}-summary",
-                    source=source_meta.source,
-                    type=source_meta.type,
-                    title=source_meta.title,
-                    embedding_type="summary",
-                )
-                context.chunks.append(
-                    Chunk(content=summary, metadata=summary_meta, chunk_index=0)
-                )
-                logger.info("Summarized document %s", doc_id)
-            except Exception as exc:
-                logger.warning("Summarization failed for %s: %s", doc_id, exc)
+        sem = asyncio.Semaphore(self._concurrency)
+
+        async def _summarize_one(
+            doc_id: str, doc_chunks: list[Chunk],
+        ) -> tuple[str, str | None, Chunk | None, str | None]:
+            async with sem:
+                try:
+                    logger.info(
+                        "Summarizing document %s (%d chunks) [model=%s]",
+                        doc_id, len(doc_chunks), self._model_name,
+                    )
+                    summary = await _refine_summarize(
+                        [c.content for c in doc_chunks],
+                        self._llm.invoke,
+                        self._summary_length,
+                        DOCUMENT_REFINE_SYSTEM,
+                        DOCUMENT_REFINE_INITIAL,
+                        DOCUMENT_REFINE_SUBSEQUENT,
+                    )
+                    source_meta = doc_chunks[0].metadata
+                    summary_meta = DocumentMetadata(
+                        document_id=f"{doc_id}-summary",
+                        source=source_meta.source,
+                        type=source_meta.type,
+                        title=source_meta.title,
+                        embedding_type="summary",
+                    )
+                    summary_chunk = Chunk(
+                        content=summary, metadata=summary_meta, chunk_index=0,
+                    )
+                    logger.info("Summarized document %s", doc_id)
+                    return (doc_id, summary, summary_chunk, None)
+                except Exception as exc:
+                    logger.warning("Summarization failed for %s: %s", doc_id, exc)
+                    return (doc_id, None, None, str(exc))
+
+        results = await asyncio.gather(
+            *[_summarize_one(d, c) for d, c in docs_to_summarize]
+        )
+
+        for doc_id, summary, summary_chunk, error in results:
+            if error is not None:
                 context.errors.append(
-                    f"DocumentSummaryStep: summarization failed for {doc_id}: {exc}"
+                    f"DocumentSummaryStep: summarization failed for {doc_id}: {error}"
                 )
+            else:
+                assert summary is not None
+                assert summary_chunk is not None
+                context.document_summaries[doc_id] = summary
+                context.chunks.append(summary_chunk)
 
 
 # ---------------------------------------------------------------------------
