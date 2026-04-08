@@ -11,6 +11,7 @@ from core.events import (
     IngestWebsite,
     Input,
     Response,
+    WebsiteSource,
 )
 from core.ports.knowledge_store import GetResult, QueryResult
 
@@ -237,8 +238,11 @@ def make_response(**overrides) -> Response:
 
 
 def make_ingest_website(**overrides) -> IngestWebsite:
-    """Create a sample IngestWebsite event."""
-    defaults = {
+    """Create a sample IngestWebsite event.
+
+    Supports both legacy format (baseUrl) and new format (sources list).
+    """
+    defaults: dict = {
         "baseUrl": "https://example.com",
         "type": "website",
         "purpose": "knowledge",
@@ -246,6 +250,15 @@ def make_ingest_website(**overrides) -> IngestWebsite:
     }
     defaults.update(overrides)
     return IngestWebsite.model_validate(defaults)
+
+
+def make_website_source(**overrides) -> WebsiteSource:
+    """Create a sample WebsiteSource for testing."""
+    defaults: dict = {
+        "url": "https://example.com",
+    }
+    defaults.update(overrides)
+    return WebsiteSource.model_validate(defaults)
 
 
 def make_ingest_body_of_knowledge(**overrides) -> IngestBodyOfKnowledge:
