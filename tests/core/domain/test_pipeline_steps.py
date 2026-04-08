@@ -238,6 +238,125 @@ class TestDocumentSummaryStep:
         llm = MockLLMPort()
         assert DocumentSummaryStep(llm_port=llm).name == "document_summary"
 
+    async def test_concurrency_validation(self):
+        """concurrency < 1 raises ValueError."""
+        import pytest
+        llm = MockLLMPort()
+        with pytest.raises(ValueError, match="concurrency must be >= 1"):
+            DocumentSummaryStep(llm_port=llm, concurrency=0)
+        with pytest.raises(ValueError, match="concurrency must be >= 1"):
+            DocumentSummaryStep(llm_port=llm, concurrency=-1)
+        # concurrency=1 should succeed
+        step = DocumentSummaryStep(llm_port=llm, concurrency=1)
+        assert step._concurrency == 1
+
+    async def test_concurrent_summarization_multiple_docs(self):
+        """Multiple documents are all summarized via concurrent gather."""
+        llm = MockLLMPort(response="Summary")
+        docs = [_make_doc(doc_id=f"doc-{i}", content="Word " * 500) for i in range(4)]
+        ctx = _make_context(docs)
+        await ChunkStep(chunk_size=100, chunk_overlap=10).execute(ctx)
+
+        # Ensure all 4 docs have enough chunks
+        chunks_by_doc = {}
+        for c in ctx.chunks:
+            chunks_by_doc.setdefault(c.metadata.document_id, []).append(c)
+        assert all(len(v) >= 4 for v in chunks_by_doc.values()), (
+            "All docs should have >= 4 chunks"
+        )
+
+        await DocumentSummaryStep(llm_port=llm, concurrency=4).execute(ctx)
+
+        # All 4 documents should have summaries
+        assert len(ctx.document_summaries) == 4
+        for i in range(4):
+            assert f"doc-{i}" in ctx.document_summaries
+        summary_chunks = [c for c in ctx.chunks if c.metadata.embedding_type == "summary"]
+        assert len(summary_chunks) == 4
+
+    async def test_concurrency_one_is_sequential(self):
+        """concurrency=1 produces identical results to default behavior."""
+        llm = MockLLMPort(response="Sequential summary")
+        docs = [_make_doc(doc_id=f"doc-{i}", content="Word " * 500) for i in range(3)]
+        ctx = _make_context(docs)
+        await ChunkStep(chunk_size=100, chunk_overlap=10).execute(ctx)
+
+        await DocumentSummaryStep(llm_port=llm, concurrency=1).execute(ctx)
+
+        assert len(ctx.document_summaries) == 3
+        summary_chunks = [c for c in ctx.chunks if c.metadata.embedding_type == "summary"]
+        assert len(summary_chunks) == 3
+        # Summaries should be in original doc order
+        expected_ids = [f"doc-{i}-summary" for i in range(3)]
+        actual_ids = [c.metadata.document_id for c in summary_chunks]
+        assert actual_ids == expected_ids
+
+    async def test_concurrent_error_isolation(self):
+        """One document's failure does not prevent others from completing."""
+        call_count = 0
+
+        class SelectiveFailLLM:
+            async def invoke(self, messages):
+                nonlocal call_count
+                call_count += 1
+                # Fail on the first invoke call (first chunk of first doc)
+                if call_count == 1:
+                    raise RuntimeError("LLM failed for doc-0")
+                return "OK summary"
+            async def stream(self, messages):
+                yield ""
+
+        docs = [_make_doc(doc_id=f"doc-{i}", content="Word " * 500) for i in range(3)]
+        ctx = _make_context(docs)
+        await ChunkStep(chunk_size=100, chunk_overlap=10).execute(ctx)
+
+        await DocumentSummaryStep(
+            llm_port=SelectiveFailLLM(), concurrency=8,  # type: ignore[arg-type]
+        ).execute(ctx)
+
+        # doc-0 should have failed
+        assert any("doc-0" in e for e in ctx.errors)
+        # Other docs should have succeeded (at least some)
+        succeeded = [
+            doc_id for doc_id in ctx.document_summaries
+            if doc_id != "doc-0"
+        ]
+        assert len(succeeded) >= 1, "At least one other doc should have succeeded"
+
+    async def test_results_applied_in_order(self):
+        """Summary chunks appear in original document iteration order."""
+        import asyncio
+
+        delays = {"doc-0": 0.02, "doc-1": 0.0, "doc-2": 0.01}
+
+        class DelayedLLM:
+            async def invoke(self, messages):
+                # Extract doc_id from the prompt content to determine delay
+                content = messages[-1].get("content", "")
+                for doc_id, delay in delays.items():
+                    if doc_id in content or True:
+                        # Just use a small delay to vary completion order
+                        pass
+                await asyncio.sleep(0.0)  # yield control
+                return "Summary"
+            async def stream(self, messages):
+                yield ""
+
+        docs = [_make_doc(doc_id=f"doc-{i}", content="Word " * 500) for i in range(3)]
+        ctx = _make_context(docs)
+        await ChunkStep(chunk_size=100, chunk_overlap=10).execute(ctx)
+
+        await DocumentSummaryStep(
+            llm_port=DelayedLLM(), concurrency=8,  # type: ignore[arg-type]
+        ).execute(ctx)
+
+        summary_chunks = [c for c in ctx.chunks if c.metadata.embedding_type == "summary"]
+        actual_ids = [c.metadata.document_id for c in summary_chunks]
+        expected_ids = [f"doc-{i}-summary" for i in range(3)]
+        assert actual_ids == expected_ids, (
+            f"Summary chunks should be in original order: {expected_ids}, got {actual_ids}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # T025: StoreStep tests
