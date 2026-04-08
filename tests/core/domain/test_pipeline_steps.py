@@ -238,6 +238,113 @@ class TestDocumentSummaryStep:
         llm = MockLLMPort()
         assert DocumentSummaryStep(llm_port=llm).name == "document_summary"
 
+    async def test_incremental_embedding_after_summary(self):
+        """With embeddings_port, all chunks for a summarized document have embeddings."""
+        llm = MockLLMPort(response="Generated summary")
+        embeddings = MockEmbeddingsPort()
+        ctx = _make_context()
+        await ChunkStep(chunk_size=100, chunk_overlap=10).execute(ctx)
+        assert len(ctx.chunks) > 3, "Test doc should produce >3 chunks"
+
+        await DocumentSummaryStep(
+            llm_port=llm, embeddings_port=embeddings,
+        ).execute(ctx)
+
+        # All chunks for doc-1 (content + summary) should have embeddings
+        doc1_chunks = [
+            c for c in ctx.chunks
+            if c.metadata.document_id in ("doc-1", "doc-1-summary")
+        ]
+        assert all(c.embedding is not None for c in doc1_chunks)
+        # Embeddings port should have been called
+        assert len(embeddings.calls) >= 1
+
+    async def test_summary_chunk_gets_embedded(self):
+        """The summary chunk produced for a document also receives an embedding."""
+        llm = MockLLMPort(response="Summary text")
+        embeddings = MockEmbeddingsPort()
+        ctx = _make_context()
+        await ChunkStep(chunk_size=100, chunk_overlap=10).execute(ctx)
+
+        await DocumentSummaryStep(
+            llm_port=llm, embeddings_port=embeddings,
+        ).execute(ctx)
+
+        summary_chunks = [
+            c for c in ctx.chunks if c.metadata.embedding_type == "summary"
+        ]
+        assert len(summary_chunks) == 1
+        assert summary_chunks[0].embedding is not None
+
+    async def test_unchanged_chunks_not_re_embedded(self):
+        """Chunks with pre-existing embeddings are not sent to the embeddings port."""
+        llm = MockLLMPort(response="Summary")
+        embeddings = MockEmbeddingsPort()
+        meta = DocumentMetadata(
+            document_id="doc-1", source="s", type="knowledge",
+            title="T", embedding_type="chunk",
+        )
+        # Create chunks where all content chunks already have embeddings
+        pre_embedded_chunks = [
+            Chunk(
+                content=f"chunk {i}", metadata=meta, chunk_index=i,
+                embedding=[float(i)] * 384,
+            )
+            for i in range(5)
+        ]
+        ctx = PipelineContext(
+            collection_name="test",
+            documents=[_make_doc()],
+            chunks=pre_embedded_chunks,
+        )
+
+        await DocumentSummaryStep(
+            llm_port=llm, embeddings_port=embeddings,
+        ).execute(ctx)
+
+        # Only the summary chunk (which is new) should be sent for embedding
+        assert len(embeddings.calls) == 1
+        assert len(embeddings.calls[0]) == 1  # Just the summary chunk
+
+    async def test_no_embedding_without_port(self):
+        """Without embeddings_port, chunks remain without embeddings after step."""
+        llm = MockLLMPort(response="Summary")
+        ctx = _make_context()
+        await ChunkStep(chunk_size=100, chunk_overlap=10).execute(ctx)
+
+        await DocumentSummaryStep(llm_port=llm).execute(ctx)
+
+        content_chunks = [
+            c for c in ctx.chunks if c.metadata.embedding_type == "chunk"
+        ]
+        assert all(c.embedding is None for c in content_chunks)
+
+    async def test_embedding_error_does_not_block_summary(self):
+        """If embedding fails, the summary still exists and errors are recorded."""
+        class FailingEmbeddings:
+            async def embed(self, texts):
+                raise RuntimeError("GPU unavailable")
+
+        llm = MockLLMPort(response="Summary despite error")
+        ctx = _make_context()
+        await ChunkStep(chunk_size=100, chunk_overlap=10).execute(ctx)
+
+        await DocumentSummaryStep(
+            llm_port=llm, embeddings_port=FailingEmbeddings(),  # type: ignore[arg-type]
+        ).execute(ctx)
+
+        # Summary should still be produced
+        assert "doc-1" in ctx.document_summaries
+        assert ctx.document_summaries["doc-1"] == "Summary despite error"
+        summary_chunks = [
+            c for c in ctx.chunks if c.metadata.embedding_type == "summary"
+        ]
+        assert len(summary_chunks) == 1
+        # Error should be recorded
+        assert any(
+            "DocumentSummaryStep: embedding failed" in e for e in ctx.errors
+        )
+
 
 # ---------------------------------------------------------------------------
 # T025: StoreStep tests
