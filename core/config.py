@@ -43,6 +43,7 @@ class BaseConfig(BaseSettings):
     rabbitmq_result_routing_key: str = "invoke-engine-result"
     rabbitmq_heartbeat: int = 300
     rabbitmq_max_retries: int = 3
+    pipeline_timeout: int = 7200  # seconds; 0 = no timeout
 
     # ChromaDB / Vector DB
     vector_db_host: str | None = None
@@ -106,6 +107,10 @@ class BaseConfig(BaseSettings):
         if self.rabbitmq_max_retries < 1:
             raise ValueError(
                 f"RABBITMQ_MAX_RETRIES must be >= 1, got {self.rabbitmq_max_retries}"
+            )
+        if self.pipeline_timeout < 0:
+            raise ValueError(
+                f"PIPELINE_TIMEOUT must be >= 0 (0 = no timeout), got {self.pipeline_timeout}"
             )
 
         # Vector DB distance function validation

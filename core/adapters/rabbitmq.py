@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Callable
@@ -14,6 +15,12 @@ class RabbitMQAdapter:
     """RabbitMQ transport adapter using aio-pika.
 
     Implements the TransportPort protocol for message consumption and publishing.
+
+    Supports **early ACK** mode: when ``pipeline_timeout`` is passed to
+    ``consume()``, messages are acknowledged immediately after JSON parsing
+    succeeds, and the callback runs asynchronously as a background task
+    wrapped in ``asyncio.wait_for()``.  This prevents RabbitMQ
+    ``consumer_timeout`` from killing long-running pipelines.
     """
 
     def __init__(
@@ -36,6 +43,7 @@ class RabbitMQAdapter:
         self._connection: aio_pika.abc.AbstractRobustConnection | None = None
         self._channel: aio_pika.abc.AbstractChannel | None = None
         self._exchange: aio_pika.abc.AbstractExchange | None = None
+        self._inflight_tasks: set[asyncio.Task] = set()  # type: ignore[type-arg]
 
     async def connect(self) -> None:
         """Establish connection and channel."""
@@ -63,12 +71,25 @@ class RabbitMQAdapter:
             and not self._channel.is_closed
         )
 
-    async def consume(self, queue: str, callback: Callable) -> None:
+    async def consume(
+        self,
+        queue: str,
+        callback: Callable,
+        pipeline_timeout: float | None = None,
+    ) -> None:
         """Start consuming messages from a queue.
 
-        The callback receives the parsed JSON body as a dict.
-        Exceptions from the callback escape the process() context so
-        aio-pika rejects/requeues the message (dead-letter on repeated failure).
+        When *pipeline_timeout* is provided the adapter operates in **early
+        ACK** mode:
+
+        1. Parse the message body as JSON.
+        2. If parsing fails, NACK (``reject(requeue=False)``) and return.
+        3. ACK the message immediately.
+        4. Spawn *callback(body)* as a background ``asyncio.Task`` wrapped
+           in ``asyncio.wait_for(timeout=pipeline_timeout)``.
+
+        When *pipeline_timeout* is ``None`` the legacy behaviour is used
+        (callback runs inline, no early ACK -- useful for tests).
         """
         if self._channel is None or self._exchange is None:
             raise RuntimeError("Not connected to RabbitMQ")
@@ -78,46 +99,80 @@ class RabbitMQAdapter:
         )
         await q.bind(self._exchange, routing_key=queue)
 
-        max_retries = self._max_retries
-        exchange = self._exchange
-        assert exchange is not None, "consume() called before connect()"
+        inflight = self._inflight_tasks
+        timeout = pipeline_timeout
+
+        async def _run_callback(body: dict, queue_name: str) -> None:
+            """Execute the callback with an optional outer timeout."""
+            try:
+                if timeout and timeout > 0:
+                    await asyncio.wait_for(callback(body), timeout=timeout)
+                else:
+                    await callback(body)
+            except asyncio.TimeoutError:
+                logger.error(
+                    "Pipeline timeout (%.0fs) exceeded for message on queue %s",
+                    timeout,
+                    queue_name,
+                )
+            except Exception as exc:
+                # Callback should handle its own errors, but guard against
+                # unexpected leakage so the consumer loop keeps running.
+                logger.exception(
+                    "Unhandled exception in background task for queue %s: %s",
+                    queue_name,
+                    exc,
+                )
 
         async def on_message(message: aio_pika.abc.AbstractIncomingMessage) -> None:
-            headers = message.headers or {}
-            retry_count = int(headers.get("x-retry-count", 0))
-
+            # --- Step 1: Parse JSON ------------------------------------------------
             try:
                 body = json.loads(message.body.decode("utf-8"))
-                logger.info("Received message on queue %s (attempt %d/%d)", queue, retry_count + 1, max_retries)
-                await callback(body)
-                await message.ack()
-            except Exception as exc:
-                if retry_count < max_retries - 1:
-                    logger.warning(
-                        "Message failed (attempt %d/%d), requeuing: %s",
-                        retry_count + 1, max_retries, exc,
-                    )
-                    new_headers = dict(headers)
-                    new_headers["x-retry-count"] = retry_count + 1
-                    retry_msg = Message(
-                        body=message.body,
-                        content_type=message.content_type,
-                        headers=new_headers,
-                    )
-                    try:
-                        await exchange.publish(retry_msg, routing_key=queue)
-                    except Exception as pub_exc:
-                        logger.error("Failed to republish retry message: %s", pub_exc)
-                    await message.reject(requeue=False)
-                else:
-                    logger.error(
-                        "Message failed after %d attempts, discarding: %s",
-                        max_retries, exc,
-                    )
-                    await message.reject(requeue=False)
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                logger.error(
+                    "Invalid message body on queue %s, rejecting: %s", queue, exc,
+                )
+                await message.reject(requeue=False)
+                return
+
+            # --- Step 2: Early ACK -------------------------------------------------
+            logger.info("Received message on queue %s — ACK'd early", queue)
+            await message.ack()
+
+            # --- Step 3: Dispatch callback as background task ----------------------
+            task = asyncio.create_task(_run_callback(body, queue))
+            inflight.add(task)
+            task.add_done_callback(inflight.discard)
 
         await q.consume(on_message)
-        logger.info("Consuming from queue: %s", queue)
+        logger.info("Consuming from queue: %s (pipeline_timeout=%s)", queue, timeout)
+
+    async def drain_tasks(self, timeout: float = 30.0) -> None:
+        """Wait for all in-flight background tasks to complete.
+
+        Called during graceful shutdown. Tasks that do not finish within
+        *timeout* seconds are cancelled.
+        """
+        pending = list(self._inflight_tasks)
+        if not pending:
+            logger.info("No in-flight tasks to drain")
+            return
+
+        logger.info("Draining %d in-flight task(s) (timeout=%.0fs)", len(pending), timeout)
+        done, not_done = await asyncio.wait(pending, timeout=timeout)
+
+        if not_done:
+            logger.warning(
+                "%d task(s) did not complete within %.0fs — cancelling",
+                len(not_done),
+                timeout,
+            )
+            for t in not_done:
+                t.cancel()
+            # Allow cancellation to propagate
+            await asyncio.gather(*not_done, return_exceptions=True)
+
+        logger.info("Task drain complete: %d finished, %d cancelled", len(done), len(not_done))
 
     async def publish(self, exchange: str, routing_key: str, message: bytes) -> None:
         """Publish a message to the exchange with the given routing key."""

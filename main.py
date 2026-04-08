@@ -49,6 +49,7 @@ def _log_config(config: BaseConfig) -> None:
         "guidance_min_score",
         "max_context_chars",
         "summary_chunk_threshold",
+        "pipeline_timeout",
     ]
     for name in fields:
         value = getattr(config, name, None)
@@ -297,8 +298,13 @@ async def _run(config: BaseConfig) -> None:
                 json.dumps(envelope).encode("utf-8"),
             )
 
-    # Start consuming
-    await transport.consume(config.rabbitmq_input_queue, on_message)
+    # Start consuming (early ACK + async dispatch with outer timeout)
+    pipeline_timeout = float(config.pipeline_timeout) if config.pipeline_timeout > 0 else None
+    await transport.consume(
+        config.rabbitmq_input_queue,
+        on_message,
+        pipeline_timeout=pipeline_timeout,
+    )
 
     # Health server
     health = HealthServer(port=config.health_port)
@@ -324,6 +330,7 @@ async def _run(config: BaseConfig) -> None:
     # Graceful shutdown
     logger.info("Shutting down...")
     await health.stop()
+    await transport.drain_tasks(timeout=30.0)
     await plugin.shutdown()
     await transport.close()
     logger.info("Shutdown complete")
