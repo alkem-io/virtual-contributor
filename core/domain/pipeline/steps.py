@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
@@ -239,13 +239,30 @@ class ChangeDetectionStep:
 # DocumentSummaryStep
 # ---------------------------------------------------------------------------
 
+
+@dataclass
+class _SummaryResult:
+    """Outcome of a single document summarization task."""
+
+    doc_id: str
+    summary: str | None = None
+    chunk: Chunk | None = None
+    doc_chunks: list[Chunk] | None = None
+    error: str | None = None
+
+
 class DocumentSummaryStep:
     """Generate per-document summaries for docs with >= chunk_threshold chunks.
 
+    Summarizations run concurrently, bounded by ``concurrency`` via
+    ``asyncio.Semaphore``.  All shared-state mutations on
+    ``PipelineContext`` happen *after* ``asyncio.gather`` completes
+    (collect-and-apply pattern) to avoid race conditions.
+
     When ``embeddings_port`` is provided, each document's content chunks and
-    its summary chunk are embedded immediately after summarization completes.
-    This overlaps LLM-bound summarization I/O with GPU-bound embedding I/O,
-    significantly reducing total pipeline wall-clock time.
+    its summary chunk are embedded as a background task after summarization
+    completes, overlapping LLM-bound summarization I/O with GPU-bound
+    embedding I/O.
     """
 
     def __init__(
@@ -338,56 +355,85 @@ class DocumentSummaryStep:
                         orphan_id, len(doc_chunks), self._chunk_threshold,
                     )
 
-        # Concurrency limiter for background embedding tasks.
+        if not docs_to_summarize:
+            return
+
+        sem = asyncio.Semaphore(self._concurrency)
         embed_semaphore = asyncio.Semaphore(self._concurrency)
         embed_tasks: list[asyncio.Task] = []
 
-        for doc_id, doc_chunks in docs_to_summarize:
-            try:
-                logger.info(
-                    "Summarizing document %s (%d chunks) [model=%s]",
-                    doc_id, len(doc_chunks), self._model_name,
-                )
-                summary = await _refine_summarize(
-                    [c.content for c in doc_chunks],
-                    self._llm.invoke,
-                    self._summary_length,
-                    DOCUMENT_REFINE_SYSTEM,
-                    DOCUMENT_REFINE_INITIAL,
-                    DOCUMENT_REFINE_SUBSEQUENT,
-                )
-                context.document_summaries[doc_id] = summary
+        async def _summarize_one(
+            doc_id: str, doc_chunks: list[Chunk],
+        ) -> _SummaryResult:
+            async with sem:
+                try:
+                    logger.info(
+                        "Summarizing document %s (%d chunks) [model=%s]",
+                        doc_id, len(doc_chunks), self._model_name,
+                    )
+                    summary = await _refine_summarize(
+                        [c.content for c in doc_chunks],
+                        self._llm.invoke,
+                        self._summary_length,
+                        DOCUMENT_REFINE_SYSTEM,
+                        DOCUMENT_REFINE_INITIAL,
+                        DOCUMENT_REFINE_SUBSEQUENT,
+                    )
+                    source_meta = doc_chunks[0].metadata
+                    summary_meta = DocumentMetadata(
+                        document_id=f"{doc_id}-summary",
+                        source=source_meta.source,
+                        type=source_meta.type,
+                        title=source_meta.title,
+                        embedding_type="summary",
+                    )
+                    summary_chunk = Chunk(
+                        content=summary, metadata=summary_meta, chunk_index=0,
+                    )
+                    logger.info("Summarized document %s", doc_id)
+                    return _SummaryResult(
+                        doc_id=doc_id, summary=summary, chunk=summary_chunk,
+                        doc_chunks=doc_chunks,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Summarization failed for %s: %s", doc_id, exc,
+                    )
+                    return _SummaryResult(
+                        doc_id=doc_id,
+                        error=(
+                            f"DocumentSummaryStep: summarization failed "
+                            f"for {doc_id}: {exc}"
+                        ),
+                    )
 
-                source_meta = doc_chunks[0].metadata
-                summary_meta = DocumentMetadata(
-                    document_id=f"{doc_id}-summary",
-                    source=source_meta.source,
-                    type=source_meta.type,
-                    title=source_meta.title,
-                    embedding_type="summary",
-                )
-                summary_chunk = Chunk(
-                    content=summary, metadata=summary_meta, chunk_index=0,
-                )
-                context.chunks.append(summary_chunk)
-                logger.info("Summarized document %s", doc_id)
+        # Fan out concurrent summarizations
+        results: list[_SummaryResult] = await asyncio.gather(
+            *[_summarize_one(d, c) for d, c in docs_to_summarize],
+        )
+
+        # Apply results to context in deterministic (input) order
+        # and fire background embedding tasks for successful results.
+        for result in results:
+            if result.error is not None:
+                context.errors.append(result.error)
+            else:
+                assert result.summary is not None
+                assert result.chunk is not None
+                context.document_summaries[result.doc_id] = result.summary
+                context.chunks.append(result.chunk)
 
                 # Incremental embedding: fire off embedding as a background
-                # task so the next document can start summarizing while this
-                # document's chunks are being embedded.
-                if self._embeddings is not None:
-                    embed_targets = doc_chunks + [summary_chunk]
+                # task while remaining results are applied.
+                if self._embeddings is not None and result.doc_chunks is not None:
+                    embed_targets = result.doc_chunks + [result.chunk]
                     task = asyncio.create_task(
                         self._embed_document_background(
-                            embed_targets, context, doc_id, embed_semaphore,
+                            embed_targets, context, result.doc_id,
+                            embed_semaphore,
                         )
                     )
                     embed_tasks.append(task)
-            except Exception as exc:
-                logger.warning("Summarization failed for %s: %s", doc_id, exc)
-                context.errors.append(
-                    f"DocumentSummaryStep: summarization failed for {doc_id}: {exc}"
-                )
 
         # Await all background embedding tasks before returning.
         for task in embed_tasks:
