@@ -321,6 +321,23 @@ class DocumentSummaryStep:
             )
         ]
 
+        # Mark stale summaries for cleanup: changed documents that dropped
+        # below the chunk threshold no longer qualify for summarization,
+        # so their existing summary entry must be removed.
+        if context.change_detection_ran:
+            for doc_id, doc_chunks in chunks_by_doc.items():
+                if (
+                    doc_id in context.changed_document_ids
+                    and len(doc_chunks) < self._chunk_threshold
+                ):
+                    orphan_id = f"{doc_id}-summary-0"
+                    context.orphan_ids.add(orphan_id)
+                    logger.info(
+                        "Stale summary marked for cleanup: %s "
+                        "(%d chunks < threshold %d)",
+                        orphan_id, len(doc_chunks), self._chunk_threshold,
+                    )
+
         # Concurrency limiter for background embedding tasks.
         embed_semaphore = asyncio.Semaphore(self._concurrency)
         embed_tasks: list[asyncio.Task] = []
@@ -434,6 +451,13 @@ class BodyOfKnowledgeSummaryStep:
                 seen_doc_ids.append(doc_id)
 
         if not seen_doc_ids:
+            # Corpus is empty — if documents were removed, mark the BoK
+            # summary for cleanup so OrphanCleanupStep deletes it.
+            if context.removed_document_ids:
+                context.orphan_ids.add("body-of-knowledge-summary-0")
+                logger.info(
+                    "Corpus empty after removals; marking BoK summary for cleanup"
+                )
             return
 
         # For each doc: prefer document_summaries, else concatenate raw chunk content
@@ -537,11 +561,26 @@ class StoreStep:
         return "store"
 
     async def execute(self, context: PipelineContext) -> None:
-        storable = [c for c in context.chunks if c.embedding is not None]
-        skipped = len(context.chunks) - len(storable)
-        if skipped > 0:
+        storable = [
+            c for c in context.chunks
+            if c.embedding is not None
+            and c.content_hash not in context.unchanged_chunk_hashes
+        ]
+
+        no_embedding = sum(1 for c in context.chunks if c.embedding is None)
+        if no_embedding > 0:
             context.errors.append(
-                f"StoreStep: skipped {skipped} chunks without embeddings"
+                f"StoreStep: skipped {no_embedding} chunks without embeddings"
+            )
+
+        unchanged_skipped = sum(
+            1 for c in context.chunks
+            if c.embedding is not None
+            and c.content_hash in context.unchanged_chunk_hashes
+        )
+        if unchanged_skipped > 0:
+            logger.info(
+                "StoreStep: skipped %d unchanged chunks", unchanged_skipped,
             )
 
         for i in range(0, len(storable), self._batch_size):
