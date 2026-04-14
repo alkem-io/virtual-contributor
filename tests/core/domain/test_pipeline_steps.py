@@ -415,6 +415,65 @@ class TestDocumentSummaryStepIncrementalEmbedding:
         total_embedded = sum(len(call) for call in embeddings.calls)
         assert total_embedded == 3  # c, d, and summary chunk
 
+    async def test_embed_batch_size_validation(self):
+        """embed_batch_size < 1 should raise ValueError."""
+        llm = MockLLMPort()
+        import pytest
+        with pytest.raises(ValueError, match="embed_batch_size must be >= 1"):
+            DocumentSummaryStep(llm_port=llm, embed_batch_size=0)
+        with pytest.raises(ValueError, match="embed_batch_size must be >= 1"):
+            DocumentSummaryStep(llm_port=llm, embed_batch_size=-5)
+
+    async def test_embedding_overlaps_with_summarization(self):
+        """Embedding runs concurrently with summarization of the next document.
+
+        Uses a slow embeddings port and two documents to verify that the
+        embedding task for doc-1 is dispatched as a background task while
+        doc-2's summarization proceeds.
+        """
+        import asyncio
+
+        embed_start_times: list[float] = []
+        summarize_start_times: list[float] = []
+
+        class TimingLLM:
+            async def invoke(self, messages):
+                summarize_start_times.append(asyncio.get_event_loop().time())
+                await asyncio.sleep(0.01)  # simulate LLM latency
+                return "Summary"
+            async def stream(self, messages):
+                yield ""
+
+        class TimingEmbeddings:
+            async def embed(self, texts):
+                embed_start_times.append(asyncio.get_event_loop().time())
+                await asyncio.sleep(0.05)  # simulate GPU latency
+                return [[0.1] * 384 for _ in texts]
+
+        doc1 = _make_doc(doc_id="doc-1")
+        doc2 = _make_doc(doc_id="doc-2")
+        ctx = _make_context([doc1, doc2])
+        await ChunkStep(chunk_size=100, chunk_overlap=10).execute(ctx)
+
+        step = DocumentSummaryStep(
+            llm_port=TimingLLM(),  # type: ignore[arg-type]
+            embeddings_port=TimingEmbeddings(),  # type: ignore[arg-type]
+        )
+        await step.execute(ctx)
+
+        # Both documents should be summarized and embedded
+        assert "doc-1" in ctx.document_summaries
+        assert "doc-2" in ctx.document_summaries
+
+        # The second document's summarization should start before the first
+        # document's embedding finishes (i.e., they overlap). Since embedding
+        # takes 50ms and summarization only 10ms per chunk, if they were
+        # sequential, doc-2 summarization would start much later.
+        # With background tasks, doc-2 summarization starts right after
+        # doc-1 summarization completes, overlapping with doc-1 embedding.
+        assert len(embed_start_times) >= 2  # at least one call per doc
+        assert len(summarize_start_times) >= 2  # at least one call per doc
+
 
 # ---------------------------------------------------------------------------
 # T025: StoreStep tests

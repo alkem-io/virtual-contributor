@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 from dataclasses import replace
@@ -258,6 +259,8 @@ class DocumentSummaryStep:
     ) -> None:
         if chunk_threshold < 1:
             raise ValueError("chunk_threshold must be >= 1")
+        if embed_batch_size < 1:
+            raise ValueError("embed_batch_size must be >= 1")
         self._llm = llm_port
         self._summary_length = summary_length
         self._concurrency = concurrency
@@ -318,6 +321,10 @@ class DocumentSummaryStep:
             )
         ]
 
+        # Concurrency limiter for background embedding tasks.
+        embed_semaphore = asyncio.Semaphore(self._concurrency)
+        embed_tasks: list[asyncio.Task] = []
+
         for doc_id, doc_chunks in docs_to_summarize:
             try:
                 logger.info(
@@ -348,25 +355,44 @@ class DocumentSummaryStep:
                 context.chunks.append(summary_chunk)
                 logger.info("Summarized document %s", doc_id)
 
-                # Incremental embedding: embed this document's chunks
-                # immediately after its summary is produced.
+                # Incremental embedding: fire off embedding as a background
+                # task so the next document can start summarizing while this
+                # document's chunks are being embedded.
                 if self._embeddings is not None:
                     embed_targets = doc_chunks + [summary_chunk]
-                    await self._embed_document_chunks(
-                        embed_targets, context, doc_id,
+                    task = asyncio.create_task(
+                        self._embed_document_background(
+                            embed_targets, context, doc_id, embed_semaphore,
+                        )
                     )
-                    embedded_count = sum(
-                        1 for c in embed_targets if c.embedding is not None
-                    )
-                    logger.info(
-                        "Inline-embedded %d/%d chunks for document %s",
-                        embedded_count, len(embed_targets), doc_id,
-                    )
+                    embed_tasks.append(task)
             except Exception as exc:
                 logger.warning("Summarization failed for %s: %s", doc_id, exc)
                 context.errors.append(
                     f"DocumentSummaryStep: summarization failed for {doc_id}: {exc}"
                 )
+
+        # Await all background embedding tasks before returning.
+        for task in embed_tasks:
+            await task
+
+    async def _embed_document_background(
+        self,
+        chunks: list[Chunk],
+        context: PipelineContext,
+        doc_id: str,
+        semaphore: asyncio.Semaphore,
+    ) -> None:
+        """Embed a document's chunks in the background, bounded by semaphore."""
+        async with semaphore:
+            await self._embed_document_chunks(chunks, context, doc_id)
+            embedded_count = sum(
+                1 for c in chunks if c.embedding is not None
+            )
+            logger.info(
+                "Inline-embedded %d/%d chunks for document %s",
+                embedded_count, len(chunks), doc_id,
+            )
 
 
 # ---------------------------------------------------------------------------
