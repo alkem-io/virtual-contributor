@@ -15,7 +15,7 @@ The existing `PipelineContext.orphan_ids: set[str]` mechanism already handles cl
 
 The `DocumentSummaryStep.execute()` method already groups chunks by `doc_id` into `chunks_by_doc` and filters qualifying documents into `docs_to_summarize`. After this filtering, documents that dropped below the threshold are in `chunks_by_doc` but not in `docs_to_summarize`. Adding a detection loop at this point is natural:
 
-```
+```text
 For each (doc_id, doc_chunks) in chunks_by_doc:
     if change_detection_ran AND doc_id in changed_document_ids AND len(doc_chunks) < chunk_threshold:
         add f"{doc_id}-summary-0" to context.orphan_ids
