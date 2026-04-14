@@ -44,6 +44,9 @@ class BaseConfig(BaseSettings):
     rabbitmq_heartbeat: int = 300
     rabbitmq_max_retries: int = 3
 
+    # Pipeline timeout (seconds) — outer timeout wrapping plugin.handle()
+    pipeline_timeout: int = 3600
+
     # ChromaDB / Vector DB
     vector_db_host: str | None = None
     vector_db_port: int = 8765
@@ -106,6 +109,10 @@ class BaseConfig(BaseSettings):
         if self.rabbitmq_max_retries < 1:
             raise ValueError(
                 f"RABBITMQ_MAX_RETRIES must be >= 1, got {self.rabbitmq_max_retries}"
+            )
+        if self.pipeline_timeout <= 0:
+            raise ValueError(
+                f"PIPELINE_TIMEOUT must be greater than 0, got {self.pipeline_timeout}"
             )
 
         # Vector DB distance function validation
