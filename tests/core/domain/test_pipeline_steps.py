@@ -692,6 +692,8 @@ class TestChangeDetectionStep:
         assert ctx.chunks_skipped == 0
         assert ctx.change_detection_ran is False
         assert chunk.embedding is None
+        # Store-read error is recorded so pipeline result reflects failure
+        assert any("ChangeDetectionStep: store read failed" in e for e in ctx.errors)
 
     async def test_summary_chunks_not_flagged_as_removed(self):
         """Summary and BoK chunks in the store should not trigger removed-document detection."""

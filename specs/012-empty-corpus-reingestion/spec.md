@@ -17,7 +17,7 @@ As a platform operator, I want all previously stored chunks to be deleted from t
 
 **Acceptance Scenarios**:
 
-1. **Given** a collection with previously stored chunks and `read_space_tree()` returns an empty list, **When** `IngestSpacePlugin.handle()` processes the event, **Then** the cleanup pipeline (`ChangeDetectionStep` + `OrphanCleanupStep`) runs and all pre-existing chunks are deleted.
+1. **Given** a collection with previously stored chunks and `read_space_tree()` returns an empty list, **When** `IngestSpacePlugin.handle()` processes the event, **Then** the cleanup pipeline (`ChangeDetectionStep` + `OrphanCleanupStep`) runs and all pre-existing content chunks are deleted (BoK summary cleanup is out of scope -- see Edge Cases).
 2. **Given** `read_space_tree()` returns an empty list, **When** the cleanup pipeline completes without errors, **Then** the plugin returns `result="success"`.
 3. **Given** `read_space_tree()` returns an empty list, **When** the cleanup pipeline encounters errors, **Then** the plugin returns `result="failure"` with error details.
 4. **Given** `read_space_tree()` raises an exception (e.g., GraphQL connection failure), **When** the plugin catches the exception, **Then** it returns `result="failure"` without running any cleanup pipeline (existing behavior preserved).
@@ -34,7 +34,7 @@ As a platform operator, I want all previously stored chunks to be deleted from t
 
 **Acceptance Scenarios**:
 
-1. **Given** a collection with previously stored chunks and `crawl()` returns an empty list, **When** `IngestWebsitePlugin.handle()` processes the event, **Then** the cleanup pipeline (`ChangeDetectionStep` + `OrphanCleanupStep`) runs and all pre-existing chunks are deleted.
+1. **Given** a collection with previously stored chunks and `crawl()` returns an empty list, **When** `IngestWebsitePlugin.handle()` processes the event, **Then** the cleanup pipeline (`ChangeDetectionStep` + `OrphanCleanupStep`) runs and all pre-existing content chunks are deleted (BoK summary cleanup is out of scope -- see Edge Cases).
 2. **Given** `crawl()` returns pages but text extraction produces zero documents (all empty/whitespace), **When** the plugin processes the event, **Then** the cleanup pipeline runs and all pre-existing chunks are deleted.
 3. **Given** the crawl+extract pipeline produces zero documents, **When** the cleanup pipeline completes without errors, **Then** the plugin returns `result=IngestionResult.SUCCESS`.
 4. **Given** `crawl()` raises an exception (e.g., connection timeout), **When** the plugin catches the exception, **Then** it returns `result=IngestionResult.FAILURE` without running any cleanup pipeline (existing behavior preserved).
@@ -69,8 +69,8 @@ As a platform operator, I want info-level log messages emitted when a cleanup pi
 
 - **FR-001**: System MUST run a cleanup pipeline (`ChangeDetectionStep` + `OrphanCleanupStep`) when `IngestSpacePlugin` receives an event and `read_space_tree()` returns an empty list, deleting all previously stored chunks in the collection.
 - **FR-002**: System MUST run a cleanup pipeline (`ChangeDetectionStep` + `OrphanCleanupStep`) when `IngestWebsitePlugin` receives an event and the crawl+extract pipeline produces zero documents, deleting all previously stored chunks in the collection.
-- **FR-003**: System MUST return `result="success"` from both plugins when the empty-but-successful cleanup pipeline completes without errors.
-- **FR-004**: System MUST return `result="failure"` from both plugins when the cleanup pipeline encounters errors, including error details in the response.
+- **FR-003**: System MUST return a success result from both plugins when the empty-but-successful cleanup pipeline completes without errors. `IngestSpacePlugin` returns `result="success"` (plain string). `IngestWebsitePlugin` returns `result=IngestionResult.SUCCESS` (enum, wire value `"success"`).
+- **FR-004**: System MUST return a failure result from both plugins when the cleanup pipeline encounters errors, including error details in the response. `IngestSpacePlugin` returns `result="failure"` with `error=ErrorDetail(...)`. `IngestWebsitePlugin` returns `result=IngestionResult.FAILURE` with `error=str`.
 - **FR-005**: System MUST preserve the existing failure behavior when `read_space_tree()` raises an exception -- return failure without running any cleanup pipeline.
 - **FR-006**: System MUST preserve the existing failure behavior when `crawl()` raises an exception -- return failure without running any cleanup pipeline.
 - **FR-007**: System MUST emit an INFO-level log message before running the cleanup pipeline, including the source identifier (space ID or website base URL) and collection name.

@@ -8,7 +8,7 @@ import httpx
 import pytest
 
 from core.events.ingest_website import IngestWebsiteResult
-from plugins.ingest_website.crawler import _is_same_domain, _normalize_url, _should_skip_url, crawl
+from plugins.ingest_website.crawler import CrawlError, _is_same_domain, _normalize_url, _should_skip_url, crawl
 from plugins.ingest_website.html_parser import extract_text, extract_title
 from plugins.ingest_website.plugin import IngestWebsitePlugin
 from tests.conftest import (
@@ -103,12 +103,32 @@ class TestCrawlFunction:
         assert len(results) == 0
 
     async def test_handles_request_error(self):
+        """Base URL request failure raises CrawlError instead of returning []."""
         def error_handler(request: httpx.Request) -> httpx.Response:
             raise httpx.ConnectError("Connection refused")
 
         with self._patch_transport(error_handler):
+            with pytest.raises(CrawlError, match="Failed to reach base URL"):
+                await crawl("https://example.com", page_limit=5)
+
+    async def test_subsequent_page_error_continues(self):
+        """Errors on pages after the first are logged and skipped."""
+        call_count = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal call_count
+            call_count += 1
+            url = str(request.url)
+            if "about" in url:
+                raise httpx.ConnectError("Connection refused")
+            return _mock_response(
+                _html_page("Home", "Content", ["https://example.com/about"])
+            )
+
+        with self._patch_transport(handler):
             results = await crawl("https://example.com", page_limit=5)
-        assert len(results) == 0
+        # Only the first page succeeds; the second fails but is skipped
+        assert len(results) == 1
 
     async def test_deduplicates_visited_urls(self):
         html = _html_page("Home", "Content", [
@@ -235,7 +255,7 @@ class TestIngestWebsitePlugin:
         assert result.result == "success"
 
     async def test_crawl_failure_no_cleanup(self):
-        """When crawl raises, return failure without running cleanup."""
+        """When crawl raises CrawlError, return failure without running cleanup."""
         store = MockKnowledgeStorePort()
         collection = "example.com-knowledge"
         await store.ingest(
@@ -255,12 +275,12 @@ class TestIngestWebsitePlugin:
         event = make_ingest_website()
         with patch(
             "plugins.ingest_website.plugin.crawl",
-            side_effect=RuntimeError("Connection timeout"),
+            side_effect=CrawlError("Failed to reach base URL https://example.com/: Connection refused"),
         ):
             result = await plugin.handle(event)
 
         assert result.result == "failure"
-        assert "Connection timeout" in result.error
+        assert "Failed to reach base URL" in result.error
         # Store should be untouched — no cleanup ran
         assert len(store.collections[collection]) == 1
 

@@ -152,6 +152,9 @@ class ChangeDetectionStep:
             logger.warning(
                 "Change detection failed, treating all chunks as new: %s", exc
             )
+            context.errors.append(
+                f"ChangeDetectionStep: store read failed: {exc}"
+            )
             context.unchanged_chunk_hashes.clear()
             context.orphan_ids.clear()
             context.removed_document_ids.clear()
