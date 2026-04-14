@@ -116,6 +116,12 @@ class BaseConfig(BaseSettings):
                 f"got '{self.vector_db_distance_fn}'"
             )
 
+        # Summarize concurrency validation
+        if self.summarize_concurrency < 0:
+            raise ValueError(
+                f"SUMMARIZE_CONCURRENCY must be >= 0, got {self.summarize_concurrency}"
+            )
+
         # Summarization LLM validation
         if self.summarize_llm_temperature is not None and not (
             0.0 <= self.summarize_llm_temperature <= 2.0
@@ -268,6 +274,7 @@ class BaseConfig(BaseSettings):
     batch_size: int = 20
     summary_length: int = 10000
     summarize_concurrency: int = 8
+    summarize_enabled: bool = True
 
     # Health
     health_port: int = 8080

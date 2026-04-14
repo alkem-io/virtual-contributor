@@ -161,11 +161,7 @@ class TestIngestWebsitePlugin:
         event = make_ingest_website()
         mock_pages = [{"url": "https://example.com", "html": "<p>Content for ingestion test.</p>"}]
 
-        mock_config = MagicMock()
-        mock_config.summarize_concurrency = 0
-
-        with patch("plugins.ingest_website.plugin.crawl", return_value=mock_pages), \
-             patch("core.config.BaseConfig", return_value=mock_config):
+        with patch("plugins.ingest_website.plugin.crawl", return_value=mock_pages):
             result = await plugin.handle(event)
         assert isinstance(result, IngestWebsiteResult)
         # delete_collection is no longer called — incremental dedup replaces it
@@ -182,3 +178,83 @@ class TestIngestWebsitePlugin:
     async def test_startup_shutdown(self, plugin):
         await plugin.startup()
         await plugin.shutdown()
+
+
+class TestIngestWebsiteSummarizationBehavior:
+    """Verify summarization step inclusion based on summarize_enabled and concurrency."""
+
+    _MOCK_PAGES = [{"url": "https://example.com", "html": "<p>Content for ingestion test.</p>"}]
+
+    async def test_summarize_enabled_with_concurrency(self):
+        """When summarize_enabled=True and concurrency>0, summary steps are included."""
+        plugin = IngestWebsitePlugin(
+            llm=MockLLMPort(),
+            embeddings=MockEmbeddingsPort(),
+            knowledge_store=MockKnowledgeStorePort(),
+            summarize_enabled=True,
+            summarize_concurrency=8,
+        )
+        event = make_ingest_website()
+
+        with patch("plugins.ingest_website.plugin.crawl", return_value=self._MOCK_PAGES), \
+             patch("plugins.ingest_website.plugin.IngestEngine") as mock_engine:
+            mock_engine.return_value.run = MagicMock(return_value=MagicMock(success=True, errors=[]))
+            # Make run() a coroutine
+            import asyncio
+            mock_engine.return_value.run = lambda *a, **kw: asyncio.coroutine(lambda: MagicMock(success=True, errors=[]))()
+            await plugin.handle(event)
+
+        # Inspect the steps passed to IngestEngine
+        call_kwargs = mock_engine.call_args
+        steps = call_kwargs.kwargs.get("steps") or call_kwargs.args[0] if call_kwargs.args else call_kwargs.kwargs["steps"]
+        step_names = [type(s).__name__ for s in steps]
+        assert "DocumentSummaryStep" in step_names
+        assert "BodyOfKnowledgeSummaryStep" in step_names
+
+    async def test_summarize_enabled_with_zero_concurrency(self):
+        """When summarize_enabled=True and concurrency=0, summary steps included with concurrency=1."""
+        plugin = IngestWebsitePlugin(
+            llm=MockLLMPort(),
+            embeddings=MockEmbeddingsPort(),
+            knowledge_store=MockKnowledgeStorePort(),
+            summarize_enabled=True,
+            summarize_concurrency=0,
+        )
+        assert plugin._summarize_concurrency == 1  # 0 maps to 1
+
+        event = make_ingest_website()
+
+        with patch("plugins.ingest_website.plugin.crawl", return_value=self._MOCK_PAGES), \
+             patch("plugins.ingest_website.plugin.IngestEngine") as mock_engine:
+            import asyncio
+            mock_engine.return_value.run = lambda *a, **kw: asyncio.coroutine(lambda: MagicMock(success=True, errors=[]))()
+            await plugin.handle(event)
+
+        call_kwargs = mock_engine.call_args
+        steps = call_kwargs.kwargs.get("steps") or call_kwargs.args[0] if call_kwargs.args else call_kwargs.kwargs["steps"]
+        step_names = [type(s).__name__ for s in steps]
+        assert "DocumentSummaryStep" in step_names
+        assert "BodyOfKnowledgeSummaryStep" in step_names
+
+    async def test_summarize_disabled(self):
+        """When summarize_enabled=False, no summary steps are included."""
+        plugin = IngestWebsitePlugin(
+            llm=MockLLMPort(),
+            embeddings=MockEmbeddingsPort(),
+            knowledge_store=MockKnowledgeStorePort(),
+            summarize_enabled=False,
+            summarize_concurrency=8,
+        )
+        event = make_ingest_website()
+
+        with patch("plugins.ingest_website.plugin.crawl", return_value=self._MOCK_PAGES), \
+             patch("plugins.ingest_website.plugin.IngestEngine") as mock_engine:
+            import asyncio
+            mock_engine.return_value.run = lambda *a, **kw: asyncio.coroutine(lambda: MagicMock(success=True, errors=[]))()
+            await plugin.handle(event)
+
+        call_kwargs = mock_engine.call_args
+        steps = call_kwargs.kwargs.get("steps") or call_kwargs.args[0] if call_kwargs.args else call_kwargs.kwargs["steps"]
+        step_names = [type(s).__name__ for s in steps]
+        assert "DocumentSummaryStep" not in step_names
+        assert "BodyOfKnowledgeSummaryStep" not in step_names

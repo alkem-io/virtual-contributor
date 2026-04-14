@@ -99,6 +99,22 @@ class TestInvalidRanges:
         with pytest.raises(ValueError, match="LLM_TIMEOUT"):
             BaseConfig(llm_api_key="key", llm_timeout=0)
 
+    def test_summarize_concurrency_negative(self) -> None:
+        with pytest.raises(ValueError, match="SUMMARIZE_CONCURRENCY"):
+            BaseConfig(llm_api_key="key", summarize_concurrency=-1)
+
+    def test_summarize_concurrency_zero_valid(self) -> None:
+        config = BaseConfig(llm_api_key="key", summarize_concurrency=0)
+        assert config.summarize_concurrency == 0
+
+    def test_summarize_enabled_default_true(self) -> None:
+        config = BaseConfig(llm_api_key="key")
+        assert config.summarize_enabled is True
+
+    def test_summarize_enabled_false(self) -> None:
+        config = BaseConfig(llm_api_key="key", summarize_enabled=False)
+        assert config.summarize_enabled is False
+
 
 class TestPerPluginOverride:
     """Test per-plugin provider override via env vars."""
