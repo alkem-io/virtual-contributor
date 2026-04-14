@@ -240,6 +240,183 @@ class TestDocumentSummaryStep:
 
 
 # ---------------------------------------------------------------------------
+# T024b: DocumentSummaryStep incremental embedding tests
+# ---------------------------------------------------------------------------
+
+class TestDocumentSummaryStepIncrementalEmbedding:
+    async def test_inline_embedding_after_summary(self):
+        """When embeddings_port is provided, chunks are embedded inline."""
+        llm = MockLLMPort(response="Generated summary")
+        embeddings = MockEmbeddingsPort()
+        ctx = _make_context()
+        await ChunkStep(chunk_size=100, chunk_overlap=10).execute(ctx)
+        assert len(ctx.chunks) > 3
+
+        await DocumentSummaryStep(
+            llm_port=llm, embeddings_port=embeddings,
+        ).execute(ctx)
+
+        # All content chunks for doc-1 should have embeddings
+        doc_chunks = [c for c in ctx.chunks if c.metadata.document_id == "doc-1"]
+        assert all(c.embedding is not None for c in doc_chunks)
+
+        # Summary chunk should also have an embedding
+        summary_chunks = [c for c in ctx.chunks if c.metadata.embedding_type == "summary"]
+        assert len(summary_chunks) == 1
+        assert summary_chunks[0].embedding is not None
+
+    async def test_embed_step_skips_already_embedded(self):
+        """EmbedStep makes zero calls for chunks already embedded inline."""
+        llm = MockLLMPort(response="Summary")
+        inline_embeddings = MockEmbeddingsPort()
+        safety_embeddings = MockEmbeddingsPort()
+
+        ctx = _make_context()
+        await ChunkStep(chunk_size=100, chunk_overlap=10).execute(ctx)
+        assert len(ctx.chunks) > 3
+
+        await DocumentSummaryStep(
+            llm_port=llm, embeddings_port=inline_embeddings,
+        ).execute(ctx)
+
+        # All chunks should now have embeddings
+        assert all(c.embedding is not None for c in ctx.chunks)
+
+        # EmbedStep should skip everything
+        await EmbedStep(embeddings_port=safety_embeddings).execute(ctx)
+        assert len(safety_embeddings.calls) == 0
+
+    async def test_inline_embed_error_handling(self):
+        """Embedding errors are captured without halting summarization."""
+        class FailingEmbeddings:
+            async def embed(self, texts):
+                raise RuntimeError("Embedding service down")
+
+        llm = MockLLMPort(response="Summary despite embed failure")
+        ctx = _make_context()
+        await ChunkStep(chunk_size=100, chunk_overlap=10).execute(ctx)
+
+        await DocumentSummaryStep(
+            llm_port=llm,
+            embeddings_port=FailingEmbeddings(),  # type: ignore[arg-type]
+        ).execute(ctx)
+
+        # Summary should still be produced
+        assert "doc-1" in ctx.document_summaries
+        summary_chunks = [c for c in ctx.chunks if c.metadata.embedding_type == "summary"]
+        assert len(summary_chunks) == 1
+
+        # Error should be recorded
+        assert any("inline embedding failed" in e for e in ctx.errors)
+
+    async def test_no_embeddings_port_backward_compat(self):
+        """Without embeddings_port, chunks have no embeddings after execute."""
+        llm = MockLLMPort(response="Summary")
+        ctx = _make_context()
+        await ChunkStep(chunk_size=100, chunk_overlap=10).execute(ctx)
+
+        await DocumentSummaryStep(llm_port=llm).execute(ctx)
+
+        # Content chunks should NOT have embeddings
+        content_chunks = [c for c in ctx.chunks if c.metadata.embedding_type == "chunk"]
+        assert all(c.embedding is None for c in content_chunks)
+
+        # Summary chunk should NOT have an embedding
+        summary_chunks = [c for c in ctx.chunks if c.metadata.embedding_type == "summary"]
+        assert len(summary_chunks) == 1
+        assert summary_chunks[0].embedding is None
+
+    async def test_below_threshold_not_embedded_inline(self):
+        """Documents below chunk threshold are not embedded by DocumentSummaryStep."""
+        llm = MockLLMPort()
+        embeddings = MockEmbeddingsPort()
+        doc = _make_doc(content="Short text.")
+        ctx = _make_context([doc])
+        await ChunkStep(chunk_size=10000).execute(ctx)
+
+        assert len(ctx.chunks) <= 3
+
+        await DocumentSummaryStep(
+            llm_port=llm, embeddings_port=embeddings,
+        ).execute(ctx)
+
+        # No summarization, no inline embedding
+        assert len(embeddings.calls) == 0
+        assert all(c.embedding is None for c in ctx.chunks)
+
+    async def test_full_pipeline_with_incremental_embedding(self):
+        """Integration: full pipeline with incremental embedding stores all chunks."""
+        llm = MockLLMPort(response="Doc summary")
+        bok_llm = MockLLMPort(response="BoK summary")
+        embeddings = MockEmbeddingsPort()
+        store = MockKnowledgeStorePort()
+
+        engine = IngestEngine(steps=[
+            ChunkStep(chunk_size=100, chunk_overlap=10),
+            ContentHashStep(),
+            DocumentSummaryStep(
+                llm_port=llm,
+                embeddings_port=embeddings,
+            ),
+            BodyOfKnowledgeSummaryStep(llm_port=bok_llm),
+            EmbedStep(embeddings_port=embeddings),
+            StoreStep(knowledge_store_port=store),
+        ])
+        result = await engine.run([_make_doc()], "incremental-test")
+
+        assert result.success is True
+        assert result.chunks_stored > 0
+        assert result.errors == []
+        # All chunks should be stored — collection must exist and contain entries
+        assert "incremental-test" in store.collections
+        stored = store.collections["incremental-test"]
+        assert len(stored) > 0
+        # Should have content chunks, doc summary, and BoK summary
+        stored_types = {it["metadata"]["embeddingType"] for it in stored}
+        assert "chunk" in stored_types
+        assert "summary" in stored_types
+
+    async def test_skips_chunks_with_preexisting_embeddings(self):
+        """Inline embedding skips chunks that already have embeddings from change detection."""
+        llm = MockLLMPort(response="Summary")
+        embeddings = MockEmbeddingsPort()
+        meta = DocumentMetadata(
+            document_id="doc-1", source="s", type="knowledge",
+            title="T", embedding_type="chunk",
+        )
+        # Create chunks where some already have embeddings (from ChangeDetectionStep)
+        ctx = PipelineContext(
+            collection_name="test",
+            documents=[],
+            chunks=[
+                Chunk(content="a", metadata=meta, chunk_index=0, embedding=[9.0]),
+                Chunk(content="b", metadata=meta, chunk_index=1, embedding=[9.0]),
+                Chunk(content="c", metadata=meta, chunk_index=2),
+                Chunk(content="d", metadata=meta, chunk_index=3),
+            ],
+        )
+
+        await DocumentSummaryStep(
+            llm_port=llm, embeddings_port=embeddings,
+        ).execute(ctx)
+
+        # Pre-existing embeddings should be preserved
+        assert ctx.chunks[0].embedding == [9.0]
+        assert ctx.chunks[1].embedding == [9.0]
+        # New chunks should be embedded
+        assert ctx.chunks[2].embedding is not None
+        assert ctx.chunks[3].embedding is not None
+        # Summary chunk should be embedded
+        summary = [c for c in ctx.chunks if c.metadata.embedding_type == "summary"]
+        assert len(summary) == 1
+        assert summary[0].embedding is not None
+
+        # Only chunks without pre-existing embeddings should have been sent
+        total_embedded = sum(len(call) for call in embeddings.calls)
+        assert total_embedded == 3  # c, d, and summary chunk
+
+
+# ---------------------------------------------------------------------------
 # T025: StoreStep tests
 # ---------------------------------------------------------------------------
 
