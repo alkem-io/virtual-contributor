@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -104,6 +104,86 @@ class TestIngestSpacePlugin:
     async def test_startup_shutdown(self, plugin):
         await plugin.startup()
         await plugin.shutdown()
+
+    async def test_empty_space_runs_cleanup(self):
+        """When read_space_tree returns [], cleanup deletes pre-existing chunks."""
+        store = MockKnowledgeStorePort()
+        # Pre-populate the store with chunks that should be cleaned up
+        collection = "bok-123-knowledge"
+        await store.ingest(
+            collection=collection,
+            documents=["old content"],
+            metadatas=[{"documentId": "old-doc", "embeddingType": "chunk", "source": "s", "type": "t", "title": "T", "chunkIndex": 0}],
+            ids=["old-hash-1"],
+            embeddings=[[0.1] * 384],
+        )
+        assert len(store.collections[collection]) == 1
+
+        mock_graphql = AsyncMock()
+        plugin = IngestSpacePlugin(
+            llm=MockLLMPort(),
+            embeddings=MockEmbeddingsPort(),
+            knowledge_store=store,
+            graphql_client=mock_graphql,
+        )
+
+        event = make_ingest_body_of_knowledge()
+        with patch("plugins.ingest_space.space_reader.read_space_tree", return_value=[]):
+            result = await plugin.handle(event)
+
+        assert isinstance(result, IngestBodyOfKnowledgeResult)
+        assert result.result == "success"
+        # All pre-existing chunks should have been deleted
+        assert len(store.collections.get(collection, [])) == 0
+
+    async def test_empty_space_returns_success(self):
+        """Empty-but-successful fetch returns result='success'."""
+        mock_graphql = AsyncMock()
+        plugin = IngestSpacePlugin(
+            llm=MockLLMPort(),
+            embeddings=MockEmbeddingsPort(),
+            knowledge_store=MockKnowledgeStorePort(),
+            graphql_client=mock_graphql,
+        )
+
+        event = make_ingest_body_of_knowledge()
+        with patch("plugins.ingest_space.space_reader.read_space_tree", return_value=[]):
+            result = await plugin.handle(event)
+
+        assert result.result == "success"
+        assert result.error is None
+
+    async def test_fetch_failure_no_cleanup(self):
+        """When read_space_tree raises, return failure without running cleanup."""
+        store = MockKnowledgeStorePort()
+        collection = "bok-123-knowledge"
+        await store.ingest(
+            collection=collection,
+            documents=["preserved content"],
+            metadatas=[{"documentId": "doc-1", "embeddingType": "chunk", "source": "s", "type": "t", "title": "T", "chunkIndex": 0}],
+            ids=["hash-1"],
+            embeddings=[[0.1] * 384],
+        )
+
+        mock_graphql = AsyncMock()
+        plugin = IngestSpacePlugin(
+            llm=MockLLMPort(),
+            embeddings=MockEmbeddingsPort(),
+            knowledge_store=store,
+            graphql_client=mock_graphql,
+        )
+
+        event = make_ingest_body_of_knowledge()
+        with patch(
+            "plugins.ingest_space.space_reader.read_space_tree",
+            side_effect=RuntimeError("GraphQL connection failed"),
+        ):
+            result = await plugin.handle(event)
+
+        assert result.result == "failure"
+        assert result.error is not None
+        # Store should be untouched — no cleanup ran
+        assert len(store.collections[collection]) == 1
 
 
 class TestIngestSpaceSummarizationBehavior:

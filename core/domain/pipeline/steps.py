@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
@@ -152,6 +153,9 @@ class ChangeDetectionStep:
             logger.warning(
                 "Change detection failed, treating all chunks as new: %s", exc
             )
+            context.errors.append(
+                f"ChangeDetectionStep: store read failed: {exc}"
+            )
             context.unchanged_chunk_hashes.clear()
             context.orphan_ids.clear()
             context.removed_document_ids.clear()
@@ -238,8 +242,31 @@ class ChangeDetectionStep:
 # DocumentSummaryStep
 # ---------------------------------------------------------------------------
 
+
+@dataclass
+class _SummaryResult:
+    """Outcome of a single document summarization task."""
+
+    doc_id: str
+    summary: str | None = None
+    chunk: Chunk | None = None
+    doc_chunks: list[Chunk] | None = None
+    error: str | None = None
+
+
 class DocumentSummaryStep:
-    """Generate per-document summaries for docs with >= chunk_threshold chunks."""
+    """Generate per-document summaries for docs with >= chunk_threshold chunks.
+
+    Summarizations run concurrently, bounded by ``concurrency`` via
+    ``asyncio.Semaphore``.  All shared-state mutations on
+    ``PipelineContext`` happen *after* ``asyncio.gather`` completes
+    (collect-and-apply pattern) to avoid race conditions.
+
+    When ``embeddings_port`` is provided, each document's content chunks and
+    its summary chunk are embedded as a background task after summarization
+    completes, overlapping LLM-bound summarization I/O with GPU-bound
+    embedding I/O.
+    """
 
     def __init__(
         self,
@@ -247,13 +274,19 @@ class DocumentSummaryStep:
         summary_length: int = 10000,
         concurrency: int = 8,
         chunk_threshold: int = 4,
+        embeddings_port: EmbeddingsPort | None = None,
+        embed_batch_size: int = 50,
     ) -> None:
         if chunk_threshold < 1:
             raise ValueError("chunk_threshold must be >= 1")
+        if embed_batch_size < 1:
+            raise ValueError("embed_batch_size must be >= 1")
         self._llm = llm_port
         self._summary_length = summary_length
         self._concurrency = concurrency
         self._chunk_threshold = chunk_threshold
+        self._embeddings = embeddings_port
+        self._embed_batch_size = embed_batch_size
         self._model_name = getattr(
             getattr(llm_port, "_llm", None), "model", "unknown"
         )
@@ -261,6 +294,36 @@ class DocumentSummaryStep:
     @property
     def name(self) -> str:
         return "document_summary"
+
+    async def _embed_document_chunks(
+        self,
+        chunks: list[Chunk],
+        context: PipelineContext,
+        doc_id: str,
+    ) -> None:
+        """Embed a document's chunks inline using the embeddings port.
+
+        Skips chunks that already have embeddings (e.g. from change detection).
+        Errors are captured in context.errors without raising.
+        """
+        assert self._embeddings is not None
+
+        to_embed = [c for c in chunks if c.embedding is None]
+        if not to_embed:
+            return
+
+        for i in range(0, len(to_embed), self._embed_batch_size):
+            batch = to_embed[i : i + self._embed_batch_size]
+            texts = [c.content for c in batch]
+            try:
+                embeddings = await self._embeddings.embed(texts)
+                for chunk, embedding in zip(batch, embeddings):
+                    chunk.embedding = embedding
+            except Exception as exc:
+                context.errors.append(
+                    f"DocumentSummaryStep: inline embedding failed for "
+                    f"{doc_id} batch {i // self._embed_batch_size}: {exc}"
+                )
 
     async def execute(self, context: PipelineContext) -> None:
         # Group chunks by document_id
@@ -278,39 +341,124 @@ class DocumentSummaryStep:
             )
         ]
 
-        for doc_id, doc_chunks in docs_to_summarize:
-            try:
-                logger.info(
-                    "Summarizing document %s (%d chunks) [model=%s]",
-                    doc_id, len(doc_chunks), self._model_name,
-                )
-                summary = await _refine_summarize(
-                    [c.content for c in doc_chunks],
-                    self._llm.invoke,
-                    self._summary_length,
-                    DOCUMENT_REFINE_SYSTEM,
-                    DOCUMENT_REFINE_INITIAL,
-                    DOCUMENT_REFINE_SUBSEQUENT,
-                )
-                context.document_summaries[doc_id] = summary
+        # Mark stale summaries for cleanup: changed documents that dropped
+        # below the chunk threshold no longer qualify for summarization,
+        # so their existing summary entry must be removed.
+        if context.change_detection_ran:
+            for doc_id, doc_chunks in chunks_by_doc.items():
+                if (
+                    doc_id in context.changed_document_ids
+                    and len(doc_chunks) < self._chunk_threshold
+                ):
+                    orphan_id = f"{doc_id}-summary-0"
+                    context.orphan_ids.add(orphan_id)
+                    logger.info(
+                        "Stale summary marked for cleanup: %s "
+                        "(%d chunks < threshold %d)",
+                        orphan_id, len(doc_chunks), self._chunk_threshold,
+                    )
 
-                source_meta = doc_chunks[0].metadata
-                summary_meta = DocumentMetadata(
-                    document_id=f"{doc_id}-summary",
-                    source=source_meta.source,
-                    type=source_meta.type,
-                    title=source_meta.title,
-                    embedding_type="summary",
-                )
-                context.chunks.append(
-                    Chunk(content=summary, metadata=summary_meta, chunk_index=0)
-                )
-                logger.info("Summarized document %s", doc_id)
-            except Exception as exc:
-                logger.warning("Summarization failed for %s: %s", doc_id, exc)
-                context.errors.append(
-                    f"DocumentSummaryStep: summarization failed for {doc_id}: {exc}"
-                )
+        if not docs_to_summarize:
+            return
+
+        sem = asyncio.Semaphore(self._concurrency)
+        embed_semaphore = asyncio.Semaphore(self._concurrency)
+        embed_tasks: list[asyncio.Task] = []
+
+        async def _summarize_one(
+            doc_id: str, doc_chunks: list[Chunk],
+        ) -> _SummaryResult:
+            async with sem:
+                try:
+                    logger.info(
+                        "Summarizing document %s (%d chunks) [model=%s]",
+                        doc_id, len(doc_chunks), self._model_name,
+                    )
+                    summary = await _refine_summarize(
+                        [c.content for c in doc_chunks],
+                        self._llm.invoke,
+                        self._summary_length,
+                        DOCUMENT_REFINE_SYSTEM,
+                        DOCUMENT_REFINE_INITIAL,
+                        DOCUMENT_REFINE_SUBSEQUENT,
+                    )
+                    source_meta = doc_chunks[0].metadata
+                    summary_meta = DocumentMetadata(
+                        document_id=f"{doc_id}-summary",
+                        source=source_meta.source,
+                        type=source_meta.type,
+                        title=source_meta.title,
+                        embedding_type="summary",
+                    )
+                    summary_chunk = Chunk(
+                        content=summary, metadata=summary_meta, chunk_index=0,
+                    )
+                    logger.info("Summarized document %s", doc_id)
+                    return _SummaryResult(
+                        doc_id=doc_id, summary=summary, chunk=summary_chunk,
+                        doc_chunks=doc_chunks,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Summarization failed for %s: %s", doc_id, exc,
+                    )
+                    return _SummaryResult(
+                        doc_id=doc_id,
+                        error=(
+                            f"DocumentSummaryStep: summarization failed "
+                            f"for {doc_id}: {exc}"
+                        ),
+                    )
+
+        # Fan out concurrent summarizations
+        results: list[_SummaryResult] = await asyncio.gather(
+            *[_summarize_one(d, c) for d, c in docs_to_summarize],
+        )
+
+        # Apply results to context in deterministic (input) order
+        # and fire background embedding tasks for successful results.
+        for result in results:
+            if result.error is not None:
+                context.errors.append(result.error)
+            else:
+                assert result.summary is not None
+                assert result.chunk is not None
+                context.document_summaries[result.doc_id] = result.summary
+                context.chunks.append(result.chunk)
+
+                # Incremental embedding: fire off embedding as a background
+                # task while remaining results are applied.
+                if self._embeddings is not None and result.doc_chunks is not None:
+                    embed_targets = result.doc_chunks + [result.chunk]
+                    task = asyncio.create_task(
+                        self._embed_document_background(
+                            embed_targets, context, result.doc_id,
+                            embed_semaphore,
+                        )
+                    )
+                    embed_tasks.append(task)
+
+        # Await all background embedding tasks before returning.
+        for task in embed_tasks:
+            await task
+
+    async def _embed_document_background(
+        self,
+        chunks: list[Chunk],
+        context: PipelineContext,
+        doc_id: str,
+        semaphore: asyncio.Semaphore,
+    ) -> None:
+        """Embed a document's chunks in the background, bounded by semaphore."""
+        async with semaphore:
+            await self._embed_document_chunks(chunks, context, doc_id)
+            embedded_count = sum(
+                1 for c in chunks if c.embedding is not None
+            )
+            logger.info(
+                "Inline-embedded %d/%d chunks for document %s",
+                embedded_count, len(chunks), doc_id,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -352,6 +500,13 @@ class BodyOfKnowledgeSummaryStep:
                 seen_doc_ids.append(doc_id)
 
         if not seen_doc_ids:
+            # Corpus is empty — if documents were removed, mark the BoK
+            # summary for cleanup so OrphanCleanupStep deletes it.
+            if context.removed_document_ids:
+                context.orphan_ids.add("body-of-knowledge-summary-0")
+                logger.info(
+                    "Corpus empty after removals; marking BoK summary for cleanup"
+                )
             return
 
         # For each doc: prefer document_summaries, else concatenate raw chunk content
@@ -455,11 +610,26 @@ class StoreStep:
         return "store"
 
     async def execute(self, context: PipelineContext) -> None:
-        storable = [c for c in context.chunks if c.embedding is not None]
-        skipped = len(context.chunks) - len(storable)
-        if skipped > 0:
+        storable = [
+            c for c in context.chunks
+            if c.embedding is not None
+            and c.content_hash not in context.unchanged_chunk_hashes
+        ]
+
+        no_embedding = sum(1 for c in context.chunks if c.embedding is None)
+        if no_embedding > 0:
             context.errors.append(
-                f"StoreStep: skipped {skipped} chunks without embeddings"
+                f"StoreStep: skipped {no_embedding} chunks without embeddings"
+            )
+
+        unchanged_skipped = sum(
+            1 for c in context.chunks
+            if c.embedding is not None
+            and c.content_hash in context.unchanged_chunk_hashes
+        )
+        if unchanged_skipped > 0:
+            logger.info(
+                "StoreStep: skipped %d unchanged chunks", unchanged_skipped,
             )
 
         for i in range(0, len(storable), self._batch_size):
@@ -519,13 +689,11 @@ class OrphanCleanupStep:
     def name(self) -> str:
         return "orphan_cleanup"
 
-    async def execute(self, context: PipelineContext) -> None:
-        if any(e.startswith("StoreStep:") for e in context.errors):
-            context.errors.append(
-                "OrphanCleanupStep: skipped cleanup because earlier storage writes failed"
-            )
-            return
+    @property
+    def destructive(self) -> bool:
+        return True
 
+    async def execute(self, context: PipelineContext) -> None:
         deleted = 0
 
         # Delete orphan chunk IDs

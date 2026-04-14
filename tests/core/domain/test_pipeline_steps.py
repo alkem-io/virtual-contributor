@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import time
+
 from core.domain.ingest_pipeline import Chunk, Document, DocumentMetadata, IngestResult
 from core.domain.pipeline.engine import IngestEngine, PipelineContext
 from core.ports.knowledge_store import GetResult
@@ -240,6 +243,242 @@ class TestDocumentSummaryStep:
 
 
 # ---------------------------------------------------------------------------
+# T024b: DocumentSummaryStep incremental embedding tests
+# ---------------------------------------------------------------------------
+
+class TestDocumentSummaryStepIncrementalEmbedding:
+    async def test_inline_embedding_after_summary(self):
+        """When embeddings_port is provided, chunks are embedded inline."""
+        llm = MockLLMPort(response="Generated summary")
+        embeddings = MockEmbeddingsPort()
+        ctx = _make_context()
+        await ChunkStep(chunk_size=100, chunk_overlap=10).execute(ctx)
+        assert len(ctx.chunks) > 3
+
+        await DocumentSummaryStep(
+            llm_port=llm, embeddings_port=embeddings,
+        ).execute(ctx)
+
+        # All content chunks for doc-1 should have embeddings
+        doc_chunks = [c for c in ctx.chunks if c.metadata.document_id == "doc-1"]
+        assert all(c.embedding is not None for c in doc_chunks)
+
+        # Summary chunk should also have an embedding
+        summary_chunks = [c for c in ctx.chunks if c.metadata.embedding_type == "summary"]
+        assert len(summary_chunks) == 1
+        assert summary_chunks[0].embedding is not None
+
+    async def test_embed_step_skips_already_embedded(self):
+        """EmbedStep makes zero calls for chunks already embedded inline."""
+        llm = MockLLMPort(response="Summary")
+        inline_embeddings = MockEmbeddingsPort()
+        safety_embeddings = MockEmbeddingsPort()
+
+        ctx = _make_context()
+        await ChunkStep(chunk_size=100, chunk_overlap=10).execute(ctx)
+        assert len(ctx.chunks) > 3
+
+        await DocumentSummaryStep(
+            llm_port=llm, embeddings_port=inline_embeddings,
+        ).execute(ctx)
+
+        # All chunks should now have embeddings
+        assert all(c.embedding is not None for c in ctx.chunks)
+
+        # EmbedStep should skip everything
+        await EmbedStep(embeddings_port=safety_embeddings).execute(ctx)
+        assert len(safety_embeddings.calls) == 0
+
+    async def test_inline_embed_error_handling(self):
+        """Embedding errors are captured without halting summarization."""
+        class FailingEmbeddings:
+            async def embed(self, texts):
+                raise RuntimeError("Embedding service down")
+
+        llm = MockLLMPort(response="Summary despite embed failure")
+        ctx = _make_context()
+        await ChunkStep(chunk_size=100, chunk_overlap=10).execute(ctx)
+
+        await DocumentSummaryStep(
+            llm_port=llm,
+            embeddings_port=FailingEmbeddings(),  # type: ignore[arg-type]
+        ).execute(ctx)
+
+        # Summary should still be produced
+        assert "doc-1" in ctx.document_summaries
+        summary_chunks = [c for c in ctx.chunks if c.metadata.embedding_type == "summary"]
+        assert len(summary_chunks) == 1
+
+        # Error should be recorded
+        assert any("inline embedding failed" in e for e in ctx.errors)
+
+    async def test_no_embeddings_port_backward_compat(self):
+        """Without embeddings_port, chunks have no embeddings after execute."""
+        llm = MockLLMPort(response="Summary")
+        ctx = _make_context()
+        await ChunkStep(chunk_size=100, chunk_overlap=10).execute(ctx)
+
+        await DocumentSummaryStep(llm_port=llm).execute(ctx)
+
+        # Content chunks should NOT have embeddings
+        content_chunks = [c for c in ctx.chunks if c.metadata.embedding_type == "chunk"]
+        assert all(c.embedding is None for c in content_chunks)
+
+        # Summary chunk should NOT have an embedding
+        summary_chunks = [c for c in ctx.chunks if c.metadata.embedding_type == "summary"]
+        assert len(summary_chunks) == 1
+        assert summary_chunks[0].embedding is None
+
+    async def test_below_threshold_not_embedded_inline(self):
+        """Documents below chunk threshold are not embedded by DocumentSummaryStep."""
+        llm = MockLLMPort()
+        embeddings = MockEmbeddingsPort()
+        doc = _make_doc(content="Short text.")
+        ctx = _make_context([doc])
+        await ChunkStep(chunk_size=10000).execute(ctx)
+
+        assert len(ctx.chunks) <= 3
+
+        await DocumentSummaryStep(
+            llm_port=llm, embeddings_port=embeddings,
+        ).execute(ctx)
+
+        # No summarization, no inline embedding
+        assert len(embeddings.calls) == 0
+        assert all(c.embedding is None for c in ctx.chunks)
+
+    async def test_full_pipeline_with_incremental_embedding(self):
+        """Integration: full pipeline with incremental embedding stores all chunks."""
+        llm = MockLLMPort(response="Doc summary")
+        bok_llm = MockLLMPort(response="BoK summary")
+        embeddings = MockEmbeddingsPort()
+        store = MockKnowledgeStorePort()
+
+        engine = IngestEngine(steps=[
+            ChunkStep(chunk_size=100, chunk_overlap=10),
+            ContentHashStep(),
+            DocumentSummaryStep(
+                llm_port=llm,
+                embeddings_port=embeddings,
+            ),
+            BodyOfKnowledgeSummaryStep(llm_port=bok_llm),
+            EmbedStep(embeddings_port=embeddings),
+            StoreStep(knowledge_store_port=store),
+        ])
+        result = await engine.run([_make_doc()], "incremental-test")
+
+        assert result.success is True
+        assert result.chunks_stored > 0
+        assert result.errors == []
+        # All chunks should be stored — collection must exist and contain entries
+        assert "incremental-test" in store.collections
+        stored = store.collections["incremental-test"]
+        assert len(stored) > 0
+        # Should have content chunks, doc summary, and BoK summary
+        stored_types = {it["metadata"]["embeddingType"] for it in stored}
+        assert "chunk" in stored_types
+        assert "summary" in stored_types
+
+    async def test_skips_chunks_with_preexisting_embeddings(self):
+        """Inline embedding skips chunks that already have embeddings from change detection."""
+        llm = MockLLMPort(response="Summary")
+        embeddings = MockEmbeddingsPort()
+        meta = DocumentMetadata(
+            document_id="doc-1", source="s", type="knowledge",
+            title="T", embedding_type="chunk",
+        )
+        # Create chunks where some already have embeddings (from ChangeDetectionStep)
+        ctx = PipelineContext(
+            collection_name="test",
+            documents=[],
+            chunks=[
+                Chunk(content="a", metadata=meta, chunk_index=0, embedding=[9.0]),
+                Chunk(content="b", metadata=meta, chunk_index=1, embedding=[9.0]),
+                Chunk(content="c", metadata=meta, chunk_index=2),
+                Chunk(content="d", metadata=meta, chunk_index=3),
+            ],
+        )
+
+        await DocumentSummaryStep(
+            llm_port=llm, embeddings_port=embeddings,
+        ).execute(ctx)
+
+        # Pre-existing embeddings should be preserved
+        assert ctx.chunks[0].embedding == [9.0]
+        assert ctx.chunks[1].embedding == [9.0]
+        # New chunks should be embedded
+        assert ctx.chunks[2].embedding is not None
+        assert ctx.chunks[3].embedding is not None
+        # Summary chunk should be embedded
+        summary = [c for c in ctx.chunks if c.metadata.embedding_type == "summary"]
+        assert len(summary) == 1
+        assert summary[0].embedding is not None
+
+        # Only chunks without pre-existing embeddings should have been sent
+        total_embedded = sum(len(call) for call in embeddings.calls)
+        assert total_embedded == 3  # c, d, and summary chunk
+
+    async def test_embed_batch_size_validation(self):
+        """embed_batch_size < 1 should raise ValueError."""
+        llm = MockLLMPort()
+        import pytest
+        with pytest.raises(ValueError, match="embed_batch_size must be >= 1"):
+            DocumentSummaryStep(llm_port=llm, embed_batch_size=0)
+        with pytest.raises(ValueError, match="embed_batch_size must be >= 1"):
+            DocumentSummaryStep(llm_port=llm, embed_batch_size=-5)
+
+    async def test_embedding_overlaps_with_summarization(self):
+        """Embedding runs concurrently with summarization of the next document.
+
+        Uses a slow embeddings port and two documents to verify that the
+        embedding task for doc-1 is dispatched as a background task while
+        doc-2's summarization proceeds.
+        """
+        import asyncio
+
+        embed_start_times: list[float] = []
+        summarize_start_times: list[float] = []
+
+        class TimingLLM:
+            async def invoke(self, messages):
+                summarize_start_times.append(asyncio.get_event_loop().time())
+                await asyncio.sleep(0.01)  # simulate LLM latency
+                return "Summary"
+            async def stream(self, messages):
+                yield ""
+
+        class TimingEmbeddings:
+            async def embed(self, texts):
+                embed_start_times.append(asyncio.get_event_loop().time())
+                await asyncio.sleep(0.05)  # simulate GPU latency
+                return [[0.1] * 384 for _ in texts]
+
+        doc1 = _make_doc(doc_id="doc-1")
+        doc2 = _make_doc(doc_id="doc-2")
+        ctx = _make_context([doc1, doc2])
+        await ChunkStep(chunk_size=100, chunk_overlap=10).execute(ctx)
+
+        step = DocumentSummaryStep(
+            llm_port=TimingLLM(),  # type: ignore[arg-type]
+            embeddings_port=TimingEmbeddings(),  # type: ignore[arg-type]
+        )
+        await step.execute(ctx)
+
+        # Both documents should be summarized and embedded
+        assert "doc-1" in ctx.document_summaries
+        assert "doc-2" in ctx.document_summaries
+
+        # The second document's summarization should start before the first
+        # document's embedding finishes (i.e., they overlap). Since embedding
+        # takes 50ms and summarization only 10ms per chunk, if they were
+        # sequential, doc-2 summarization would start much later.
+        # With background tasks, doc-2 summarization starts right after
+        # doc-1 summarization completes, overlapping with doc-1 embedding.
+        assert len(embed_start_times) >= 2  # at least one call per doc
+        assert len(summarize_start_times) >= 2  # at least one call per doc
+
+
+# ---------------------------------------------------------------------------
 # T025: StoreStep tests
 # ---------------------------------------------------------------------------
 
@@ -355,6 +594,120 @@ class TestStoreStep:
     async def test_step_name(self):
         store = MockKnowledgeStorePort()
         assert StoreStep(knowledge_store_port=store).name == "store"
+
+    async def test_skips_unchanged_chunks(self):
+        """Chunks whose content_hash is in unchanged_chunk_hashes are not stored."""
+        store = MockKnowledgeStorePort()
+        meta = DocumentMetadata(
+            document_id="d1", source="s", type="knowledge",
+            title="T", embedding_type="chunk",
+        )
+        ctx = PipelineContext(
+            collection_name="c",
+            documents=[],
+            chunks=[
+                Chunk(
+                    content="unchanged text", metadata=meta, chunk_index=0,
+                    embedding=[0.1, 0.2], content_hash="hash-unchanged",
+                ),
+            ],
+            unchanged_chunk_hashes={"hash-unchanged"},
+        )
+
+        await StoreStep(knowledge_store_port=store).execute(ctx)
+
+        assert ctx.chunks_stored == 0
+        assert "c" not in store.collections
+
+    async def test_stores_changed_chunks_alongside_unchanged(self):
+        """Only changed chunks are stored; unchanged are skipped."""
+        store = MockKnowledgeStorePort()
+        meta = DocumentMetadata(
+            document_id="d1", source="s", type="knowledge",
+            title="T", embedding_type="chunk",
+        )
+        ctx = PipelineContext(
+            collection_name="c",
+            documents=[],
+            chunks=[
+                Chunk(
+                    content="changed text", metadata=meta, chunk_index=0,
+                    embedding=[0.1, 0.2], content_hash="hash-changed",
+                ),
+                Chunk(
+                    content="unchanged text", metadata=meta, chunk_index=1,
+                    embedding=[0.3, 0.4], content_hash="hash-unchanged",
+                ),
+            ],
+            unchanged_chunk_hashes={"hash-unchanged"},
+        )
+
+        await StoreStep(knowledge_store_port=store).execute(ctx)
+
+        assert ctx.chunks_stored == 1
+        assert len(store.collections["c"]) == 1
+        assert store.collections["c"][0]["document"] == "changed text"
+        assert store.collections["c"][0]["id"] == "hash-changed"
+
+    async def test_unchanged_filter_does_not_affect_summary_chunks(self):
+        """Summary chunks (content_hash=None) are always stored."""
+        store = MockKnowledgeStorePort()
+        chunk_meta = DocumentMetadata(
+            document_id="d1", source="s", type="knowledge",
+            title="T", embedding_type="chunk",
+        )
+        summary_meta = DocumentMetadata(
+            document_id="d1-summary", source="s", type="knowledge",
+            title="T", embedding_type="summary",
+        )
+        ctx = PipelineContext(
+            collection_name="c",
+            documents=[],
+            chunks=[
+                Chunk(
+                    content="unchanged chunk", metadata=chunk_meta, chunk_index=0,
+                    embedding=[0.1, 0.2], content_hash="hash-unchanged",
+                ),
+                Chunk(
+                    content="summary text", metadata=summary_meta, chunk_index=0,
+                    embedding=[0.5, 0.6], content_hash=None,
+                ),
+            ],
+            unchanged_chunk_hashes={"hash-unchanged"},
+        )
+
+        await StoreStep(knowledge_store_port=store).execute(ctx)
+
+        assert ctx.chunks_stored == 1
+        assert len(store.collections["c"]) == 1
+        assert store.collections["c"][0]["document"] == "summary text"
+
+    async def test_no_filter_when_unchanged_hashes_empty(self):
+        """When unchanged_chunk_hashes is empty, all embedded chunks are stored."""
+        store = MockKnowledgeStorePort()
+        meta = DocumentMetadata(
+            document_id="d1", source="s", type="knowledge",
+            title="T", embedding_type="chunk",
+        )
+        ctx = PipelineContext(
+            collection_name="c",
+            documents=[],
+            chunks=[
+                Chunk(
+                    content="chunk a", metadata=meta, chunk_index=0,
+                    embedding=[0.1, 0.2], content_hash="hash-a",
+                ),
+                Chunk(
+                    content="chunk b", metadata=meta, chunk_index=1,
+                    embedding=[0.3, 0.4], content_hash="hash-b",
+                ),
+            ],
+        )
+
+        await StoreStep(knowledge_store_port=store).execute(ctx)
+
+        assert ctx.chunks_stored == 2
+        assert len(store.collections["c"]) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -568,6 +921,261 @@ class TestIngestEngine:
 
 
 # ---------------------------------------------------------------------------
+# T037: Destructive step gating tests
+# ---------------------------------------------------------------------------
+
+
+class TestDestructiveStepGating:
+    """Verify IngestEngine skips destructive steps when prior errors exist."""
+
+    async def test_engine_skips_destructive_step_with_prior_errors(self):
+        """Destructive step is not executed when context has errors."""
+        executed = []
+
+        class ErrorStep:
+            @property
+            def name(self):
+                return "error_step"
+
+            async def execute(self, context):
+                context.errors.append("error_step: something went wrong")
+
+        class DestructiveStep:
+            @property
+            def name(self):
+                return "cleanup"
+
+            @property
+            def destructive(self):
+                return True
+
+            async def execute(self, context):
+                executed.append("cleanup")
+
+        engine = IngestEngine(steps=[
+            ErrorStep(),  # type: ignore[list-item]
+            DestructiveStep(),  # type: ignore[list-item]
+        ])
+        result = await engine.run([], "test")
+
+        assert "cleanup" not in executed
+        assert any("destructive step gated" in e for e in result.errors)
+        assert result.success is False
+
+    async def test_engine_runs_destructive_step_with_no_errors(self):
+        """Destructive step executes normally when no prior errors exist."""
+        executed = []
+
+        class DestructiveStep:
+            @property
+            def name(self):
+                return "cleanup"
+
+            @property
+            def destructive(self):
+                return True
+
+            async def execute(self, context):
+                executed.append("cleanup")
+
+        engine = IngestEngine(steps=[
+            DestructiveStep(),  # type: ignore[list-item]
+        ])
+        result = await engine.run([], "test")
+
+        assert "cleanup" in executed
+        assert result.success is True
+
+    async def test_non_destructive_steps_run_despite_errors(self):
+        """Non-destructive steps run regardless of prior errors."""
+        executed = []
+
+        class ErrorStep:
+            @property
+            def name(self):
+                return "error_step"
+
+            async def execute(self, context):
+                context.errors.append("error_step: failure")
+
+        class NormalStep:
+            @property
+            def name(self):
+                return "normal"
+
+            async def execute(self, context):
+                executed.append("normal")
+
+        engine = IngestEngine(steps=[
+            ErrorStep(),  # type: ignore[list-item]
+            NormalStep(),  # type: ignore[list-item]
+        ])
+        result = await engine.run([], "test")
+
+        assert "normal" in executed
+        assert result.success is False
+
+    async def test_multiple_destructive_steps_all_skipped(self):
+        """All destructive steps are skipped when errors exist."""
+        executed = []
+
+        class ErrorStep:
+            @property
+            def name(self):
+                return "error_step"
+
+            async def execute(self, context):
+                context.errors.append("error_step: failure")
+
+        class DestructiveA:
+            @property
+            def name(self):
+                return "cleanup_a"
+
+            @property
+            def destructive(self):
+                return True
+
+            async def execute(self, context):
+                executed.append("cleanup_a")
+
+        class DestructiveB:
+            @property
+            def name(self):
+                return "cleanup_b"
+
+            @property
+            def destructive(self):
+                return True
+
+            async def execute(self, context):
+                executed.append("cleanup_b")
+
+        engine = IngestEngine(steps=[
+            ErrorStep(),  # type: ignore[list-item]
+            DestructiveA(),  # type: ignore[list-item]
+            DestructiveB(),  # type: ignore[list-item]
+        ])
+        result = await engine.run([], "test")
+
+        assert executed == []
+        assert any("cleanup_a" in e and "destructive step gated" in e for e in result.errors)
+        assert any("cleanup_b" in e and "destructive step gated" in e for e in result.errors)
+
+    async def test_destructive_step_skipped_after_failing_non_destructive(self):
+        """Destructive step is skipped when a prior non-destructive step raises an exception."""
+        executed = []
+
+        class RaisingStep:
+            @property
+            def name(self):
+                return "raiser"
+
+            async def execute(self, context):
+                raise RuntimeError("unexpected crash")
+
+        class DestructiveStep:
+            @property
+            def name(self):
+                return "cleanup"
+
+            @property
+            def destructive(self):
+                return True
+
+            async def execute(self, context):
+                executed.append("cleanup")
+
+        engine = IngestEngine(steps=[
+            RaisingStep(),  # type: ignore[list-item]
+            DestructiveStep(),  # type: ignore[list-item]
+        ])
+        result = await engine.run([], "test")
+
+        assert "cleanup" not in executed
+        assert any("destructive step gated" in e for e in result.errors)
+
+    async def test_metrics_recorded_for_skipped_destructive_step(self):
+        """Skipped destructive steps get StepMetrics with duration=0.0 and error_count=1."""
+
+        class ErrorStep:
+            @property
+            def name(self):
+                return "error_step"
+
+            async def execute(self, context):
+                context.errors.append("error_step: failure")
+
+        class DestructiveStep:
+            @property
+            def name(self):
+                return "cleanup"
+
+            @property
+            def destructive(self):
+                return True
+
+            async def execute(self, context):
+                pass  # pragma: no cover
+
+        captured_metrics: dict = {}
+
+        class MetricCapture:
+            @property
+            def name(self):
+                return "capture"
+
+            async def execute(self, context):
+                captured_metrics.update(context.metrics)
+
+        engine = IngestEngine(steps=[
+            ErrorStep(),  # type: ignore[list-item]
+            DestructiveStep(),  # type: ignore[list-item]
+            MetricCapture(),  # type: ignore[list-item]
+        ])
+        await engine.run([], "test")
+
+        assert "cleanup" in captured_metrics
+        m = captured_metrics["cleanup"]
+        assert m.duration == 0.0
+        assert m.error_count == 1
+
+    async def test_skip_message_format(self):
+        """Verify the exact format of the skip message includes step name and error count."""
+
+        class ErrorStep:
+            @property
+            def name(self):
+                return "error_step"
+
+            async def execute(self, context):
+                context.errors.append("error_step: fail 1")
+                context.errors.append("error_step: fail 2")
+
+        class DestructiveStep:
+            @property
+            def name(self):
+                return "cleanup"
+
+            @property
+            def destructive(self):
+                return True
+
+            async def execute(self, context):
+                pass  # pragma: no cover
+
+        engine = IngestEngine(steps=[
+            ErrorStep(),  # type: ignore[list-item]
+            DestructiveStep(),  # type: ignore[list-item]
+        ])
+        result = await engine.run([], "test")
+
+        skip_msgs = [e for e in result.errors if "destructive step gated" in e]
+        assert len(skip_msgs) == 1
+        assert skip_msgs[0] == "cleanup: skipped (destructive step gated by 2 prior error(s))"
+
+
+# ---------------------------------------------------------------------------
 # T010: ChangeDetectionStep tests
 # ---------------------------------------------------------------------------
 
@@ -692,6 +1300,8 @@ class TestChangeDetectionStep:
         assert ctx.chunks_skipped == 0
         assert ctx.change_detection_ran is False
         assert chunk.embedding is None
+        # Store-read error is recorded so pipeline result reflects failure
+        assert any("ChangeDetectionStep: store read failed" in e for e in ctx.errors)
 
     async def test_summary_chunks_not_flagged_as_removed(self):
         """Summary and BoK chunks in the store should not trigger removed-document detection."""
@@ -828,25 +1438,50 @@ class TestOrphanCleanupStep:
         assert len(ctx.errors) == 0
 
     async def test_skips_cleanup_on_store_step_errors(self):
-        """Cleanup is skipped when StoreStep had write failures."""
+        """Engine-level destructive gating: cleanup is skipped when StoreStep had write failures."""
         store = MockKnowledgeStorePort()
         store.collections["coll"] = [
             {"id": "orphan-1", "metadata": {"documentId": "doc-1"}, "document": "old"},
         ]
 
-        ctx = PipelineContext(
-            collection_name="coll",
-            documents=[],
-            orphan_ids={"orphan-1"},
-            errors=["StoreStep: storage failed for batch 0: connection refused"],
-        )
-        await OrphanCleanupStep(knowledge_store_port=store).execute(ctx)
+        class FailingStoreStep:
+            @property
+            def name(self):
+                return "store"
+
+            async def execute(self, context):
+                context.errors.append("store: storage failed for batch 0: connection refused")
+
+        engine = IngestEngine(steps=[
+            FailingStoreStep(),  # type: ignore[list-item]
+            OrphanCleanupStep(knowledge_store_port=store),
+        ])
+        # Pre-populate context: engine creates a fresh context, so we run with
+        # a step that sets up orphan_ids first.
+        class SetupStep:
+            @property
+            def name(self):
+                return "setup"
+
+            async def execute(self, context):
+                context.orphan_ids = {"orphan-1"}
+
+        engine = IngestEngine(steps=[
+            SetupStep(),  # type: ignore[list-item]
+            FailingStoreStep(),  # type: ignore[list-item]
+            OrphanCleanupStep(knowledge_store_port=store),
+        ])
+        result = await engine.run([], "coll")
 
         # Orphan should NOT have been deleted
         remaining_ids = [it["id"] for it in store.collections["coll"]]
         assert "orphan-1" in remaining_ids
-        assert ctx.chunks_deleted == 0
-        assert any("skipped cleanup" in e for e in ctx.errors)
+        assert result.chunks_deleted == 0
+        assert any("destructive step gated" in e for e in result.errors)
+
+    async def test_destructive_property(self):
+        store = MockKnowledgeStorePort()
+        assert OrphanCleanupStep(knowledge_store_port=store).destructive is True
 
     async def test_step_name(self):
         store = MockKnowledgeStorePort()
@@ -921,6 +1556,102 @@ class TestDocumentSummaryStepDedup:
         await DocumentSummaryStep(llm_port=llm).execute(ctx)
 
         assert len(ctx.chunks) == chunks_before + 1
+
+
+# ---------------------------------------------------------------------------
+# Story #36: DocumentSummaryStep stale summary cleanup tests
+# ---------------------------------------------------------------------------
+
+
+class TestDocumentSummaryStepStaleCleanup:
+    async def test_stale_summary_marked_as_orphan(self):
+        """Changed doc that dropped below threshold has its summary orphaned."""
+        llm = MockLLMPort(response="Summary")
+        meta = DocumentMetadata(
+            document_id="doc-1", source="s", type="knowledge",
+            title="T", embedding_type="chunk",
+        )
+        # Only 2 chunks — below the default threshold of 4
+        ctx = PipelineContext(
+            collection_name="test",
+            documents=[],
+            chunks=[
+                Chunk(content="a", metadata=meta, chunk_index=0),
+                Chunk(content="b", metadata=meta, chunk_index=1),
+            ],
+        )
+        ctx.change_detection_ran = True
+        ctx.changed_document_ids = {"doc-1"}
+
+        await DocumentSummaryStep(llm_port=llm).execute(ctx)
+
+        assert "doc-1-summary-0" in ctx.orphan_ids
+        # No summary chunk should be generated (below threshold)
+        summary_chunks = [c for c in ctx.chunks if c.metadata.embedding_type == "summary"]
+        assert len(summary_chunks) == 0
+        assert len(llm.calls) == 0
+
+    async def test_no_orphan_when_still_above_threshold(self):
+        """Changed doc still above threshold is summarized, not orphaned."""
+        llm = MockLLMPort(response="Summary")
+        ctx = _make_context()
+        await ChunkStep(chunk_size=100, chunk_overlap=10).execute(ctx)
+        assert len(ctx.chunks) >= 4  # above threshold
+
+        ctx.change_detection_ran = True
+        ctx.changed_document_ids = {"doc-1"}
+
+        await DocumentSummaryStep(llm_port=llm).execute(ctx)
+
+        assert "doc-1-summary-0" not in ctx.orphan_ids
+        # Should have generated a summary
+        summary_chunks = [c for c in ctx.chunks if c.metadata.embedding_type == "summary"]
+        assert len(summary_chunks) == 1
+
+    async def test_no_stale_cleanup_without_change_detection(self):
+        """No orphan marking when change detection did not run."""
+        llm = MockLLMPort(response="Summary")
+        meta = DocumentMetadata(
+            document_id="doc-1", source="s", type="knowledge",
+            title="T", embedding_type="chunk",
+        )
+        # 2 chunks — below threshold, but change detection not ran
+        ctx = PipelineContext(
+            collection_name="test",
+            documents=[],
+            chunks=[
+                Chunk(content="a", metadata=meta, chunk_index=0),
+                Chunk(content="b", metadata=meta, chunk_index=1),
+            ],
+        )
+        assert ctx.change_detection_ran is False
+
+        await DocumentSummaryStep(llm_port=llm).execute(ctx)
+
+        assert len(ctx.orphan_ids) == 0
+
+    async def test_stale_cleanup_only_targets_changed_docs(self):
+        """Unchanged docs below threshold are not orphaned."""
+        llm = MockLLMPort(response="Summary")
+        meta = DocumentMetadata(
+            document_id="doc-1", source="s", type="knowledge",
+            title="T", embedding_type="chunk",
+        )
+        ctx = PipelineContext(
+            collection_name="test",
+            documents=[],
+            chunks=[
+                Chunk(content="a", metadata=meta, chunk_index=0),
+                Chunk(content="b", metadata=meta, chunk_index=1),
+            ],
+        )
+        ctx.change_detection_ran = True
+        # doc-1 is NOT in changed_document_ids
+        ctx.changed_document_ids = {"other-doc"}
+
+        await DocumentSummaryStep(llm_port=llm).execute(ctx)
+
+        assert "doc-1-summary-0" not in ctx.orphan_ids
 
 
 # ---------------------------------------------------------------------------
@@ -1022,6 +1753,72 @@ class TestBoKSummaryStepDedup:
 
 
 # ---------------------------------------------------------------------------
+# Story #36: BodyOfKnowledgeSummaryStep empty-corpus cleanup tests
+# ---------------------------------------------------------------------------
+
+
+class TestBoKSummaryStepEmptyCorpusCleanup:
+    async def test_bok_summary_orphaned_on_empty_corpus(self):
+        """When all docs removed (empty corpus), BoK summary is marked for cleanup."""
+        llm = MockLLMPort(response="BoK overview")
+        ctx = PipelineContext(
+            collection_name="test",
+            documents=[],
+            chunks=[],  # No content chunks at all
+        )
+        ctx.change_detection_ran = True
+        ctx.removed_document_ids = {"doc-1", "doc-2"}
+
+        await BodyOfKnowledgeSummaryStep(llm_port=llm).execute(ctx)
+
+        assert "body-of-knowledge-summary-0" in ctx.orphan_ids
+        # No BoK summary chunk should be generated
+        bok = [c for c in ctx.chunks if c.metadata.document_id == "body-of-knowledge-summary"]
+        assert len(bok) == 0
+        assert len(llm.calls) == 0
+
+    async def test_bok_summary_not_orphaned_when_docs_exist(self):
+        """Non-empty corpus does not orphan BoK summary."""
+        llm = MockLLMPort(response="BoK overview")
+        ctx = PipelineContext(
+            collection_name="test",
+            documents=[],
+            chunks=[
+                Chunk(
+                    content="text",
+                    metadata=DocumentMetadata(document_id="d1", source="s", embedding_type="chunk"),
+                    chunk_index=0,
+                ),
+            ],
+        )
+        ctx.change_detection_ran = True
+        ctx.changed_document_ids = {"d1"}
+
+        await BodyOfKnowledgeSummaryStep(llm_port=llm).execute(ctx)
+
+        assert "body-of-knowledge-summary-0" not in ctx.orphan_ids
+        # BoK summary should be generated normally
+        bok = [c for c in ctx.chunks if c.metadata.document_id == "body-of-knowledge-summary"]
+        assert len(bok) == 1
+
+    async def test_bok_not_orphaned_on_empty_corpus_without_removals(self):
+        """Empty corpus with no removals does not orphan BoK (nothing to clean up)."""
+        llm = MockLLMPort(response="BoK overview")
+        ctx = PipelineContext(
+            collection_name="test",
+            documents=[],
+            chunks=[],
+        )
+        # No change detection ran, no removals
+        assert ctx.change_detection_ran is False
+
+        await BodyOfKnowledgeSummaryStep(llm_port=llm).execute(ctx)
+
+        assert "body-of-knowledge-summary-0" not in ctx.orphan_ids
+        assert len(llm.calls) == 0
+
+
+# ---------------------------------------------------------------------------
 # T017: Integration tests — full pipeline with dedup
 # ---------------------------------------------------------------------------
 
@@ -1117,3 +1914,249 @@ class TestPipelineIntegration:
         remaining_doc_ids = {it["metadata"].get("documentId") for it in remaining}
         assert "doc-b" not in remaining_doc_ids
         assert "doc-a" in remaining_doc_ids
+
+
+# ---------------------------------------------------------------------------
+# DocumentSummaryStep concurrency tests
+# ---------------------------------------------------------------------------
+
+
+def _make_multi_doc_context(
+    n_docs: int = 3,
+    chunks_per_doc: int = 5,
+    collection: str = "test-collection",
+) -> PipelineContext:
+    """Build a PipelineContext with n_docs documents, each having chunks_per_doc chunks."""
+    chunks: list[Chunk] = []
+    for d in range(n_docs):
+        doc_id = f"doc-{d}"
+        for c in range(chunks_per_doc):
+            meta = DocumentMetadata(
+                document_id=doc_id,
+                source=f"source-{d}",
+                type="knowledge",
+                title=f"Doc {d}",
+                embedding_type="chunk",
+            )
+            chunks.append(
+                Chunk(content=f"Content for doc {d} chunk {c}. " * 20, metadata=meta, chunk_index=c)
+            )
+    return PipelineContext(
+        collection_name=collection,
+        documents=[],
+        chunks=chunks,
+    )
+
+
+class _DelayedLLMPort:
+    """Mock LLM that introduces an asyncio.sleep delay to measure concurrency."""
+
+    def __init__(self, delay: float = 0.05, response: str = "summary") -> None:
+        self.delay = delay
+        self.response = response
+        self.call_count = 0
+
+    async def invoke(self, messages: list[dict]) -> str:
+        self.call_count += 1
+        await asyncio.sleep(self.delay)
+        return self.response
+
+    async def stream(self, messages: list[dict]):
+        yield self.response
+
+
+class _SelectiveFailLLMPort:
+    """Mock LLM that fails for a specific document marker string in prompt text."""
+
+    def __init__(self, fail_marker: str, response: str = "summary") -> None:
+        self.fail_marker = fail_marker
+        self.response = response
+        self.call_count = 0
+
+    async def invoke(self, messages: list[dict]) -> str:
+        self.call_count += 1
+        # Check if any message content contains the fail marker
+        for msg in messages:
+            if self.fail_marker in msg.get("content", ""):
+                raise RuntimeError(f"Simulated LLM failure for {self.fail_marker}")
+        return self.response
+
+    async def stream(self, messages: list[dict]):
+        yield self.response
+
+
+class TestDocumentSummaryStepConcurrency:
+    """Tests for concurrent document summarization (story #1823)."""
+
+    async def test_concurrent_execution_faster_than_sequential(self):
+        """With concurrency > 1, multiple documents should be summarized in parallel."""
+        n_docs = 3
+        delay = 0.1  # 100ms per LLM call
+        ctx = _make_multi_doc_context(n_docs=n_docs, chunks_per_doc=5)
+        llm = _DelayedLLMPort(delay=delay)
+
+        step = DocumentSummaryStep(
+            llm_port=llm,  # type: ignore[arg-type]
+            concurrency=n_docs,
+            chunk_threshold=2,
+        )
+
+        start = time.monotonic()
+        await step.execute(ctx)
+        elapsed = time.monotonic() - start
+
+        # Each doc has 5 chunks, each chunk triggers one LLM call (refine pattern).
+        # Sequential would take n_docs * chunks_per_doc * delay = 3 * 5 * 0.1 = 1.5s.
+        # Concurrent should take roughly chunks_per_doc * delay = 0.5s + overhead.
+        # We assert it completes in less than 80% of sequential time.
+        sequential_estimate = n_docs * 5 * delay
+        assert elapsed < sequential_estimate * 0.8, (
+            f"Expected concurrent execution to be significantly faster than "
+            f"sequential (~{sequential_estimate:.1f}s), but took {elapsed:.2f}s"
+        )
+
+        # All documents should have summaries
+        assert len(ctx.document_summaries) == n_docs
+        summary_chunks = [c for c in ctx.chunks if c.metadata.embedding_type == "summary"]
+        assert len(summary_chunks) == n_docs
+
+    async def test_deterministic_ordering_of_summary_chunks(self):
+        """Summary chunks appear in context.chunks in input document order, not completion order."""
+        n_docs = 4
+        ctx = _make_multi_doc_context(n_docs=n_docs, chunks_per_doc=5)
+
+        # Use varying delays so documents finish out of order
+        call_counter = 0
+        doc_delays = {"doc-0": 0.08, "doc-1": 0.02, "doc-2": 0.06, "doc-3": 0.01}
+
+        class VaryingDelayLLM:
+            async def invoke(self, messages):
+                nonlocal call_counter
+                call_counter += 1
+                # Extract doc-id from prompt content
+                content = messages[-1].get("content", "")
+                for doc_id, delay in doc_delays.items():
+                    if doc_id in content:
+                        await asyncio.sleep(delay)
+                        return f"summary-{doc_id}"
+                return "summary-unknown"
+
+            async def stream(self, messages):
+                yield ""
+
+        step = DocumentSummaryStep(
+            llm_port=VaryingDelayLLM(),  # type: ignore[arg-type]
+            concurrency=n_docs,
+            chunk_threshold=2,
+        )
+        await step.execute(ctx)
+
+        summary_chunks = [c for c in ctx.chunks if c.metadata.embedding_type == "summary"]
+        summary_doc_ids = [c.metadata.document_id for c in summary_chunks]
+
+        # Should be in original document order: doc-0, doc-1, doc-2, doc-3
+        expected = [f"doc-{i}-summary" for i in range(n_docs)]
+        assert summary_doc_ids == expected, (
+            f"Summary chunks should be in input order {expected}, got {summary_doc_ids}"
+        )
+
+    async def test_partial_failure_does_not_block_other_documents(self):
+        """If summarization fails for one document, others still complete."""
+        n_docs = 3
+        ctx = _make_multi_doc_context(n_docs=n_docs, chunks_per_doc=5)
+        # The chunk content contains "Content for doc 1 chunk N" — match on that.
+        llm = _SelectiveFailLLMPort(fail_marker="Content for doc 1")
+
+        step = DocumentSummaryStep(
+            llm_port=llm,  # type: ignore[arg-type]
+            concurrency=n_docs,
+            chunk_threshold=2,
+        )
+        await step.execute(ctx)
+
+        # doc-0 and doc-2 should have summaries
+        assert "doc-0" in ctx.document_summaries
+        assert "doc-2" in ctx.document_summaries
+        assert "doc-1" not in ctx.document_summaries
+
+        # One error should be recorded for doc-1
+        errors_for_doc1 = [e for e in ctx.errors if "doc-1" in e]
+        assert len(errors_for_doc1) == 1
+        assert "DocumentSummaryStep" in errors_for_doc1[0]
+
+        # Summary chunks: 2 (for doc-0 and doc-2)
+        summary_chunks = [c for c in ctx.chunks if c.metadata.embedding_type == "summary"]
+        assert len(summary_chunks) == 2
+
+    async def test_concurrency_one_produces_correct_results(self):
+        """With concurrency=1, behavior is equivalent to sequential execution."""
+        n_docs = 3
+        ctx = _make_multi_doc_context(n_docs=n_docs, chunks_per_doc=5)
+        llm = MockLLMPort(response="sequential summary")
+
+        step = DocumentSummaryStep(
+            llm_port=llm,
+            concurrency=1,
+            chunk_threshold=2,
+        )
+        await step.execute(ctx)
+
+        # All documents should have summaries
+        assert len(ctx.document_summaries) == n_docs
+        for i in range(n_docs):
+            assert f"doc-{i}" in ctx.document_summaries
+            assert ctx.document_summaries[f"doc-{i}"] == "sequential summary"
+
+        # Summary chunks in correct order
+        summary_chunks = [c for c in ctx.chunks if c.metadata.embedding_type == "summary"]
+        assert len(summary_chunks) == n_docs
+        for i, sc in enumerate(summary_chunks):
+            assert sc.metadata.document_id == f"doc-{i}-summary"
+
+    async def test_multiple_documents_all_summarized(self):
+        """Verify all qualifying documents get summaries with default concurrency."""
+        n_docs = 5
+        ctx = _make_multi_doc_context(n_docs=n_docs, chunks_per_doc=6)
+        llm = MockLLMPort(response="multi-doc summary")
+
+        step = DocumentSummaryStep(
+            llm_port=llm,
+            concurrency=8,
+            chunk_threshold=4,
+        )
+        await step.execute(ctx)
+
+        assert len(ctx.document_summaries) == n_docs
+        summary_chunks = [c for c in ctx.chunks if c.metadata.embedding_type == "summary"]
+        assert len(summary_chunks) == n_docs
+
+    async def test_no_context_corruption_under_concurrency(self):
+        """Verify context state is consistent after concurrent execution."""
+        n_docs = 10
+        ctx = _make_multi_doc_context(n_docs=n_docs, chunks_per_doc=5)
+        initial_chunk_count = len(ctx.chunks)
+        llm = _DelayedLLMPort(delay=0.01, response="safe summary")
+
+        step = DocumentSummaryStep(
+            llm_port=llm,  # type: ignore[arg-type]
+            concurrency=5,
+            chunk_threshold=2,
+        )
+        await step.execute(ctx)
+
+        # Chunk count should be initial + n_docs (one summary each)
+        assert len(ctx.chunks) == initial_chunk_count + n_docs
+
+        # All document_summaries keys should be present
+        assert len(ctx.document_summaries) == n_docs
+
+        # No errors
+        assert len(ctx.errors) == 0
+
+        # Summary chunk doc IDs should be unique
+        summary_doc_ids = [
+            c.metadata.document_id
+            for c in ctx.chunks
+            if c.metadata.embedding_type == "summary"
+        ]
+        assert len(summary_doc_ids) == len(set(summary_doc_ids))
