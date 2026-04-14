@@ -8,7 +8,7 @@ import httpx
 import pytest
 
 from core.events.ingest_website import IngestWebsiteResult
-from plugins.ingest_website.crawler import _is_same_domain, _normalize_url, _should_skip_url, crawl
+from plugins.ingest_website.crawler import CrawlError, _is_same_domain, _normalize_url, _should_skip_url, crawl
 from plugins.ingest_website.html_parser import extract_text, extract_title
 from plugins.ingest_website.plugin import IngestWebsitePlugin
 from tests.conftest import (
@@ -103,12 +103,32 @@ class TestCrawlFunction:
         assert len(results) == 0
 
     async def test_handles_request_error(self):
+        """Base URL request failure raises CrawlError instead of returning []."""
         def error_handler(request: httpx.Request) -> httpx.Response:
             raise httpx.ConnectError("Connection refused")
 
         with self._patch_transport(error_handler):
+            with pytest.raises(CrawlError, match="Failed to reach base URL"):
+                await crawl("https://example.com", page_limit=5)
+
+    async def test_subsequent_page_error_continues(self):
+        """Errors on pages after the first are logged and skipped."""
+        call_count = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal call_count
+            call_count += 1
+            url = str(request.url)
+            if "about" in url:
+                raise httpx.ConnectError("Connection refused")
+            return _mock_response(
+                _html_page("Home", "Content", ["https://example.com/about"])
+            )
+
+        with self._patch_transport(handler):
             results = await crawl("https://example.com", page_limit=5)
-        assert len(results) == 0
+        # Only the first page succeeds; the second fails but is skipped
+        assert len(results) == 1
 
     async def test_deduplicates_visited_urls(self):
         html = _html_page("Home", "Content", [
@@ -172,12 +192,97 @@ class TestIngestWebsitePlugin:
         assert plugin._knowledge_store.deleted == []
         assert "example.com-knowledge" in plugin._knowledge_store.collections
 
-    async def test_unsupported_content_skip(self, plugin):
-        """Empty crawl results should still succeed."""
+    async def test_empty_crawl_runs_cleanup(self):
+        """When crawl returns [], cleanup deletes pre-existing chunks."""
+        store = MockKnowledgeStorePort()
+        collection = "example.com-knowledge"
+        await store.ingest(
+            collection=collection,
+            documents=["old website content"],
+            metadatas=[{"documentId": "https://example.com/old", "embeddingType": "chunk", "source": "s", "type": "t", "title": "T", "chunkIndex": 0}],
+            ids=["old-hash-1"],
+            embeddings=[[0.1] * 384],
+        )
+        assert len(store.collections[collection]) == 1
+
+        plugin = IngestWebsitePlugin(
+            llm=MockLLMPort(),
+            embeddings=MockEmbeddingsPort(),
+            knowledge_store=store,
+        )
+
+        event = make_ingest_website()
+        with patch("plugins.ingest_website.plugin.crawl", return_value=[]):
+            result = await plugin.handle(event)
+
+        assert isinstance(result, IngestWebsiteResult)
+        assert result.result == "success"
+        # All pre-existing chunks should have been deleted
+        assert len(store.collections.get(collection, [])) == 0
+
+    async def test_empty_extract_runs_cleanup(self):
+        """When crawl returns pages but extraction yields nothing, cleanup runs."""
+        store = MockKnowledgeStorePort()
+        collection = "example.com-knowledge"
+        await store.ingest(
+            collection=collection,
+            documents=["stale content"],
+            metadatas=[{"documentId": "https://example.com/stale", "embeddingType": "chunk", "source": "s", "type": "t", "title": "T", "chunkIndex": 0}],
+            ids=["stale-hash"],
+            embeddings=[[0.1] * 384],
+        )
+
+        plugin = IngestWebsitePlugin(
+            llm=MockLLMPort(),
+            embeddings=MockEmbeddingsPort(),
+            knowledge_store=store,
+        )
+
+        event = make_ingest_website()
+        # Crawl returns pages, but all pages have empty/whitespace text
+        empty_pages = [{"url": "https://example.com/empty", "html": "<html><body>   </body></html>"}]
+        with patch("plugins.ingest_website.plugin.crawl", return_value=empty_pages):
+            result = await plugin.handle(event)
+
+        assert result.result == "success"
+        assert len(store.collections.get(collection, [])) == 0
+
+    async def test_empty_crawl_returns_success(self, plugin):
+        """Empty-but-successful crawl returns IngestionResult.SUCCESS."""
         event = make_ingest_website()
         with patch("plugins.ingest_website.plugin.crawl", return_value=[]):
             result = await plugin.handle(event)
         assert result.result == "success"
+
+    async def test_crawl_failure_no_cleanup(self):
+        """When crawl raises CrawlError, return failure without running cleanup."""
+        store = MockKnowledgeStorePort()
+        collection = "example.com-knowledge"
+        await store.ingest(
+            collection=collection,
+            documents=["preserved content"],
+            metadatas=[{"documentId": "https://example.com/page", "embeddingType": "chunk", "source": "s", "type": "t", "title": "T", "chunkIndex": 0}],
+            ids=["hash-1"],
+            embeddings=[[0.1] * 384],
+        )
+
+        plugin = IngestWebsitePlugin(
+            llm=MockLLMPort(),
+            embeddings=MockEmbeddingsPort(),
+            knowledge_store=store,
+        )
+
+        event = make_ingest_website()
+        with patch(
+            "plugins.ingest_website.plugin.crawl",
+            side_effect=CrawlError("Failed to reach base URL https://example.com/: Connection refused"),
+        ):
+            result = await plugin.handle(event)
+
+        assert result.result == "failure"
+        assert "Failed to reach base URL" in result.error
+        # Store should be untouched — no cleanup ran
+        assert len(store.collections[collection]) == 1
 
     async def test_startup_shutdown(self, plugin):
         await plugin.startup()

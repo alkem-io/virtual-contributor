@@ -85,6 +85,10 @@ async def _is_safe_url(url: str) -> bool:
         return not (addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved)
 
 
+class CrawlError(Exception):
+    """Raised when the crawl fails to reach the target site."""
+
+
 async def crawl(
     base_url: str,
     page_limit: int = 20,
@@ -92,6 +96,10 @@ async def crawl(
     """Crawl a website recursively within domain boundaries.
 
     Returns list of {"url": str, "html": str} dicts.
+
+    Raises ``CrawlError`` when the base URL is unreachable (e.g. network
+    error, DNS failure) so callers can distinguish a genuine empty site
+    from a transient failure.
     """
     if not await _is_safe_url(base_url):
         logger.warning("Blocked unsafe base URL: %s", base_url)
@@ -100,6 +108,7 @@ async def crawl(
     visited: set[str] = set()
     results: list[dict] = []
     queue = [_normalize_url(base_url)]
+    is_first_request = True
 
     async with httpx.AsyncClient(
         timeout=30.0,
@@ -123,6 +132,7 @@ async def crawl(
                 response = await client.get(normalized)
                 content_type = response.headers.get("content-type", "")
                 if "text/html" not in content_type:
+                    is_first_request = False
                     continue
 
                 html = response.text
@@ -142,7 +152,13 @@ async def crawl(
                         queue.append(full_normalized)
 
             except Exception as exc:
+                if is_first_request:
+                    raise CrawlError(
+                        f"Failed to reach base URL {normalized}: {exc}"
+                    ) from exc
                 logger.warning("Failed to crawl %s: %s", normalized, exc)
+            finally:
+                is_first_request = False
 
     logger.info("Crawled %d pages from %s", len(results), base_url)
     return results
