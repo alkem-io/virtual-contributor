@@ -53,7 +53,7 @@ This guarantees deterministic ordering and avoids any concurrent mutation of sha
 
 **Findings**:
 
-`asyncio.gather` with `return_exceptions=False` (default) propagates the first exception and cancels remaining tasks. This conflicts with the partial-failure requirement.
+`asyncio.gather` with `return_exceptions=False` (default) propagates the first exception to the awaiter; other awaitables are not automatically canceled. This still conflicts with the partial-failure requirement because control flow exits early unless exceptions are handled per task.
 
 Two approaches handle this:
 
@@ -61,7 +61,7 @@ Two approaches handle this:
 2. **`asyncio.gather(return_exceptions=True)`**: Exceptions are returned as values. The post-gather loop must type-check each result.
 
 **Decision**: Use try/except inside `_summarize_one`, returning `_SummaryResult(error=...)` on failure.
-**Rationale**: The try/except was already present in the sequential version. Moving it into the inner function preserves the same error handling behavior. The post-gather loop has a clean interface: every result is a `_SummaryResult`, not a mixed type. No need for `isinstance` checks.
+**Rationale**: The try/except was already present in the sequential version. Moving it into the inner function preserves the same error-handling behavior. The post-gather loop has a clean interface: every result is a `_SummaryResult`, not a mixed type. No need for `isinstance` checks.
 **Alternatives considered**: `return_exceptions=True` --- viable but produces `list[_SummaryResult | Exception]` requiring type narrowing in the apply loop, which is less clean.
 
 ---
