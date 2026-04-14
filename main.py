@@ -49,6 +49,7 @@ def _log_config(config: BaseConfig) -> None:
         "guidance_min_score",
         "max_context_chars",
         "summary_chunk_threshold",
+        "pipeline_timeout",
     ]
     for name in fields:
         value = getattr(config, name, None)
@@ -273,32 +274,138 @@ async def _run(config: BaseConfig) -> None:
     # Router
     router = Router(plugin_type=config.plugin_type)
 
-    # Message handler
-    async def on_message(body: dict) -> None:
+    # Track in-flight pipeline tasks for graceful shutdown
+    active_tasks: set[asyncio.Task] = set()
+
+    def _is_ingest_event(event: object) -> bool:
+        """Return True for ingest event types that should use early ACK."""
+        from core.events.ingest_space import IngestBodyOfKnowledge
+        from core.events.ingest_website import IngestWebsite
+        return isinstance(event, (IngestWebsite, IngestBodyOfKnowledge))
+
+    async def _publish_result(envelope: dict) -> None:
+        """Publish a result envelope to the result queue."""
+        await transport.publish(
+            config.rabbitmq_exchange,
+            config.rabbitmq_result_routing_key,
+            json.dumps(envelope).encode("utf-8"),
+        )
+
+    async def _run_pipeline(event: object) -> None:
+        """Run plugin.handle() with timeout and publish result."""
+        try:
+            response = await asyncio.wait_for(
+                plugin.handle(event),
+                timeout=config.pipeline_timeout,
+            )
+            envelope = router.build_response_envelope(response, event)
+            await _publish_result(envelope)
+        except asyncio.TimeoutError:
+            logger.error(
+                "Pipeline timed out after %ds for event type %s",
+                config.pipeline_timeout,
+                type(event).__name__,
+            )
+            from core.events.response import Response
+            error_response = Response(result=f"Error: pipeline timed out after {config.pipeline_timeout}s")
+            envelope = router.build_response_envelope(error_response, event)
+            await _publish_result(envelope)
+        except Exception as exc:
+            logger.exception("Pipeline failed for event type %s: %s", type(event).__name__, exc)
+            from core.events.response import Response
+            error_response = Response(result=f"Error: {exc}")
+            envelope = router.build_response_envelope(error_response, event)
+            await _publish_result(envelope)
+
+    def _task_done(task: asyncio.Task) -> None:
+        """Remove completed task from the active set."""
+        active_tasks.discard(task)
+
+    # Message handler — receives both body and raw message for ACK control
+    async def on_message(
+        body: dict,
+        message: object,
+    ) -> None:
         event = None
         try:
             event = router.parse_event(body)
-            response = await plugin.handle(event)
-            envelope = router.build_response_envelope(response, event)
-            await transport.publish(
-                config.rabbitmq_exchange,
-                config.rabbitmq_result_routing_key,
-                json.dumps(envelope).encode("utf-8"),
-            )
+
+            if _is_ingest_event(event):
+                # Early ACK: acknowledge before processing starts
+                await message.ack()  # type: ignore[union-attr]
+                logger.info(
+                    "Early-ACKed ingest message, scheduling async pipeline for %s",
+                    type(event).__name__,
+                )
+                task = asyncio.create_task(_run_pipeline(event))
+                active_tasks.add(task)
+                task.add_done_callback(_task_done)
+            else:
+                # Engine query: late ACK — process synchronously, then ACK
+                try:
+                    response = await asyncio.wait_for(
+                        plugin.handle(event),
+                        timeout=config.pipeline_timeout,
+                    )
+                    envelope = router.build_response_envelope(response, event)
+                    await _publish_result(envelope)
+                    await message.ack()  # type: ignore[union-attr]
+                except asyncio.TimeoutError:
+                    logger.error(
+                        "Handler timed out after %ds for %s",
+                        config.pipeline_timeout,
+                        type(event).__name__,
+                    )
+                    from core.events.response import Response
+                    error_response = Response(
+                        result=f"Error: handler timed out after {config.pipeline_timeout}s",
+                    )
+                    envelope = router.build_response_envelope(error_response, event)
+                    await _publish_result(envelope)
+                    await _retry_or_reject(message, body)
+                except Exception as exc:
+                    logger.exception("Error handling engine query: %s", exc)
+                    from core.events.response import Response
+                    error_response = Response(result=f"Error: {exc}")
+                    envelope = router.build_response_envelope(error_response, event)
+                    await _publish_result(envelope)
+                    await _retry_or_reject(message, body)
         except Exception as exc:
-            logger.exception("Error handling message: %s", exc)
-            from core.events.response import Response
+            # parse_event failed — reject the message
+            logger.exception("Failed to parse message: %s", exc)
+            await _retry_or_reject(message, body)
 
-            error_response = Response(result=f"Error: {exc}")
-            envelope = router.build_response_envelope(error_response, event) if event else {"response": error_response.model_dump()}
-            await transport.publish(
-                config.rabbitmq_exchange,
-                config.rabbitmq_result_routing_key,
-                json.dumps(envelope).encode("utf-8"),
+    async def _retry_or_reject(message: object, body: dict) -> None:
+        """Replicate the adapter's retry/reject logic for engine queries."""
+        headers = getattr(message, "headers", None) or {}
+        retry_count = int(headers.get("x-retry-count", 0))
+        max_retries = config.rabbitmq_max_retries
+
+        if retry_count < max_retries - 1:
+            logger.warning(
+                "Message failed (attempt %d/%d), requeuing",
+                retry_count + 1, max_retries,
             )
+            new_headers = dict(headers)
+            new_headers["x-retry-count"] = retry_count + 1
+            try:
+                await transport.republish_with_headers(
+                    config.rabbitmq_input_queue,
+                    json.dumps(body).encode("utf-8"),
+                    new_headers,
+                )
+            except Exception as pub_exc:
+                logger.error("Failed to republish retry message: %s", pub_exc)
+            await message.reject(requeue=False)  # type: ignore[union-attr]
+        else:
+            logger.error(
+                "Message failed after %d attempts, discarding",
+                max_retries,
+            )
+            await message.reject(requeue=False)  # type: ignore[union-attr]
 
-    # Start consuming
-    await transport.consume(config.rabbitmq_input_queue, on_message)
+    # Start consuming with message handle exposed for ACK control
+    await transport.consume_with_message(config.rabbitmq_input_queue, on_message)
 
     # Health server
     health = HealthServer(port=config.health_port)
@@ -323,6 +430,24 @@ async def _run(config: BaseConfig) -> None:
 
     # Graceful shutdown
     logger.info("Shutting down...")
+
+    # Wait for in-flight pipeline tasks to complete (30s grace period)
+    if active_tasks:
+        logger.info(
+            "Waiting for %d in-flight pipeline task(s) to complete (30s grace)...",
+            len(active_tasks),
+        )
+        done, pending = await asyncio.wait(active_tasks, timeout=30)
+        if pending:
+            logger.warning(
+                "Cancelling %d pipeline task(s) that did not complete in time",
+                len(pending),
+            )
+            for task in pending:
+                task.cancel()
+            # Wait briefly for cancellation to propagate
+            await asyncio.wait(pending, timeout=5)
+
     await health.stop()
     await plugin.shutdown()
     await transport.close()

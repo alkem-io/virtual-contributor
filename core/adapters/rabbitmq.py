@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Callable
+from collections.abc import Awaitable, Callable
 
 import aio_pika
 from aio_pika import ExchangeType, Message
@@ -119,6 +119,42 @@ class RabbitMQAdapter:
         await q.consume(on_message)
         logger.info("Consuming from queue: %s", queue)
 
+    async def consume_with_message(
+        self,
+        queue: str,
+        callback: Callable[[dict, aio_pika.abc.AbstractIncomingMessage], Awaitable[None]],
+    ) -> None:
+        """Start consuming, passing both parsed body and raw message to callback.
+
+        Unlike ``consume()``, this method does NOT ACK or reject messages.
+        The callback is fully responsible for the message lifecycle
+        (calling ``message.ack()`` / ``message.reject()``).
+        """
+        if self._channel is None or self._exchange is None:
+            raise RuntimeError("Not connected to RabbitMQ")
+
+        q = await self._channel.declare_queue(
+            queue, durable=True, auto_delete=False,
+        )
+        await q.bind(self._exchange, routing_key=queue)
+
+        async def on_message(message: aio_pika.abc.AbstractIncomingMessage) -> None:
+            try:
+                body = json.loads(message.body.decode("utf-8"))
+                logger.info("Received message on queue %s", queue)
+                await callback(body, message)
+            except Exception:
+                logger.exception("Unhandled error in consume_with_message callback")
+                # Reject without requeue to avoid infinite loops;
+                # the callback should handle its own ACK/reject.
+                try:
+                    await message.reject(requeue=False)
+                except Exception:
+                    pass
+
+        await q.consume(on_message)
+        logger.info("Consuming (with message) from queue: %s", queue)
+
     async def publish(self, exchange: str, routing_key: str, message: bytes) -> None:
         """Publish a message to the exchange with the given routing key."""
         if self._channel is None:
@@ -138,6 +174,24 @@ class RabbitMQAdapter:
         msg = Message(
             body=message,
             content_type="application/json",
+        )
+        await self._exchange.publish(msg, routing_key=routing_key)
+
+    async def republish_with_headers(
+        self, routing_key: str, body: bytes, headers: dict,
+    ) -> None:
+        """Republish a message to the exchange with custom headers.
+
+        Used by the application layer to implement retry logic when
+        ``consume_with_message()`` delegates ACK/reject control to the callback.
+        """
+        if self._exchange is None:
+            raise RuntimeError("Not connected to RabbitMQ")
+
+        msg = Message(
+            body=body,
+            content_type="application/json",
+            headers=headers,
         )
         await self._exchange.publish(msg, routing_key=routing_key)
 
