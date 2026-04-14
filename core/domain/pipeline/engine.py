@@ -65,6 +65,28 @@ class IngestEngine:
         for step in self._steps:
             items_before = len(context.chunks)
             errors_before = len(context.errors)
+
+            # Gate: skip destructive steps when prior errors exist
+            if getattr(step, "destructive", False) and context.errors:
+                n_errors = len(context.errors)
+                msg = (
+                    f"{step.name}: skipped "
+                    f"(destructive step gated by {n_errors} prior error(s))"
+                )
+                context.errors.append(msg)
+                logger.warning(
+                    "Skipping destructive step '%s' due to %d prior error(s)",
+                    step.name,
+                    n_errors,
+                )
+                context.metrics[step.name] = StepMetrics(
+                    duration=0.0,
+                    items_in=items_before,
+                    items_out=len(context.chunks),
+                    error_count=1,
+                )
+                continue
+
             start = time.monotonic()
 
             try:
