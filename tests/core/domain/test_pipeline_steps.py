@@ -921,6 +921,261 @@ class TestIngestEngine:
 
 
 # ---------------------------------------------------------------------------
+# T037: Destructive step gating tests
+# ---------------------------------------------------------------------------
+
+
+class TestDestructiveStepGating:
+    """Verify IngestEngine skips destructive steps when prior errors exist."""
+
+    async def test_engine_skips_destructive_step_with_prior_errors(self):
+        """Destructive step is not executed when context has errors."""
+        executed = []
+
+        class ErrorStep:
+            @property
+            def name(self):
+                return "error_step"
+
+            async def execute(self, context):
+                context.errors.append("error_step: something went wrong")
+
+        class DestructiveStep:
+            @property
+            def name(self):
+                return "cleanup"
+
+            @property
+            def destructive(self):
+                return True
+
+            async def execute(self, context):
+                executed.append("cleanup")
+
+        engine = IngestEngine(steps=[
+            ErrorStep(),  # type: ignore[list-item]
+            DestructiveStep(),  # type: ignore[list-item]
+        ])
+        result = await engine.run([], "test")
+
+        assert "cleanup" not in executed
+        assert any("destructive step gated" in e for e in result.errors)
+        assert result.success is False
+
+    async def test_engine_runs_destructive_step_with_no_errors(self):
+        """Destructive step executes normally when no prior errors exist."""
+        executed = []
+
+        class DestructiveStep:
+            @property
+            def name(self):
+                return "cleanup"
+
+            @property
+            def destructive(self):
+                return True
+
+            async def execute(self, context):
+                executed.append("cleanup")
+
+        engine = IngestEngine(steps=[
+            DestructiveStep(),  # type: ignore[list-item]
+        ])
+        result = await engine.run([], "test")
+
+        assert "cleanup" in executed
+        assert result.success is True
+
+    async def test_non_destructive_steps_run_despite_errors(self):
+        """Non-destructive steps run regardless of prior errors."""
+        executed = []
+
+        class ErrorStep:
+            @property
+            def name(self):
+                return "error_step"
+
+            async def execute(self, context):
+                context.errors.append("error_step: failure")
+
+        class NormalStep:
+            @property
+            def name(self):
+                return "normal"
+
+            async def execute(self, context):
+                executed.append("normal")
+
+        engine = IngestEngine(steps=[
+            ErrorStep(),  # type: ignore[list-item]
+            NormalStep(),  # type: ignore[list-item]
+        ])
+        result = await engine.run([], "test")
+
+        assert "normal" in executed
+        assert result.success is False
+
+    async def test_multiple_destructive_steps_all_skipped(self):
+        """All destructive steps are skipped when errors exist."""
+        executed = []
+
+        class ErrorStep:
+            @property
+            def name(self):
+                return "error_step"
+
+            async def execute(self, context):
+                context.errors.append("error_step: failure")
+
+        class DestructiveA:
+            @property
+            def name(self):
+                return "cleanup_a"
+
+            @property
+            def destructive(self):
+                return True
+
+            async def execute(self, context):
+                executed.append("cleanup_a")
+
+        class DestructiveB:
+            @property
+            def name(self):
+                return "cleanup_b"
+
+            @property
+            def destructive(self):
+                return True
+
+            async def execute(self, context):
+                executed.append("cleanup_b")
+
+        engine = IngestEngine(steps=[
+            ErrorStep(),  # type: ignore[list-item]
+            DestructiveA(),  # type: ignore[list-item]
+            DestructiveB(),  # type: ignore[list-item]
+        ])
+        result = await engine.run([], "test")
+
+        assert executed == []
+        assert any("cleanup_a" in e and "destructive step gated" in e for e in result.errors)
+        assert any("cleanup_b" in e and "destructive step gated" in e for e in result.errors)
+
+    async def test_destructive_step_skipped_after_failing_non_destructive(self):
+        """Destructive step is skipped when a prior non-destructive step raises an exception."""
+        executed = []
+
+        class RaisingStep:
+            @property
+            def name(self):
+                return "raiser"
+
+            async def execute(self, context):
+                raise RuntimeError("unexpected crash")
+
+        class DestructiveStep:
+            @property
+            def name(self):
+                return "cleanup"
+
+            @property
+            def destructive(self):
+                return True
+
+            async def execute(self, context):
+                executed.append("cleanup")
+
+        engine = IngestEngine(steps=[
+            RaisingStep(),  # type: ignore[list-item]
+            DestructiveStep(),  # type: ignore[list-item]
+        ])
+        result = await engine.run([], "test")
+
+        assert "cleanup" not in executed
+        assert any("destructive step gated" in e for e in result.errors)
+
+    async def test_metrics_recorded_for_skipped_destructive_step(self):
+        """Skipped destructive steps get StepMetrics with duration=0.0 and error_count=1."""
+
+        class ErrorStep:
+            @property
+            def name(self):
+                return "error_step"
+
+            async def execute(self, context):
+                context.errors.append("error_step: failure")
+
+        class DestructiveStep:
+            @property
+            def name(self):
+                return "cleanup"
+
+            @property
+            def destructive(self):
+                return True
+
+            async def execute(self, context):
+                pass  # pragma: no cover
+
+        captured_metrics: dict = {}
+
+        class MetricCapture:
+            @property
+            def name(self):
+                return "capture"
+
+            async def execute(self, context):
+                captured_metrics.update(context.metrics)
+
+        engine = IngestEngine(steps=[
+            ErrorStep(),  # type: ignore[list-item]
+            DestructiveStep(),  # type: ignore[list-item]
+            MetricCapture(),  # type: ignore[list-item]
+        ])
+        await engine.run([], "test")
+
+        assert "cleanup" in captured_metrics
+        m = captured_metrics["cleanup"]
+        assert m.duration == 0.0
+        assert m.error_count == 1
+
+    async def test_skip_message_format(self):
+        """Verify the exact format of the skip message includes step name and error count."""
+
+        class ErrorStep:
+            @property
+            def name(self):
+                return "error_step"
+
+            async def execute(self, context):
+                context.errors.append("error_step: fail 1")
+                context.errors.append("error_step: fail 2")
+
+        class DestructiveStep:
+            @property
+            def name(self):
+                return "cleanup"
+
+            @property
+            def destructive(self):
+                return True
+
+            async def execute(self, context):
+                pass  # pragma: no cover
+
+        engine = IngestEngine(steps=[
+            ErrorStep(),  # type: ignore[list-item]
+            DestructiveStep(),  # type: ignore[list-item]
+        ])
+        result = await engine.run([], "test")
+
+        skip_msgs = [e for e in result.errors if "destructive step gated" in e]
+        assert len(skip_msgs) == 1
+        assert skip_msgs[0] == "cleanup: skipped (destructive step gated by 2 prior error(s))"
+
+
+# ---------------------------------------------------------------------------
 # T010: ChangeDetectionStep tests
 # ---------------------------------------------------------------------------
 
@@ -1183,25 +1438,50 @@ class TestOrphanCleanupStep:
         assert len(ctx.errors) == 0
 
     async def test_skips_cleanup_on_store_step_errors(self):
-        """Cleanup is skipped when StoreStep had write failures."""
+        """Engine-level destructive gating: cleanup is skipped when StoreStep had write failures."""
         store = MockKnowledgeStorePort()
         store.collections["coll"] = [
             {"id": "orphan-1", "metadata": {"documentId": "doc-1"}, "document": "old"},
         ]
 
-        ctx = PipelineContext(
-            collection_name="coll",
-            documents=[],
-            orphan_ids={"orphan-1"},
-            errors=["StoreStep: storage failed for batch 0: connection refused"],
-        )
-        await OrphanCleanupStep(knowledge_store_port=store).execute(ctx)
+        class FailingStoreStep:
+            @property
+            def name(self):
+                return "store"
+
+            async def execute(self, context):
+                context.errors.append("store: storage failed for batch 0: connection refused")
+
+        engine = IngestEngine(steps=[
+            FailingStoreStep(),  # type: ignore[list-item]
+            OrphanCleanupStep(knowledge_store_port=store),
+        ])
+        # Pre-populate context: engine creates a fresh context, so we run with
+        # a step that sets up orphan_ids first.
+        class SetupStep:
+            @property
+            def name(self):
+                return "setup"
+
+            async def execute(self, context):
+                context.orphan_ids = {"orphan-1"}
+
+        engine = IngestEngine(steps=[
+            SetupStep(),  # type: ignore[list-item]
+            FailingStoreStep(),  # type: ignore[list-item]
+            OrphanCleanupStep(knowledge_store_port=store),
+        ])
+        result = await engine.run([], "coll")
 
         # Orphan should NOT have been deleted
         remaining_ids = [it["id"] for it in store.collections["coll"]]
         assert "orphan-1" in remaining_ids
-        assert ctx.chunks_deleted == 0
-        assert any("skipped cleanup" in e for e in ctx.errors)
+        assert result.chunks_deleted == 0
+        assert any("destructive step gated" in e for e in result.errors)
+
+    async def test_destructive_property(self):
+        store = MockKnowledgeStorePort()
+        assert OrphanCleanupStep(knowledge_store_port=store).destructive is True
 
     async def test_step_name(self):
         store = MockKnowledgeStorePort()

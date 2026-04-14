@@ -689,13 +689,11 @@ class OrphanCleanupStep:
     def name(self) -> str:
         return "orphan_cleanup"
 
-    async def execute(self, context: PipelineContext) -> None:
-        if any(e.startswith("StoreStep:") for e in context.errors):
-            context.errors.append(
-                "OrphanCleanupStep: skipped cleanup because earlier storage writes failed"
-            )
-            return
+    @property
+    def destructive(self) -> bool:
+        return True
 
+    async def execute(self, context: PipelineContext) -> None:
         deleted = 0
 
         # Delete orphan chunk IDs
