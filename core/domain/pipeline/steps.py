@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 from dataclasses import replace
@@ -239,7 +240,13 @@ class ChangeDetectionStep:
 # ---------------------------------------------------------------------------
 
 class DocumentSummaryStep:
-    """Generate per-document summaries for docs with >= chunk_threshold chunks."""
+    """Generate per-document summaries for docs with >= chunk_threshold chunks.
+
+    When ``embeddings_port`` is provided, each document's content chunks and
+    its summary chunk are embedded immediately after summarization completes.
+    This overlaps LLM-bound summarization I/O with GPU-bound embedding I/O,
+    significantly reducing total pipeline wall-clock time.
+    """
 
     def __init__(
         self,
@@ -247,13 +254,19 @@ class DocumentSummaryStep:
         summary_length: int = 10000,
         concurrency: int = 8,
         chunk_threshold: int = 4,
+        embeddings_port: EmbeddingsPort | None = None,
+        embed_batch_size: int = 50,
     ) -> None:
         if chunk_threshold < 1:
             raise ValueError("chunk_threshold must be >= 1")
+        if embed_batch_size < 1:
+            raise ValueError("embed_batch_size must be >= 1")
         self._llm = llm_port
         self._summary_length = summary_length
         self._concurrency = concurrency
         self._chunk_threshold = chunk_threshold
+        self._embeddings = embeddings_port
+        self._embed_batch_size = embed_batch_size
         self._model_name = getattr(
             getattr(llm_port, "_llm", None), "model", "unknown"
         )
@@ -261,6 +274,36 @@ class DocumentSummaryStep:
     @property
     def name(self) -> str:
         return "document_summary"
+
+    async def _embed_document_chunks(
+        self,
+        chunks: list[Chunk],
+        context: PipelineContext,
+        doc_id: str,
+    ) -> None:
+        """Embed a document's chunks inline using the embeddings port.
+
+        Skips chunks that already have embeddings (e.g. from change detection).
+        Errors are captured in context.errors without raising.
+        """
+        assert self._embeddings is not None
+
+        to_embed = [c for c in chunks if c.embedding is None]
+        if not to_embed:
+            return
+
+        for i in range(0, len(to_embed), self._embed_batch_size):
+            batch = to_embed[i : i + self._embed_batch_size]
+            texts = [c.content for c in batch]
+            try:
+                embeddings = await self._embeddings.embed(texts)
+                for chunk, embedding in zip(batch, embeddings):
+                    chunk.embedding = embedding
+            except Exception as exc:
+                context.errors.append(
+                    f"DocumentSummaryStep: inline embedding failed for "
+                    f"{doc_id} batch {i // self._embed_batch_size}: {exc}"
+                )
 
     async def execute(self, context: PipelineContext) -> None:
         # Group chunks by document_id
@@ -295,6 +338,10 @@ class DocumentSummaryStep:
                         orphan_id, len(doc_chunks), self._chunk_threshold,
                     )
 
+        # Concurrency limiter for background embedding tasks.
+        embed_semaphore = asyncio.Semaphore(self._concurrency)
+        embed_tasks: list[asyncio.Task] = []
+
         for doc_id, doc_chunks in docs_to_summarize:
             try:
                 logger.info(
@@ -319,15 +366,50 @@ class DocumentSummaryStep:
                     title=source_meta.title,
                     embedding_type="summary",
                 )
-                context.chunks.append(
-                    Chunk(content=summary, metadata=summary_meta, chunk_index=0)
+                summary_chunk = Chunk(
+                    content=summary, metadata=summary_meta, chunk_index=0,
                 )
+                context.chunks.append(summary_chunk)
                 logger.info("Summarized document %s", doc_id)
+
+                # Incremental embedding: fire off embedding as a background
+                # task so the next document can start summarizing while this
+                # document's chunks are being embedded.
+                if self._embeddings is not None:
+                    embed_targets = doc_chunks + [summary_chunk]
+                    task = asyncio.create_task(
+                        self._embed_document_background(
+                            embed_targets, context, doc_id, embed_semaphore,
+                        )
+                    )
+                    embed_tasks.append(task)
             except Exception as exc:
                 logger.warning("Summarization failed for %s: %s", doc_id, exc)
                 context.errors.append(
                     f"DocumentSummaryStep: summarization failed for {doc_id}: {exc}"
                 )
+
+        # Await all background embedding tasks before returning.
+        for task in embed_tasks:
+            await task
+
+    async def _embed_document_background(
+        self,
+        chunks: list[Chunk],
+        context: PipelineContext,
+        doc_id: str,
+        semaphore: asyncio.Semaphore,
+    ) -> None:
+        """Embed a document's chunks in the background, bounded by semaphore."""
+        async with semaphore:
+            await self._embed_document_chunks(chunks, context, doc_id)
+            embedded_count = sum(
+                1 for c in chunks if c.embedding is not None
+            )
+            logger.info(
+                "Inline-embedded %d/%d chunks for document %s",
+                embedded_count, len(chunks), doc_id,
+            )
 
 
 # ---------------------------------------------------------------------------
