@@ -1,88 +1,77 @@
-# Plan: Pipeline Engine Safety -- Formalize Destructive Step Handling
+# Implementation Plan: Pipeline Engine Safety -- Formalize Destructive Step Handling
 
-**Story:** #37
-**Spec:** `spec.md`
+**Branch**: `story/37-pipeline-engine-safety-destructive-step-handling` | **Date**: 2026-04-14 | **Spec**: [spec.md](spec.md)
+**Input**: Feature specification from `specs/011-pipeline-destructive-step-safety/spec.md`
 
----
+## Summary
 
-## Architecture
+Add engine-level `destructive` flag support to pipeline steps. `IngestEngine.run()` skips destructive steps when prior errors exist, replacing the fragile string-matching guard in `OrphanCleanupStep`. The `PipelineStep` protocol remains unchanged -- the flag is opt-in via duck typing (`getattr` with default). `OrphanCleanupStep` declares itself destructive and its manual guard is removed.
 
-The change is localized to two files in `core/domain/pipeline/` and their corresponding test file. No new modules, no new dependencies, no configuration changes.
+## Technical Context
 
-**Before:**
+**Language/Version**: Python 3.12 (Poetry)
+**Primary Dependencies**: No new dependencies. Existing: pydantic-settings ^2.11.0
+**Storage**: ChromaDB (unchanged)
+**Testing**: pytest ^9.0 + pytest-asyncio ^1.3 (asyncio_mode = auto)
+**Target Platform**: Linux server (Docker containers, K8s)
+**Project Type**: Microkernel service
+**Performance Goals**: N/A (safety mechanism, no performance impact)
+**Constraints**: Full backward compatibility; PipelineStep protocol unchanged; sequential execution model preserved (ADR-0004)
+**Scale/Scope**: 3 files modified, ~50 lines added, ~10 lines removed
+
+## Constitution Check
+
+| # | Principle / Standard | Status | Notes |
+|---|---------------------|--------|-------|
+| P1 | AI-Native Development | PASS | Pure code change, no interactive steps |
+| P2 | SOLID Architecture | PASS | Open/Closed: new behavior via opt-in property, no protocol modification. Single Responsibility: engine handles gating, steps declare intent |
+| P3 | No Vendor Lock-in | N/A | No provider changes |
+| P4 | Optimised Feedback Loops | PASS | 7 new meaningful tests covering gating behavior, metrics, and message format |
+| P5 | Best Available Infrastructure | N/A | No CI changes |
+| P6 | SDD | PASS | Full SDD artifacts produced |
+| P7 | No Filling Tests | PASS | Every test guards a specific behavioral contract or boundary condition |
+| P8 | ADR | PASS | No port/contract changes. No new external dependencies |
+| AS:Microkernel | Microkernel Architecture | PASS | Change localized to core domain logic. No cross-plugin coupling |
+| AS:Hexagonal | Hexagonal Boundaries | PASS | No port or adapter changes |
+| AS:Plugin | Plugin Contract | PASS | PluginContract unchanged. Ingest plugins unaffected |
+| AS:Domain | Domain Logic Isolation | PASS | Engine and step changes are internal to core/domain/pipeline/ |
+| AS:Simplicity | Simplicity Over Speculation | PASS | Single boolean flag + getattr. No phase model, no new protocols, no abstractions |
+| AS:Async | Async-First Design | PASS | No new sync calls |
+
+**Gate result**: PASS -- no violations.
+
+## Project Structure
+
+### Documentation (this feature)
+
+```text
+specs/011-pipeline-destructive-step-safety/
+├── spec.md
+├── plan.md
+├── research.md
+├── data-model.md
+├── quickstart.md
+├── tasks.md
+├── clarifications.md
+└── checklists/
+    └── requirements.md
 ```
-IngestEngine.run() -> for step in steps: step.execute(context)
-OrphanCleanupStep.execute() -> manual string check: any(e.startswith("StoreStep:") ...)
+
+### Source Code (repository root)
+
+```text
+core/
+└── domain/
+    └── pipeline/
+        ├── engine.py      # Add destructive-step gating logic in IngestEngine.run()
+        └── steps.py       # Add destructive property to OrphanCleanupStep; remove string guard
+
+tests/
+└── core/
+    └── domain/
+        └── test_pipeline_steps.py  # 7 new tests + 2 updated tests
 ```
 
-**After:**
-```
-IngestEngine.run() -> for step in steps:
-    if getattr(step, 'destructive', False) and context.errors:
-        skip + log + record metrics
-    else:
-        step.execute(context)
-OrphanCleanupStep -> destructive = True (property); execute() has NO guard
-```
+## Complexity Tracking
 
-## Affected Modules
-
-| File | Change Type | Description |
-|------|-------------|-------------|
-| `core/domain/pipeline/engine.py` | Modify | Add destructive-step gating logic in `IngestEngine.run()` |
-| `core/domain/pipeline/steps.py` | Modify | Add `destructive` property to `OrphanCleanupStep`; remove string-matching guard |
-| `tests/core/domain/test_pipeline_steps.py` | Modify | Update `test_skips_cleanup_on_store_step_errors` to test engine-level gating; add new engine-level tests |
-
-## Data Model Deltas
-
-None. `PipelineContext`, `StepMetrics`, `IngestResult` are unchanged. The `PipelineStep` protocol is not modified (we use `getattr` duck-typing).
-
-## Interface Contracts
-
-### PipelineStep Protocol (unchanged)
-```python
-@runtime_checkable
-class PipelineStep(Protocol):
-    @property
-    def name(self) -> str: ...
-    async def execute(self, context: PipelineContext) -> None: ...
-```
-
-### Destructive Step Convention (new, opt-in)
-Steps that want engine-level error gating declare:
-```python
-@property
-def destructive(self) -> bool:
-    return True
-```
-
-The engine checks `getattr(step, 'destructive', False)`. Steps without this property default to `False` (non-destructive).
-
-### IngestEngine.run() Contract Change
-When `getattr(step, 'destructive', False)` is `True` and `len(context.errors) > 0`:
-- Step is NOT executed
-- A warning is logged: `"Skipping destructive step '%s' due to %d prior error(s)"`
-- An error is appended: `"{step.name}: skipped (destructive step gated by {N} prior error(s))"`
-- Metrics are recorded with `duration=0.0` and `error_count=1`
-
-## Test Strategy
-
-1. **Unit: Engine destructive gating** -- New test class `TestDestructiveStepGating` in test_pipeline_steps.py:
-   - Test engine skips destructive step when context has errors
-   - Test engine runs destructive step when context has no errors
-   - Test non-destructive steps still run even when errors exist
-   - Test metrics recorded for skipped destructive steps
-   - Test skip message format in context.errors
-
-2. **Unit: OrphanCleanupStep.destructive property** -- New test in `TestOrphanCleanupStep`:
-   - `assert OrphanCleanupStep(...).destructive is True`
-
-3. **Update: test_skips_cleanup_on_store_step_errors** -- Change from testing step-level string guard to testing engine-level gating (run through IngestEngine with a failing StoreStep followed by OrphanCleanupStep).
-
-4. **Regression: all existing tests** -- Must pass without changes to non-destructive steps.
-
-## Rollout Notes
-
-- Zero-config change. No environment variables, no feature flags.
-- Backward compatible. Existing pipeline step implementations continue to work without modification.
-- The behavior change is strictly safer: destructive steps are now gated by any prior error, not just errors matching a specific string pattern.
+No constitution violations to justify.
