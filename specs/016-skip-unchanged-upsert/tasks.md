@@ -57,6 +57,10 @@
 **Phase 1**: T001, T002, T003 are sequential (same file, same function).
 **Phase 2**: T004, T005, T006, T007 are all parallel (independent test methods in the same file, no data dependencies).
 
+```text
+T001-T003 (implementation) --> T004, T005, T006, T007 (tests, parallel)
+```
+
 ---
 
 ## Implementation Strategy

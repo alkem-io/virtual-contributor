@@ -28,7 +28,7 @@ As a platform operator running incremental ingests, I want StoreStep to skip wri
 
 ### Edge Cases
 
-- When `content_hash` is `None` (summary/BoK chunks), the chunk passes the filter naturally because `None not in set()` is always `True`.
+- When `content_hash` is `None` (summary/BoK chunks), the chunk passes the filter because `unchanged_chunk_hashes` is populated with chunk hash strings, so `None` does not match any unchanged hash.
 - When `change_detection_ran` is `False`, `unchanged_chunk_hashes` is empty, so the filter has no effect and all embedded chunks are stored.
 - When all chunks are unchanged, `chunks_stored` is 0 and no upsert calls are made.
 - When a chunk has no embedding AND is in `unchanged_chunk_hashes`, both filters exclude it; the no-embedding error count correctly counts only that chunk (not double-counted).
