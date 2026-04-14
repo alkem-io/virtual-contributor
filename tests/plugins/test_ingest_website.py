@@ -172,12 +172,97 @@ class TestIngestWebsitePlugin:
         assert plugin._knowledge_store.deleted == []
         assert "example.com-knowledge" in plugin._knowledge_store.collections
 
-    async def test_unsupported_content_skip(self, plugin):
-        """Empty crawl results should still succeed."""
+    async def test_empty_crawl_runs_cleanup(self):
+        """When crawl returns [], cleanup deletes pre-existing chunks."""
+        store = MockKnowledgeStorePort()
+        collection = "example.com-knowledge"
+        await store.ingest(
+            collection=collection,
+            documents=["old website content"],
+            metadatas=[{"documentId": "https://example.com/old", "embeddingType": "chunk", "source": "s", "type": "t", "title": "T", "chunkIndex": 0}],
+            ids=["old-hash-1"],
+            embeddings=[[0.1] * 384],
+        )
+        assert len(store.collections[collection]) == 1
+
+        plugin = IngestWebsitePlugin(
+            llm=MockLLMPort(),
+            embeddings=MockEmbeddingsPort(),
+            knowledge_store=store,
+        )
+
+        event = make_ingest_website()
+        with patch("plugins.ingest_website.plugin.crawl", return_value=[]):
+            result = await plugin.handle(event)
+
+        assert isinstance(result, IngestWebsiteResult)
+        assert result.result == "success"
+        # All pre-existing chunks should have been deleted
+        assert len(store.collections.get(collection, [])) == 0
+
+    async def test_empty_extract_runs_cleanup(self):
+        """When crawl returns pages but extraction yields nothing, cleanup runs."""
+        store = MockKnowledgeStorePort()
+        collection = "example.com-knowledge"
+        await store.ingest(
+            collection=collection,
+            documents=["stale content"],
+            metadatas=[{"documentId": "https://example.com/stale", "embeddingType": "chunk", "source": "s", "type": "t", "title": "T", "chunkIndex": 0}],
+            ids=["stale-hash"],
+            embeddings=[[0.1] * 384],
+        )
+
+        plugin = IngestWebsitePlugin(
+            llm=MockLLMPort(),
+            embeddings=MockEmbeddingsPort(),
+            knowledge_store=store,
+        )
+
+        event = make_ingest_website()
+        # Crawl returns pages, but all pages have empty/whitespace text
+        empty_pages = [{"url": "https://example.com/empty", "html": "<html><body>   </body></html>"}]
+        with patch("plugins.ingest_website.plugin.crawl", return_value=empty_pages):
+            result = await plugin.handle(event)
+
+        assert result.result == "success"
+        assert len(store.collections.get(collection, [])) == 0
+
+    async def test_empty_crawl_returns_success(self, plugin):
+        """Empty-but-successful crawl returns IngestionResult.SUCCESS."""
         event = make_ingest_website()
         with patch("plugins.ingest_website.plugin.crawl", return_value=[]):
             result = await plugin.handle(event)
         assert result.result == "success"
+
+    async def test_crawl_failure_no_cleanup(self):
+        """When crawl raises, return failure without running cleanup."""
+        store = MockKnowledgeStorePort()
+        collection = "example.com-knowledge"
+        await store.ingest(
+            collection=collection,
+            documents=["preserved content"],
+            metadatas=[{"documentId": "https://example.com/page", "embeddingType": "chunk", "source": "s", "type": "t", "title": "T", "chunkIndex": 0}],
+            ids=["hash-1"],
+            embeddings=[[0.1] * 384],
+        )
+
+        plugin = IngestWebsitePlugin(
+            llm=MockLLMPort(),
+            embeddings=MockEmbeddingsPort(),
+            knowledge_store=store,
+        )
+
+        event = make_ingest_website()
+        with patch(
+            "plugins.ingest_website.plugin.crawl",
+            side_effect=RuntimeError("Connection timeout"),
+        ):
+            result = await plugin.handle(event)
+
+        assert result.result == "failure"
+        assert "Connection timeout" in result.error
+        # Store should be untouched — no cleanup ran
+        assert len(store.collections[collection]) == 1
 
     async def test_startup_shutdown(self, plugin):
         await plugin.startup()
