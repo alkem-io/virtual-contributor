@@ -1,6 +1,6 @@
 # Clarifications
 
-**Iteration count:** 1
+**Iteration count:** 2
 
 ---
 
@@ -16,7 +16,7 @@
 
 **Question:** When the engine skips a destructive step, what format should the error message use? The existing convention in `OrphanCleanupStep` uses `"OrphanCleanupStep: skipped cleanup because earlier storage writes failed"`. Should the engine-level message follow the same `{StepName}: ...` pattern?
 
-**Chosen answer:** Yes. The engine-level message will use the format `"{step.name}: skipped (destructive step gated by prior errors)"`. This is consistent with how `IngestEngine.run()` already formats caught exception messages as `f"{step.name}: {exc}"`.
+**Chosen answer:** Yes. The engine-level message will use the format `"{step.name}: skipped (destructive step gated by {N} prior error(s))"`, where `{N}` is the count of prior errors. This is consistent with how `IngestEngine.run()` already formats caught exception messages as `f"{step.name}: {exc}"`.
 
 **Rationale:** Consistent error message format across the engine. Using `step.name` (the property) rather than the class name keeps messages aligned with what appears in metrics.
 

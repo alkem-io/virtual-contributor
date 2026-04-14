@@ -30,13 +30,13 @@ Expected: 9 tests pass (7 new gating tests + 1 property test + 1 updated integra
 
 When an ingest pipeline encounters an error (e.g., storage write failure), the engine logs:
 
-```
+```text
 WARNING: Skipping destructive step 'orphan_cleanup' due to 1 prior error(s)
 ```
 
 And `IngestResult.errors` contains:
 
-```
+```text
 orphan_cleanup: skipped (destructive step gated by 1 prior error(s))
 ```
 
