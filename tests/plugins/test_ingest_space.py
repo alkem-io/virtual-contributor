@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -184,3 +184,90 @@ class TestIngestSpacePlugin:
         assert result.error is not None
         # Store should be untouched — no cleanup ran
         assert len(store.collections[collection]) == 1
+
+
+class TestIngestSpaceSummarizationBehavior:
+    """Verify summarization step inclusion based on summarize_enabled and concurrency."""
+
+    async def _run_with_mock_graphql(self, plugin):
+        """Helper to run plugin with a mocked graphql client and space reader."""
+        from core.domain.ingest_pipeline import Document, DocumentMetadata
+
+        mock_docs = [
+            Document(
+                content="Test space content for summarization.",
+                metadata=DocumentMetadata(
+                    document_id="space-1",
+                    source="graphql",
+                    type="knowledge",
+                    title="Test Space",
+                ),
+            ),
+        ]
+        event = make_ingest_body_of_knowledge()
+
+        with patch("plugins.ingest_space.space_reader.read_space_tree", return_value=mock_docs), \
+             patch("plugins.ingest_space.plugin.IngestEngine") as mock_engine:
+            import asyncio
+            mock_engine.return_value.run = lambda *a, **kw: asyncio.coroutine(
+                lambda: MagicMock(success=True, errors=[])
+            )()
+            await plugin.handle(event)
+
+        return mock_engine
+
+    async def test_summarize_enabled_with_concurrency(self):
+        """When summarize_enabled=True and concurrency>0, summary steps are included."""
+        plugin = IngestSpacePlugin(
+            llm=MockLLMPort(),
+            embeddings=MockEmbeddingsPort(),
+            knowledge_store=MockKnowledgeStorePort(),
+            graphql_client=MagicMock(),
+            summarize_enabled=True,
+            summarize_concurrency=8,
+        )
+        mock_engine = await self._run_with_mock_graphql(plugin)
+
+        call_kwargs = mock_engine.call_args
+        steps = call_kwargs.kwargs.get("steps") or call_kwargs.args[0] if call_kwargs.args else call_kwargs.kwargs["steps"]
+        step_names = [type(s).__name__ for s in steps]
+        assert "DocumentSummaryStep" in step_names
+        assert "BodyOfKnowledgeSummaryStep" in step_names
+
+    async def test_summarize_enabled_with_zero_concurrency(self):
+        """When summarize_enabled=True and concurrency=0, summary steps included with concurrency=1."""
+        plugin = IngestSpacePlugin(
+            llm=MockLLMPort(),
+            embeddings=MockEmbeddingsPort(),
+            knowledge_store=MockKnowledgeStorePort(),
+            graphql_client=MagicMock(),
+            summarize_enabled=True,
+            summarize_concurrency=0,
+        )
+        assert plugin._summarize_concurrency == 1  # 0 maps to 1
+
+        mock_engine = await self._run_with_mock_graphql(plugin)
+
+        call_kwargs = mock_engine.call_args
+        steps = call_kwargs.kwargs.get("steps") or call_kwargs.args[0] if call_kwargs.args else call_kwargs.kwargs["steps"]
+        step_names = [type(s).__name__ for s in steps]
+        assert "DocumentSummaryStep" in step_names
+        assert "BodyOfKnowledgeSummaryStep" in step_names
+
+    async def test_summarize_disabled(self):
+        """When summarize_enabled=False, no summary steps are included."""
+        plugin = IngestSpacePlugin(
+            llm=MockLLMPort(),
+            embeddings=MockEmbeddingsPort(),
+            knowledge_store=MockKnowledgeStorePort(),
+            graphql_client=MagicMock(),
+            summarize_enabled=False,
+            summarize_concurrency=8,
+        )
+        mock_engine = await self._run_with_mock_graphql(plugin)
+
+        call_kwargs = mock_engine.call_args
+        steps = call_kwargs.kwargs.get("steps") or call_kwargs.args[0] if call_kwargs.args else call_kwargs.kwargs["steps"]
+        step_names = [type(s).__name__ for s in steps]
+        assert "DocumentSummaryStep" not in step_names
+        assert "BodyOfKnowledgeSummaryStep" not in step_names

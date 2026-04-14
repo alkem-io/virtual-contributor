@@ -44,6 +44,8 @@ class IngestSpacePlugin:
         summarize_llm: LLMPort | None = None,
         bok_llm: LLMPort | None = None,
         chunk_threshold: int = 4,
+        summarize_enabled: bool = True,
+        summarize_concurrency: int = 8,
     ) -> None:
         self._llm = llm
         self._embeddings = embeddings
@@ -52,6 +54,8 @@ class IngestSpacePlugin:
         self._summarize_llm = summarize_llm
         self._bok_llm = bok_llm
         self._chunk_threshold = chunk_threshold
+        self._summarize_enabled = summarize_enabled
+        self._summarize_concurrency = max(1, summarize_concurrency)
 
     async def startup(self) -> None:
         logger.info("IngestSpacePlugin started")
@@ -95,20 +99,27 @@ class IngestSpacePlugin:
 
             # Run ingest pipeline with ingest-space specific settings
             summary_llm = self._summarize_llm or self._llm
-            engine = IngestEngine(steps=[
+            steps: list = [
                 ChunkStep(chunk_size=9000, chunk_overlap=500),
                 ContentHashStep(),
                 ChangeDetectionStep(knowledge_store_port=self._knowledge_store),
-                DocumentSummaryStep(
+            ]
+            if self._summarize_enabled:
+                steps.append(DocumentSummaryStep(
                     llm_port=summary_llm,
+                    concurrency=self._summarize_concurrency,
                     chunk_threshold=self._chunk_threshold,
                     embeddings_port=self._embeddings,
-                ),
-                BodyOfKnowledgeSummaryStep(llm_port=self._bok_llm or summary_llm),
+                ))
+                steps.append(BodyOfKnowledgeSummaryStep(
+                    llm_port=self._bok_llm or summary_llm,
+                ))
+            steps.extend([
                 EmbedStep(embeddings_port=self._embeddings),
                 StoreStep(knowledge_store_port=self._knowledge_store),
                 OrphanCleanupStep(knowledge_store_port=self._knowledge_store),
             ])
+            engine = IngestEngine(steps=steps)
             result = await engine.run(documents, collection_name)
 
             return IngestBodyOfKnowledgeResult(
