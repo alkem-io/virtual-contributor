@@ -278,7 +278,7 @@ class BaseConfig(BaseSettings):
     # Ingest pipeline
     chunk_size: int = 2000
     chunk_overlap: int = 400
-    batch_size: int = 20
+    ingest_batch_size: int = 5
     summary_length: int = 10000
     summarize_concurrency: int = 8
     summarize_enabled: bool = True

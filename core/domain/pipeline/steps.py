@@ -191,7 +191,8 @@ class ChangeDetectionStep:
                     existing_doc_ids.add(doc_id_val)
 
         # Detect removed documents
-        context.removed_document_ids = existing_doc_ids - current_doc_ids
+        all_ids = context.all_document_ids if context.all_document_ids else current_doc_ids
+        context.removed_document_ids = existing_doc_ids - all_ids
 
         # Per-document change detection
         for doc_id, doc_chunks in chunks_by_doc.items():
@@ -492,12 +493,26 @@ class BodyOfKnowledgeSummaryStep:
         ):
             return
 
-        # Collect unique document IDs from raw chunks (exclude summaries)
-        seen_doc_ids: list[str] = []
-        for chunk in context.chunks:
-            doc_id = chunk.metadata.document_id
-            if doc_id not in seen_doc_ids and chunk.metadata.embedding_type != "summary":
-                seen_doc_ids.append(doc_id)
+        # Collect unique document IDs and chunk content by doc.
+        # In batched mode, raw_chunks_by_doc is pre-populated from batch
+        # contexts and chunks may be empty; use documents list for ordering.
+        if context.raw_chunks_by_doc:
+            seen_doc_ids: list[str] = list(dict.fromkeys(
+                doc.metadata.document_id
+                for doc in context.documents
+                if doc.metadata.document_id in context.raw_chunks_by_doc
+            ))
+            chunks_by_doc = context.raw_chunks_by_doc
+        else:
+            seen_doc_ids = []
+            for chunk in context.chunks:
+                doc_id = chunk.metadata.document_id
+                if doc_id not in seen_doc_ids and chunk.metadata.embedding_type != "summary":
+                    seen_doc_ids.append(doc_id)
+            chunks_by_doc = {}
+            for chunk in context.chunks:
+                if chunk.metadata.embedding_type != "summary":
+                    chunks_by_doc.setdefault(chunk.metadata.document_id, []).append(chunk.content)
 
         if not seen_doc_ids:
             # Corpus is empty — if documents were removed, mark the BoK
@@ -511,11 +526,6 @@ class BodyOfKnowledgeSummaryStep:
 
         # For each doc: prefer document_summaries, else concatenate raw chunk content
         sections: list[str] = []
-        chunks_by_doc: dict[str, list[str]] = {}
-        for chunk in context.chunks:
-            if chunk.metadata.embedding_type != "summary":
-                chunks_by_doc.setdefault(chunk.metadata.document_id, []).append(chunk.content)
-
         for doc_id in seen_doc_ids:
             if doc_id in context.document_summaries:
                 sections.append(context.document_summaries[doc_id])

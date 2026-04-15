@@ -258,6 +258,8 @@ async def _run(config: BaseConfig) -> None:
         deps["summarize_enabled"] = config.summarize_enabled
     if "summarize_concurrency" in sig.parameters:
         deps["summarize_concurrency"] = config.summarize_concurrency
+    if "ingest_batch_size" in sig.parameters:
+        deps["ingest_batch_size"] = config.ingest_batch_size
     plugin = plugin_class(**deps)
 
     # Plugin lifecycle: startup
@@ -460,15 +462,25 @@ async def _run(config: BaseConfig) -> None:
 
 
 def main() -> None:
+    import concurrent.futures
+
     config = BaseConfig()
     setup_logging(level=config.log_level, plugin_type=config.plugin_type)
     logger.info("Starting virtual-contributor engine with plugin: %s", config.plugin_type)
     _log_config(config)
 
+    # Expand default thread pool to prevent deadlocks when multiple
+    # concurrent pipelines use asyncio.to_thread for sync LLM calls
+    loop = asyncio.new_event_loop()
+    loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(max_workers=32))
+    asyncio.set_event_loop(loop)
+
     try:
-        asyncio.run(_run(config))
+        loop.run_until_complete(_run(config))
     except KeyboardInterrupt:
         pass
+    finally:
+        loop.close()
 
 
 if __name__ == "__main__":

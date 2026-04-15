@@ -136,7 +136,9 @@ async def crawl(
                     continue
 
                 html = response.text
-                results.append({"url": normalized, "html": html})
+                # Use the final URL after redirects (e.g. /docs → /docs/en-US)
+                final_url = _normalize_url(str(response.url))
+                results.append({"url": final_url, "html": html})
 
                 # Extract links
                 soup = BeautifulSoup(html, "html.parser")

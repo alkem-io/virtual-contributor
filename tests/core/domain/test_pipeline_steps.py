@@ -2160,3 +2160,494 @@ class TestDocumentSummaryStepConcurrency:
             if c.metadata.embedding_type == "summary"
         ]
         assert len(summary_doc_ids) == len(set(summary_doc_ids))
+
+
+# ---------------------------------------------------------------------------
+# Batched IngestEngine tests
+# ---------------------------------------------------------------------------
+
+class TestIngestEngineBatched:
+
+    async def test_constructor_rejects_both_steps_and_batch_steps(self):
+        import pytest
+        with pytest.raises(ValueError, match="Cannot specify both"):
+            IngestEngine(steps=[], batch_steps=[], finalize_steps=[])
+
+    async def test_constructor_requires_finalize_with_batch(self):
+        import pytest
+        with pytest.raises(ValueError, match="finalize_steps"):
+            IngestEngine(batch_steps=[])
+
+    async def test_constructor_requires_steps_or_batch(self):
+        import pytest
+        with pytest.raises(ValueError, match="Must specify"):
+            IngestEngine()
+
+    async def test_batch_step_sequencing(self):
+        """Verify batch steps run per batch, then finalize steps run once."""
+        order = []
+
+        class RecordingStep:
+            def __init__(self, label):
+                self._label = label
+
+            @property
+            def name(self):
+                return self._label
+
+            async def execute(self, context):
+                n_docs = len(context.documents)
+                order.append(f"{self._label}({n_docs})")
+
+        docs = [_make_doc(doc_id=f"d{i}") for i in range(4)]
+
+        engine = IngestEngine(
+            batch_steps=[RecordingStep("batch")],
+            finalize_steps=[RecordingStep("final")],
+            batch_size=2,
+        )
+        await engine.run(docs, "test")
+
+        assert order == ["batch(2)", "batch(2)", "final(4)"]
+
+    async def test_batch_context_isolation(self):
+        """Each batch gets its own context with only its documents."""
+        seen_doc_ids: list[set[str]] = []
+
+        class DocCapture:
+            @property
+            def name(self):
+                return "capture"
+
+            async def execute(self, context):
+                seen_doc_ids.append({d.metadata.document_id for d in context.documents})
+
+        docs = [_make_doc(doc_id=f"d{i}") for i in range(3)]
+        engine = IngestEngine(
+            batch_steps=[DocCapture()],
+            finalize_steps=[],
+            batch_size=2,
+        )
+        await engine.run(docs, "test")
+
+        assert seen_doc_ids == [{"d0", "d1"}, {"d2"}]
+
+    async def test_all_document_ids_propagated_to_batches(self):
+        """Each batch context has the full set of document IDs."""
+        captured_ids: list[set[str]] = []
+
+        class IDCapture:
+            @property
+            def name(self):
+                return "capture"
+
+            async def execute(self, context):
+                captured_ids.append(set(context.all_document_ids))
+
+        docs = [_make_doc(doc_id=f"d{i}") for i in range(4)]
+        engine = IngestEngine(
+            batch_steps=[IDCapture()],
+            finalize_steps=[],
+            batch_size=2,
+        )
+        await engine.run(docs, "test")
+
+        all_ids = {"d0", "d1", "d2", "d3"}
+        assert captured_ids == [all_ids, all_ids]
+
+    async def test_results_accumulated_across_batches(self):
+        """Counters and errors from all batches are accumulated."""
+
+        class CountingStep:
+            @property
+            def name(self):
+                return "count"
+
+            async def execute(self, context):
+                context.chunks_stored += 10
+                context.chunks_skipped += 1
+                context.errors.append("batch-err")
+
+        engine = IngestEngine(
+            batch_steps=[CountingStep()],
+            finalize_steps=[],
+            batch_size=2,
+        )
+        result = await engine.run([_make_doc(doc_id=f"d{i}") for i in range(4)], "test")
+
+        assert result.chunks_stored == 20
+        assert result.chunks_skipped == 2
+        assert len(result.errors) == 2
+
+    async def test_document_summaries_accumulated(self):
+        """document_summaries from multiple batches merge into finalize context."""
+        finalize_summaries: dict[str, str] = {}
+
+        class SummaryStep:
+            @property
+            def name(self):
+                return "summarize"
+
+            async def execute(self, context):
+                for doc in context.documents:
+                    context.document_summaries[doc.metadata.document_id] = f"summary-{doc.metadata.document_id}"
+
+        class CaptureStep:
+            @property
+            def name(self):
+                return "capture"
+
+            async def execute(self, context):
+                finalize_summaries.update(context.document_summaries)
+
+        docs = [_make_doc(doc_id=f"d{i}") for i in range(3)]
+        engine = IngestEngine(
+            batch_steps=[SummaryStep()],
+            finalize_steps=[CaptureStep()],
+            batch_size=2,
+        )
+        await engine.run(docs, "test")
+
+        assert finalize_summaries == {"d0": "summary-d0", "d1": "summary-d1", "d2": "summary-d2"}
+
+    async def test_raw_chunks_by_doc_accumulated(self):
+        """raw_chunks_by_doc is populated from batch chunks for finalize."""
+        captured: dict[str, list[str]] = {}
+
+        class CaptureStep:
+            @property
+            def name(self):
+                return "capture"
+
+            async def execute(self, context):
+                captured.update(context.raw_chunks_by_doc)
+
+        docs = [_make_doc(doc_id="d0", content="Hello world")]
+        engine = IngestEngine(
+            batch_steps=[ChunkStep(chunk_size=5000)],
+            finalize_steps=[CaptureStep()],
+            batch_size=5,
+        )
+        await engine.run(docs, "test")
+
+        assert "d0" in captured
+        assert len(captured["d0"]) > 0
+
+    async def test_finalize_context_has_empty_chunks(self):
+        """Finalize context starts with empty chunks list."""
+        finalize_chunks: list = []
+
+        class PreCaptureStep:
+            @property
+            def name(self):
+                return "pre-capture"
+
+            async def execute(self, context):
+                finalize_chunks.extend(context.chunks)
+
+        docs = [_make_doc(doc_id="d0")]
+        engine = IngestEngine(
+            batch_steps=[ChunkStep(chunk_size=100)],
+            finalize_steps=[PreCaptureStep()],
+            batch_size=5,
+        )
+        await engine.run(docs, "test")
+
+        # finalize_chunks captured the state BEFORE any finalize step added chunks
+        assert finalize_chunks == []
+
+    async def test_finalize_context_has_all_documents(self):
+        """Finalize context has all original documents."""
+        finalize_doc_count = [0]
+
+        class CaptureStep:
+            @property
+            def name(self):
+                return "capture"
+
+            async def execute(self, context):
+                finalize_doc_count[0] = len(context.documents)
+
+        docs = [_make_doc(doc_id=f"d{i}") for i in range(7)]
+        engine = IngestEngine(
+            batch_steps=[],
+            finalize_steps=[CaptureStep()],
+            batch_size=3,
+        )
+        await engine.run(docs, "test")
+
+        assert finalize_doc_count[0] == 7
+
+    async def test_metrics_keyed_with_batch_index(self):
+        """Batch step metrics use '{name}_batch_{i}' keys."""
+        captured_metrics: dict = {}
+
+        class MetricCapture:
+            @property
+            def name(self):
+                return "capture"
+
+            async def execute(self, context):
+                captured_metrics.update(context.metrics)
+
+        class SimpleStep:
+            @property
+            def name(self):
+                return "step"
+
+            async def execute(self, context):
+                pass
+
+        docs = [_make_doc(doc_id=f"d{i}") for i in range(4)]
+        engine = IngestEngine(
+            batch_steps=[SimpleStep()],
+            finalize_steps=[MetricCapture()],
+            batch_size=2,
+        )
+        await engine.run(docs, "test")
+
+        assert "step_batch_0" in captured_metrics
+        assert "step_batch_1" in captured_metrics
+
+    async def test_error_in_one_batch_does_not_block_others(self):
+        """A failing step in batch 1 doesn't prevent batch 2 from running."""
+        batch_count = [0]
+
+        class FailOddBatch:
+            @property
+            def name(self):
+                return "maybe_fail"
+
+            async def execute(self, context):
+                batch_count[0] += 1
+                if batch_count[0] == 1:
+                    raise RuntimeError("Batch 0 exploded")
+
+        docs = [_make_doc(doc_id=f"d{i}") for i in range(4)]
+        engine = IngestEngine(
+            batch_steps=[FailOddBatch()],
+            finalize_steps=[],
+            batch_size=2,
+        )
+        result = await engine.run(docs, "test")
+
+        assert batch_count[0] == 2  # Both batches ran
+        assert len(result.errors) == 1
+        assert "Batch 0 exploded" in result.errors[0]
+
+    async def test_destructive_finalize_gated_by_batch_errors(self):
+        """Finalize destructive steps are skipped when batch errors exist."""
+        class FailingStep:
+            @property
+            def name(self):
+                return "fail"
+
+            async def execute(self, context):
+                raise RuntimeError("boom")
+
+        class DestructiveStep:
+            @property
+            def name(self):
+                return "destroy"
+
+            @property
+            def destructive(self):
+                return True
+
+            async def execute(self, context):
+                context.chunks_deleted += 99
+
+        docs = [_make_doc(doc_id="d0")]
+        engine = IngestEngine(
+            batch_steps=[FailingStep()],
+            finalize_steps=[DestructiveStep()],
+            batch_size=5,
+        )
+        result = await engine.run(docs, "test")
+
+        assert result.chunks_deleted == 0  # Destructive step was skipped
+
+    async def test_backward_compat_sequential_unchanged(self):
+        """IngestEngine(steps=[...]) still works identically."""
+        embeddings = MockEmbeddingsPort()
+        store = MockKnowledgeStorePort()
+
+        engine = IngestEngine(steps=[
+            ChunkStep(chunk_size=100, chunk_overlap=10),
+            EmbedStep(embeddings_port=embeddings),
+            StoreStep(knowledge_store_port=store),
+        ])
+        result = await engine.run([_make_doc()], "compat-test")
+
+        assert result.success is True
+        assert result.chunks_stored > 0
+        assert "compat-test" in store.collections
+
+
+# ---------------------------------------------------------------------------
+# Batched ChangeDetectionStep tests
+# ---------------------------------------------------------------------------
+
+class TestChangeDetectionStepBatched:
+
+    async def test_no_false_removals_with_all_document_ids(self):
+        """When all_document_ids is set, docs outside the batch aren't flagged as removed."""
+        store = MockKnowledgeStorePort()
+        # Pre-populate store with doc-A (simulating previous ingest)
+        await store.ingest(
+            collection="test",
+            documents=["existing content"],
+            metadatas=[{"documentId": "doc-A", "embeddingType": "chunk", "source": "s", "type": "t", "title": "T", "chunkIndex": 0}],
+            ids=["hash-A"],
+            embeddings=[[0.1] * 384],
+        )
+
+        # Batch context has only doc-B, but all_document_ids includes both
+        ctx = _make_context(docs=[_make_doc(doc_id="doc-B")], collection="test")
+        ctx.all_document_ids = {"doc-A", "doc-B"}
+
+        # Chunk doc-B so ChangeDetection has something to work with
+        chunk_step = ChunkStep(chunk_size=5000)
+        await chunk_step.execute(ctx)
+        hash_step = ContentHashStep()
+        await hash_step.execute(ctx)
+
+        step = ChangeDetectionStep(knowledge_store_port=store)
+        await step.execute(ctx)
+
+        assert "doc-A" not in ctx.removed_document_ids
+
+    async def test_fallback_to_current_doc_ids_when_all_empty(self):
+        """When all_document_ids is empty, uses current batch docs (old behavior)."""
+        store = MockKnowledgeStorePort()
+        await store.ingest(
+            collection="test",
+            documents=["old content"],
+            metadatas=[{"documentId": "doc-old", "embeddingType": "chunk", "source": "s", "type": "t", "title": "T", "chunkIndex": 0}],
+            ids=["hash-old"],
+            embeddings=[[0.1] * 384],
+        )
+
+        ctx = _make_context(docs=[_make_doc(doc_id="doc-new")], collection="test")
+        # all_document_ids is empty (default)
+
+        chunk_step = ChunkStep(chunk_size=5000)
+        await chunk_step.execute(ctx)
+        hash_step = ContentHashStep()
+        await hash_step.execute(ctx)
+
+        step = ChangeDetectionStep(knowledge_store_port=store)
+        await step.execute(ctx)
+
+        assert "doc-old" in ctx.removed_document_ids
+
+    async def test_actual_removal_detected_with_all_document_ids(self):
+        """A doc truly absent from all_document_ids is correctly flagged."""
+        store = MockKnowledgeStorePort()
+        await store.ingest(
+            collection="test",
+            documents=["gone content"],
+            metadatas=[{"documentId": "doc-gone", "embeddingType": "chunk", "source": "s", "type": "t", "title": "T", "chunkIndex": 0}],
+            ids=["hash-gone"],
+            embeddings=[[0.1] * 384],
+        )
+
+        ctx = _make_context(docs=[_make_doc(doc_id="doc-new")], collection="test")
+        ctx.all_document_ids = {"doc-new"}  # doc-gone not included
+
+        chunk_step = ChunkStep(chunk_size=5000)
+        await chunk_step.execute(ctx)
+        hash_step = ContentHashStep()
+        await hash_step.execute(ctx)
+
+        step = ChangeDetectionStep(knowledge_store_port=store)
+        await step.execute(ctx)
+
+        assert "doc-gone" in ctx.removed_document_ids
+
+
+# ---------------------------------------------------------------------------
+# Batched BodyOfKnowledgeSummaryStep tests
+# ---------------------------------------------------------------------------
+
+class TestBoKSummaryStepBatchedMode:
+
+    async def test_uses_raw_chunks_by_doc(self):
+        """When raw_chunks_by_doc is populated, BoK uses it instead of chunks."""
+        llm = MockLLMPort()
+        ctx = PipelineContext(
+            collection_name="test",
+            documents=[_make_doc(doc_id="d0"), _make_doc(doc_id="d1")],
+            raw_chunks_by_doc={
+                "d0": ["content from d0 chunk 1", "content from d0 chunk 2"],
+                "d1": ["content from d1"],
+            },
+        )
+
+        step = BodyOfKnowledgeSummaryStep(llm_port=llm)
+        await step.execute(ctx)
+
+        # BoK chunk should be generated
+        assert len(ctx.chunks) == 1
+        assert ctx.chunks[0].metadata.embedding_type == "summary"
+        assert ctx.chunks[0].metadata.document_id == "body-of-knowledge-summary"
+        assert len(llm.calls) > 0
+
+    async def test_prefers_document_summaries_over_raw_chunks(self):
+        """When both exist for a doc, document_summaries is used."""
+        llm = MockLLMPort()
+        ctx = PipelineContext(
+            collection_name="test",
+            documents=[_make_doc(doc_id="d0")],
+            raw_chunks_by_doc={"d0": ["raw content"]},
+            document_summaries={"d0": "pre-computed summary of d0"},
+        )
+
+        step = BodyOfKnowledgeSummaryStep(llm_port=llm)
+        await step.execute(ctx)
+
+        # The LLM received the summary, not the raw content
+        assert len(llm.calls) > 0
+        last_call = llm.calls[-1]
+        human_msg = [m for m in last_call if m.get("role") == "human"][0]
+        assert "pre-computed summary of d0" in human_msg["content"]
+
+    async def test_fallback_to_chunks_when_raw_chunks_empty(self):
+        """When raw_chunks_by_doc is empty, existing behavior via chunks."""
+        llm = MockLLMPort()
+        ctx = PipelineContext(
+            collection_name="test",
+            documents=[_make_doc(doc_id="d0")],
+            chunks=[
+                Chunk(
+                    content="chunk content",
+                    metadata=DocumentMetadata(
+                        document_id="d0", source="s", type="t",
+                        title="T", embedding_type="chunk",
+                    ),
+                    chunk_index=0,
+                ),
+            ],
+        )
+
+        step = BodyOfKnowledgeSummaryStep(llm_port=llm)
+        await step.execute(ctx)
+
+        # BoK should still be generated from chunks
+        bok_chunks = [c for c in ctx.chunks if c.metadata.document_id == "body-of-knowledge-summary"]
+        assert len(bok_chunks) == 1
+
+    async def test_empty_corpus_cleanup_in_batched_mode(self):
+        """When raw_chunks_by_doc is empty and removals exist, BoK is marked for cleanup."""
+        llm = MockLLMPort()
+        ctx = PipelineContext(
+            collection_name="test",
+            documents=[],
+            raw_chunks_by_doc={},
+            removed_document_ids={"doc-gone"},
+        )
+
+        step = BodyOfKnowledgeSummaryStep(llm_port=llm)
+        await step.execute(ctx)
+
+        assert "body-of-knowledge-summary-0" in ctx.orphan_ids

@@ -44,6 +44,7 @@ class IngestWebsitePlugin:
         chunk_threshold: int = 4,
         summarize_enabled: bool = True,
         summarize_concurrency: int = 8,
+        ingest_batch_size: int = 5,
     ) -> None:
         self._llm = llm
         self._embeddings = embeddings
@@ -53,6 +54,7 @@ class IngestWebsitePlugin:
         self._chunk_threshold = chunk_threshold
         self._summarize_enabled = summarize_enabled
         self._summarize_concurrency = max(1, summarize_concurrency)
+        self._ingest_batch_size = max(1, ingest_batch_size)
         self._page_limit = 20  # Default, can be overridden by config
 
     async def startup(self) -> None:
@@ -106,26 +108,38 @@ class IngestWebsitePlugin:
                     error="; ".join(cleanup_result.errors) if cleanup_result.errors else "",
                 )
 
-            # Run ingest pipeline
+            # Run ingest pipeline in batched mode
             summary_llm = self._summarize_llm or self._llm
-            steps: list = [
+            batch_steps: list = [
                 ChunkStep(chunk_size=2000),
                 ContentHashStep(),
                 ChangeDetectionStep(knowledge_store_port=self._knowledge_store),
             ]
             if self._summarize_enabled:
-                steps.append(DocumentSummaryStep(
+                batch_steps.append(DocumentSummaryStep(
                     llm_port=summary_llm,
                     concurrency=self._summarize_concurrency,
                     chunk_threshold=self._chunk_threshold,
                     embeddings_port=self._embeddings,
                 ))
+            batch_steps.extend([
+                EmbedStep(embeddings_port=self._embeddings),
+                StoreStep(knowledge_store_port=self._knowledge_store),
+            ])
+
+            finalize_steps: list = []
+            if self._summarize_enabled:
                 bok_llm = self._bok_llm or summary_llm
-                steps.append(BodyOfKnowledgeSummaryStep(llm_port=bok_llm))
-            steps.append(EmbedStep(embeddings_port=self._embeddings))
-            steps.append(StoreStep(knowledge_store_port=self._knowledge_store))
-            steps.append(OrphanCleanupStep(knowledge_store_port=self._knowledge_store))
-            engine = IngestEngine(steps=steps)
+                finalize_steps.append(BodyOfKnowledgeSummaryStep(llm_port=bok_llm))
+                finalize_steps.append(EmbedStep(embeddings_port=self._embeddings))
+                finalize_steps.append(StoreStep(knowledge_store_port=self._knowledge_store))
+            finalize_steps.append(OrphanCleanupStep(knowledge_store_port=self._knowledge_store))
+
+            engine = IngestEngine(
+                batch_steps=batch_steps,
+                finalize_steps=finalize_steps,
+                batch_size=self._ingest_batch_size,
+            )
             result = await engine.run(documents, collection_name)
 
             return IngestWebsiteResult(

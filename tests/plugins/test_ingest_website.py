@@ -311,10 +311,12 @@ class TestIngestWebsiteSummarizationBehavior:
 
         # Inspect the steps passed to IngestEngine
         call_kwargs = mock_engine.call_args
-        steps = call_kwargs.kwargs.get("steps") or call_kwargs.args[0] if call_kwargs.args else call_kwargs.kwargs["steps"]
-        step_names = [type(s).__name__ for s in steps]
-        assert "DocumentSummaryStep" in step_names
-        assert "BodyOfKnowledgeSummaryStep" in step_names
+        batch_steps = call_kwargs.kwargs["batch_steps"]
+        finalize_steps = call_kwargs.kwargs["finalize_steps"]
+        batch_names = [type(s).__name__ for s in batch_steps]
+        finalize_names = [type(s).__name__ for s in finalize_steps]
+        assert "DocumentSummaryStep" in batch_names
+        assert "BodyOfKnowledgeSummaryStep" in finalize_names
 
     async def test_summarize_enabled_with_zero_concurrency(self):
         """When summarize_enabled=True and concurrency=0, summary steps included with concurrency=1."""
@@ -336,10 +338,10 @@ class TestIngestWebsiteSummarizationBehavior:
             await plugin.handle(event)
 
         call_kwargs = mock_engine.call_args
-        steps = call_kwargs.kwargs.get("steps") or call_kwargs.args[0] if call_kwargs.args else call_kwargs.kwargs["steps"]
-        step_names = [type(s).__name__ for s in steps]
-        assert "DocumentSummaryStep" in step_names
-        assert "BodyOfKnowledgeSummaryStep" in step_names
+        batch_names = [type(s).__name__ for s in call_kwargs.kwargs["batch_steps"]]
+        finalize_names = [type(s).__name__ for s in call_kwargs.kwargs["finalize_steps"]]
+        assert "DocumentSummaryStep" in batch_names
+        assert "BodyOfKnowledgeSummaryStep" in finalize_names
 
     async def test_summarize_disabled(self):
         """When summarize_enabled=False, no summary steps are included."""
@@ -359,7 +361,7 @@ class TestIngestWebsiteSummarizationBehavior:
             await plugin.handle(event)
 
         call_kwargs = mock_engine.call_args
-        steps = call_kwargs.kwargs.get("steps") or call_kwargs.args[0] if call_kwargs.args else call_kwargs.kwargs["steps"]
-        step_names = [type(s).__name__ for s in steps]
-        assert "DocumentSummaryStep" not in step_names
-        assert "BodyOfKnowledgeSummaryStep" not in step_names
+        batch_names = [type(s).__name__ for s in call_kwargs.kwargs["batch_steps"]]
+        finalize_names = [type(s).__name__ for s in call_kwargs.kwargs["finalize_steps"]]
+        assert "DocumentSummaryStep" not in batch_names
+        assert "BodyOfKnowledgeSummaryStep" not in finalize_names
