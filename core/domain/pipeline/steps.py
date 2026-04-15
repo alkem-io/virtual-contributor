@@ -38,7 +38,13 @@ async def _refine_summarize(
     initial_template: str,
     subsequent_template: str,
 ) -> str:
-    """Refine-pattern summarization with progressive length budgeting."""
+    """Refine-pattern summarization with progressive length budgeting.
+
+    If a refinement round fails after a partial summary has been built,
+    the last successful summary is returned instead of raising.  A
+    partial summary covering rounds 1..N-1 is strictly better than no
+    summary at all.
+    """
     if not chunks:
         return ""
 
@@ -54,10 +60,24 @@ async def _refine_summarize(
                 summary=summary, text=chunk, budget=budget,
             )
 
-        summary = await llm_invoke([
-            {"role": "system", "content": system_prompt},
-            {"role": "human", "content": human},
-        ])
+        try:
+            summary = await llm_invoke([
+                {"role": "system", "content": system_prompt},
+                {"role": "human", "content": human},
+            ])
+            logger.debug(
+                "Refine round %d/%d complete (%d chars)",
+                i + 1, len(chunks), len(summary),
+            )
+        except Exception:
+            if summary:
+                logger.warning(
+                    "Refine round %d/%d failed; returning partial summary "
+                    "from %d completed round(s)",
+                    i + 1, len(chunks), i,
+                )
+                return summary
+            raise
 
     return summary
 
@@ -483,11 +503,13 @@ class BodyOfKnowledgeSummaryStep:
         summary_length: int = 10000,
         max_section_chars: int = 30000,
         knowledge_store_port: "KnowledgeStorePort | None" = None,
+        embeddings_port: "EmbeddingsPort | None" = None,
     ) -> None:
         self._llm = llm_port
         self._summary_length = summary_length
         self._max_section_chars = max(1000, max_section_chars)
         self._store = knowledge_store_port
+        self._embeddings = embeddings_port
         self._model_name = getattr(
             getattr(llm_port, "_llm", None), "model", "unknown"
         )
@@ -610,9 +632,38 @@ class BodyOfKnowledgeSummaryStep:
                 title="Body of Knowledge Overview",
                 embedding_type="summary",
             )
-            context.chunks.append(
-                Chunk(content=bok_summary, metadata=bok_meta, chunk_index=0)
-            )
+            bok_chunk = Chunk(content=bok_summary, metadata=bok_meta, chunk_index=0)
+
+            # Persist inline when both ports are available — this eliminates
+            # the window where BoK is generated but not stored, so a later
+            # EmbedStep/StoreStep failure can't discard the LLM work.
+            if self._embeddings is not None and self._store is not None:
+                try:
+                    embeddings = await self._embeddings.embed([bok_summary])
+                    bok_chunk.embedding = embeddings[0]
+                    await self._store.ingest(
+                        collection=context.collection_name,
+                        documents=[bok_summary],
+                        metadatas=[{
+                            "documentId": bok_meta.document_id,
+                            "source": bok_meta.source,
+                            "type": bok_meta.type,
+                            "title": bok_meta.title,
+                            "embeddingType": bok_meta.embedding_type,
+                            "chunkIndex": 0,
+                        }],
+                        ids=[f"{bok_meta.document_id}-0"],
+                        embeddings=[embeddings[0]],
+                    )
+                    context.chunks_stored += 1
+                    logger.info("BoK summary embedded and stored inline")
+                except Exception as exc:
+                    logger.warning(
+                        "BoK inline persist failed, deferring to finalize "
+                        "EmbedStep/StoreStep: %s", exc,
+                    )
+
+            context.chunks.append(bok_chunk)
         except Exception as exc:
             context.errors.append(
                 f"BodyOfKnowledgeSummaryStep: overview generation failed: {exc}"
@@ -723,6 +774,18 @@ class StoreStep:
                 })
                 ids.append(storage_id)
             batch_embeddings = [c.embedding for c in batch]
+
+            # Deduplicate by storage ID — keep the last occurrence
+            # (e.g. identical chunks across documents share a content hash).
+            seen_ids: dict[str, int] = {}
+            for idx, sid in enumerate(ids):
+                seen_ids[sid] = idx
+            if len(seen_ids) < len(ids):
+                unique_indices = sorted(seen_ids.values())
+                documents = [documents[j] for j in unique_indices]
+                metadatas = [metadatas[j] for j in unique_indices]
+                ids = [ids[j] for j in unique_indices]
+                batch_embeddings = [batch_embeddings[j] for j in unique_indices]
 
             try:
                 await self._store.ingest(

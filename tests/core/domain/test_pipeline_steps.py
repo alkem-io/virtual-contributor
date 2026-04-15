@@ -1661,8 +1661,18 @@ class TestDocumentSummaryStepStaleCleanup:
 
 class TestBoKSummaryStepDedup:
     async def test_skips_when_nothing_changed(self):
-        """BoK summary is skipped when change detection ran and found no changes."""
+        """BoK summary is skipped when change detection ran, no changes, and BoK exists in store."""
         llm = MockLLMPort(response="BoK overview")
+        store = MockKnowledgeStorePort()
+        # Pre-populate store with an existing BoK entry
+        await store.ingest(
+            collection="test",
+            documents=["existing bok"],
+            metadatas=[{"documentId": "body-of-knowledge-summary", "embeddingType": "body-of-knowledge",
+                        "source": "generated", "type": "bodyOfKnowledgeSummary", "title": "T", "chunkIndex": 0}],
+            ids=["body-of-knowledge-summary-0"],
+            embeddings=[[0.1] * 384],
+        )
         ctx = PipelineContext(
             collection_name="test",
             documents=[],
@@ -1677,7 +1687,7 @@ class TestBoKSummaryStepDedup:
         ctx.change_detection_ran = True
         # changed_document_ids is empty — nothing changed
 
-        await BodyOfKnowledgeSummaryStep(llm_port=llm).execute(ctx)
+        await BodyOfKnowledgeSummaryStep(llm_port=llm, knowledge_store_port=store).execute(ctx)
 
         bok = [c for c in ctx.chunks if c.metadata.document_id == "body-of-knowledge-summary"]
         assert len(bok) == 0

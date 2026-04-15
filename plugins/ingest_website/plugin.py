@@ -22,7 +22,7 @@ from core.ports.embeddings import EmbeddingsPort
 from core.ports.knowledge_store import KnowledgeStorePort
 from core.ports.llm import LLMPort
 from plugins.ingest_website.crawler import crawl
-from plugins.ingest_website.html_parser import extract_text, extract_title
+from plugins.ingest_website.html_parser import extract_text, extract_title, remove_cross_page_boilerplate
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +90,15 @@ class IngestWebsitePlugin:
                 )
                 documents.append(doc)
 
+            # Remove paragraphs that appear across many pages (cookie
+            # banners, repeated CTAs, etc. that HTML cleanup missed).
+            if len(documents) >= 4:
+                raw_texts = [d.content for d in documents]
+                cleaned = remove_cross_page_boilerplate(raw_texts)
+                for doc, text in zip(documents, cleaned):
+                    doc.content = text
+                documents = [d for d in documents if d.content.strip()]
+
             if not documents:
                 # Crawl/extract succeeded but produced zero documents — run
                 # cleanup pipeline to remove any previously stored chunks.
@@ -130,7 +139,11 @@ class IngestWebsitePlugin:
             finalize_steps: list = []
             if self._summarize_enabled:
                 bok_llm = self._bok_llm or summary_llm
-                finalize_steps.append(BodyOfKnowledgeSummaryStep(llm_port=bok_llm, knowledge_store_port=self._knowledge_store))
+                finalize_steps.append(BodyOfKnowledgeSummaryStep(
+                    llm_port=bok_llm,
+                    knowledge_store_port=self._knowledge_store,
+                    embeddings_port=self._embeddings,
+                ))
                 finalize_steps.append(EmbedStep(embeddings_port=self._embeddings))
                 finalize_steps.append(StoreStep(knowledge_store_port=self._knowledge_store))
             finalize_steps.append(OrphanCleanupStep(knowledge_store_port=self._knowledge_store))
