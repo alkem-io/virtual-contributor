@@ -71,15 +71,13 @@ class LangChainLLMAdapter:
                 )
                 return result
             except asyncio.TimeoutError:
-                last_exc = TimeoutError(
+                # IMPORTANT: Do NOT retry on timeout. asyncio.wait_for cancels
+                # the await but the thread keeps running (zombie thread). Retrying
+                # submits another thread, and with concurrent summarizations this
+                # can exhaust the thread pool and deadlock the pipeline.
+                raise TimeoutError(
                     f"LLM call timed out after {self._timeout}s"
-                )
-                logger.warning(
-                    "LLM invoke attempt %d timed out after %.0fs, retrying",
-                    attempt + 1,
-                    self._timeout,
-                )
-                await asyncio.sleep(BASE_DELAY * (2**attempt))
+                ) from None
             except (ConnectionError, OSError) as exc:
                 raise ConnectionError(
                     f"Failed to connect to LLM endpoint: {exc}. "

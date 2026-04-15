@@ -204,7 +204,7 @@ class ChangeDetectionStep:
 
             existing_ids = set(existing.ids)
             existing_embeddings: dict[str, list[float]] = {}
-            if existing.embeddings:
+            if existing.embeddings is not None and len(existing.embeddings) > 0:
                 for eid, emb in zip(existing.ids, existing.embeddings):
                     existing_embeddings[eid] = emb
 
@@ -418,30 +418,38 @@ class DocumentSummaryStep:
 
         # Apply results to context in deterministic (input) order
         # and fire background embedding tasks for successful results.
-        for result in results:
-            if result.error is not None:
-                context.errors.append(result.error)
-            else:
-                assert result.summary is not None
-                assert result.chunk is not None
-                context.document_summaries[result.doc_id] = result.summary
-                context.chunks.append(result.chunk)
-
-                # Incremental embedding: fire off embedding as a background
-                # task while remaining results are applied.
-                if self._embeddings is not None and result.doc_chunks is not None:
-                    embed_targets = result.doc_chunks + [result.chunk]
-                    task = asyncio.create_task(
-                        self._embed_document_background(
-                            embed_targets, context, result.doc_id,
-                            embed_semaphore,
-                        )
+        # Wrapped in try/finally to guarantee background tasks are always
+        # awaited — without this, an exception between task creation and
+        # the await loop orphans running tasks (silent resource leak).
+        try:
+            for result in results:
+                if result.error is not None:
+                    context.errors.append(result.error)
+                elif result.summary is None or result.chunk is None:
+                    context.errors.append(
+                        f"DocumentSummaryStep: unexpected None summary/chunk "
+                        f"for {result.doc_id}"
                     )
-                    embed_tasks.append(task)
+                else:
+                    context.document_summaries[result.doc_id] = result.summary
+                    context.chunks.append(result.chunk)
 
-        # Await all background embedding tasks before returning.
-        for task in embed_tasks:
-            await task
+                    # Incremental embedding: fire off embedding as a background
+                    # task while remaining results are applied.
+                    if self._embeddings is not None and result.doc_chunks is not None:
+                        embed_targets = result.doc_chunks + [result.chunk]
+                        task = asyncio.create_task(
+                            self._embed_document_background(
+                                embed_targets, context, result.doc_id,
+                                embed_semaphore,
+                            )
+                        )
+                        embed_tasks.append(task)
+        finally:
+            # Always await background tasks to prevent orphaned coroutines
+            # and ensure thread pool slots are freed.
+            if embed_tasks:
+                await asyncio.gather(*embed_tasks, return_exceptions=True)
 
     async def _embed_document_background(
         self,
@@ -473,9 +481,13 @@ class BodyOfKnowledgeSummaryStep:
         self,
         llm_port: LLMPort,
         summary_length: int = 10000,
+        max_section_chars: int = 30000,
+        knowledge_store_port: "KnowledgeStorePort | None" = None,
     ) -> None:
         self._llm = llm_port
         self._summary_length = summary_length
+        self._max_section_chars = max(1000, max_section_chars)
+        self._store = knowledge_store_port
         self._model_name = getattr(
             getattr(llm_port, "_llm", None), "model", "unknown"
         )
@@ -484,12 +496,28 @@ class BodyOfKnowledgeSummaryStep:
     def name(self) -> str:
         return "body_of_knowledge_summary"
 
+    async def _bok_exists(self, collection: str) -> bool:
+        """Check whether a BoK summary already exists in the store."""
+        if self._store is None:
+            return False
+        try:
+            result = await self._store.get(
+                collection=collection,
+                where={"embeddingType": "body-of-knowledge"},
+                include=["metadatas"],
+            )
+            return len(result.ids) > 0
+        except Exception:
+            return False
+
     async def execute(self, context: PipelineContext) -> None:
         # Skip if change detection ran and found no changes or removals
+        # — but only if a BoK summary already exists in the store.
         if (
             context.change_detection_ran
             and not context.changed_document_ids
             and not context.removed_document_ids
+            and await self._bok_exists(context.collection_name)
         ):
             return
 
@@ -534,6 +562,33 @@ class BodyOfKnowledgeSummaryStep:
 
         if not sections:
             return
+
+        # Group sections by character count to limit refinement rounds.
+        # Each round is a sequential LLM call; with slow models (e.g.
+        # gemma-26b at ~2 min/call), 20 rounds = ~40 min.  Grouping
+        # keeps each group under max_section_chars so the input fits
+        # in the model's context window alongside the running summary
+        # and prompt overhead.
+        if len(sections) > 1:
+            grouped: list[str] = []
+            current_group: list[str] = []
+            current_size = 0
+            for section in sections:
+                if current_group and current_size + len(section) > self._max_section_chars:
+                    grouped.append("\n\n---\n\n".join(current_group))
+                    current_group = []
+                    current_size = 0
+                current_group.append(section)
+                current_size += len(section)
+            if current_group:
+                grouped.append("\n\n---\n\n".join(current_group))
+            if len(grouped) < len(sections):
+                logger.info(
+                    "Grouped %d sections into %d refinement rounds "
+                    "(max_section_chars=%d)",
+                    len(sections), len(grouped), self._max_section_chars,
+                )
+                sections = grouped
 
         try:
             logger.info(

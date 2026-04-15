@@ -122,6 +122,7 @@ class IngestSpacePlugin:
             if self._summarize_enabled:
                 finalize_steps.append(BodyOfKnowledgeSummaryStep(
                     llm_port=self._bok_llm or summary_llm,
+                    knowledge_store_port=self._knowledge_store,
                 ))
                 finalize_steps.append(EmbedStep(embeddings_port=self._embeddings))
                 finalize_steps.append(StoreStep(knowledge_store_port=self._knowledge_store))
