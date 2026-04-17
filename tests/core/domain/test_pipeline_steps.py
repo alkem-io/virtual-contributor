@@ -709,6 +709,81 @@ class TestStoreStep:
         assert ctx.chunks_stored == 2
         assert len(store.collections["c"]) == 2
 
+    async def test_store_step_includes_uri_when_present(self):
+        """When a chunk has metadata.uri set, the stored metadata contains 'uri'."""
+        store = MockKnowledgeStorePort()
+        meta = DocumentMetadata(
+            document_id="d1", source="s", type="knowledge",
+            title="T", embedding_type="chunk",
+            uri="https://example.com",
+        )
+        ctx = PipelineContext(
+            collection_name="c",
+            documents=[],
+            chunks=[
+                Chunk(
+                    content="text with uri", metadata=meta, chunk_index=0,
+                    embedding=[0.1, 0.2], content_hash="hash-uri",
+                ),
+            ],
+        )
+
+        await StoreStep(knowledge_store_port=store).execute(ctx)
+
+        assert ctx.chunks_stored == 1
+        stored_meta = store.collections["c"][0]["metadata"]
+        assert stored_meta["uri"] == "https://example.com"
+
+    async def test_store_step_omits_uri_when_none(self):
+        """When a chunk has metadata.uri=None, the stored metadata has no 'uri' key."""
+        store = MockKnowledgeStorePort()
+        meta = DocumentMetadata(
+            document_id="d1", source="s", type="knowledge",
+            title="T", embedding_type="chunk",
+            uri=None,
+        )
+        ctx = PipelineContext(
+            collection_name="c",
+            documents=[],
+            chunks=[
+                Chunk(
+                    content="text without uri", metadata=meta, chunk_index=0,
+                    embedding=[0.1, 0.2], content_hash="hash-no-uri",
+                ),
+            ],
+        )
+
+        await StoreStep(knowledge_store_port=store).execute(ctx)
+
+        assert ctx.chunks_stored == 1
+        stored_meta = store.collections["c"][0]["metadata"]
+        assert "uri" not in stored_meta
+
+    async def test_store_step_omits_uri_when_empty_string(self):
+        """When a chunk has metadata.uri='', the stored metadata has no 'uri' key."""
+        store = MockKnowledgeStorePort()
+        meta = DocumentMetadata(
+            document_id="d1", source="s", type="knowledge",
+            title="T", embedding_type="chunk",
+            uri="",
+        )
+        ctx = PipelineContext(
+            collection_name="c",
+            documents=[],
+            chunks=[
+                Chunk(
+                    content="text with empty uri", metadata=meta, chunk_index=0,
+                    embedding=[0.1, 0.2], content_hash="hash-empty-uri",
+                ),
+            ],
+        )
+
+        await StoreStep(knowledge_store_port=store).execute(ctx)
+
+        assert ctx.chunks_stored == 1
+        stored_meta = store.collections["c"][0]["metadata"]
+        assert "uri" not in stored_meta
+
 
 # ---------------------------------------------------------------------------
 # T026: BodyOfKnowledgeSummaryStep tests

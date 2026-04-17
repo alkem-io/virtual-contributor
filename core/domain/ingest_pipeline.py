@@ -29,6 +29,7 @@ class DocumentMetadata:
     type: str = "knowledge"
     title: str = ""
     embedding_type: str = "knowledge"
+    uri: str | None = None
 
 
 @dataclass
