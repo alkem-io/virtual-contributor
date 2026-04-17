@@ -525,7 +525,7 @@ class BodyOfKnowledgeSummaryStep:
         try:
             result = await self._store.get(
                 collection=collection,
-                where={"embeddingType": "body-of-knowledge"},
+                where={"documentId": "body-of-knowledge-summary"},
                 include=["metadatas"],
             )
             return len(result.ids) > 0
