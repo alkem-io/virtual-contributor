@@ -16,7 +16,7 @@ Fix an async deadlock caused by zombie threads from timed-out LLM calls, prevent
 **Target Platform**: Linux server (Docker containers, K8s)
 **Project Type**: Microkernel service
 **Performance Goals**: Eliminate thread pool deadlocks; reduce BoK refinement rounds by 60-75% via section grouping
-**Constraints**: All BodyOfKnowledgeSummaryStep constructor changes are additive (backward compatible defaults)
+**Constraints**: All BodyOfKnowledgeSummaryStep constructor changes are additive (backward-compatible defaults)
 **Scale/Scope**: 6 files modified, ~120 lines added, ~15 lines removed; 1 test file updated
 
 ## Constitution Check
