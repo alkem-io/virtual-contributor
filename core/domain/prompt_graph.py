@@ -278,23 +278,18 @@ class PromptGraph:
             if output_model:
                 parser = PydanticOutputParser(pydantic_object=output_model)
                 inputs["format_instructions"] = parser.get_format_instructions()
-                chain = prompt_template | runnable_llm | parser
+                raw_chain = prompt_template | runnable_llm
+                raw = await raw_chain.ainvoke(inputs)
+                raw_text = raw.content if hasattr(raw, "content") else str(raw)
                 try:
-                    result = await chain.ainvoke(inputs)
+                    result = parser.parse(raw_text)
                     return result.model_dump()
                 except Exception as exc:
-                    # Small LLMs sometimes ignore the format instructions
-                    # and nest the required fields under extra keys.  Re-run
-                    # the raw chain and try to recover the expected fields
-                    # by searching the JSON body.
                     logger.warning(
                         "Structured parse failed for node %s: %s — "
                         "attempting recovery",
                         node.name, exc,
                     )
-                    raw_chain = prompt_template | runnable_llm
-                    raw = await raw_chain.ainvoke(inputs)
-                    raw_text = raw.content if hasattr(raw, "content") else str(raw)
                     recovered = PromptGraph._recover_fields(
                         raw_text, output_model
                     )
