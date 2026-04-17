@@ -34,11 +34,11 @@ class TestSpaceReader:
         space = {
             "id": "space-1",
             "profile": {"displayName": "Test Space", "description": "A test space"},
-            "collaboration": {"callouts": []},
+            "collaboration": {"calloutsSet": {"callouts": []}},
             "subspaces": [],
         }
         documents = []
-        _process_space(space, documents, depth=0)
+        _process_space(space, documents, set(), depth=0)
         assert len(documents) == 1
         assert "Test Space" in documents[0].content
 
@@ -47,19 +47,19 @@ class TestSpaceReader:
             "id": "space-1",
             "profile": {"displayName": "S", "description": "D"},
             "collaboration": {
-                "callouts": [{
+                "calloutsSet": {"callouts": [{
                     "id": "callout-1",
                     "type": "POST",
                     "framing": {"profile": {"displayName": "C", "description": "Callout desc"}},
                     "contributions": [{
                         "post": {"id": "post-1", "profile": {"displayName": "P", "description": "Post content"}},
                     }],
-                }],
+                }]},
             },
             "subspaces": [],
         }
         documents = []
-        _process_space(space, documents, depth=0)
+        _process_space(space, documents, set(), depth=0)
         # Space + callout + post = 3
         assert len(documents) == 3
 
@@ -67,17 +67,270 @@ class TestSpaceReader:
         space = {
             "id": "space-1",
             "profile": {"displayName": "Root", "description": "Root desc"},
-            "collaboration": {"callouts": []},
+            "collaboration": {"calloutsSet": {"callouts": []}},
             "subspaces": [{
                 "id": "sub-1",
                 "profile": {"displayName": "Sub", "description": "Sub desc"},
-                "collaboration": {"callouts": []},
+                "collaboration": {"calloutsSet": {"callouts": []}},
                 "subspaces": [],
             }],
         }
         documents = []
-        _process_space(space, documents, depth=0)
+        _process_space(space, documents, set(), depth=0)
         assert len(documents) == 2  # Root + subspace
+
+    # ------------------------------------------------------------------
+    # Callout context enrichment
+    # ------------------------------------------------------------------
+
+    def test_callout_context_prepended_to_post(self):
+        space = {
+            "id": "space-1",
+            "profile": {"displayName": "S", "description": "Desc"},
+            "collaboration": {"calloutsSet": {"callouts": [{
+                "id": "co-1",
+                "framing": {"profile": {
+                    "displayName": "Topic A",
+                    "description": "About topic A",
+                }},
+                "contributions": [{
+                    "post": {
+                        "id": "post-1",
+                        "profile": {
+                            "displayName": "My Post",
+                            "description": "Post body here",
+                        },
+                    },
+                }],
+            }]}},
+            "subspaces": [],
+        }
+        documents = []
+        _process_space(space, documents, set(), depth=0)
+        post_doc = next(d for d in documents if d.metadata.document_id == "post-1")
+        # Context comes before post content
+        assert post_doc.content.startswith("Topic A")
+        assert "About topic A" in post_doc.content
+        assert "Post body here" in post_doc.content
+        # Callout context appears before the post body
+        ctx_end = post_doc.content.index("About topic A")
+        body_start = post_doc.content.index("Post body here")
+        assert ctx_end < body_start
+
+    def test_callout_context_prepended_to_whiteboard(self):
+        space = {
+            "id": "space-1",
+            "profile": {"displayName": "S", "description": "Desc"},
+            "collaboration": {"calloutsSet": {"callouts": [{
+                "id": "co-1",
+                "framing": {"profile": {
+                    "displayName": "Topic B",
+                    "description": "About topic B",
+                }},
+                "contributions": [{
+                    "whiteboard": {
+                        "id": "wb-1",
+                        "profile": {"displayName": "Board Title"},
+                        "content": "whiteboard data",
+                    },
+                }],
+            }]}},
+            "subspaces": [],
+        }
+        documents = []
+        _process_space(space, documents, set(), depth=0)
+        wb_doc = next(d for d in documents if d.metadata.document_id == "wb-1")
+        assert wb_doc.content.startswith("Topic B")
+        assert "About topic B" in wb_doc.content
+        assert "whiteboard data" in wb_doc.content
+
+    def test_callout_context_prepended_to_link(self):
+        space = {
+            "id": "space-1",
+            "profile": {"displayName": "S", "description": "Desc"},
+            "collaboration": {"calloutsSet": {"callouts": [{
+                "id": "co-1",
+                "framing": {"profile": {
+                    "displayName": "Resources",
+                    "description": "Useful links",
+                }},
+                "contributions": [{
+                    "link": {
+                        "id": "link-1",
+                        "uri": "https://example.com",
+                        "profile": {
+                            "displayName": "Example",
+                            "description": "An example site",
+                        },
+                    },
+                }],
+            }]}},
+            "subspaces": [],
+        }
+        documents = []
+        _process_space(space, documents, set(), depth=0)
+        link_doc = next(d for d in documents if d.metadata.document_id == "link-1")
+        assert link_doc.content.startswith("Resources")
+        assert "Useful links" in link_doc.content
+        assert "Example" in link_doc.content
+        assert "https://example.com" in link_doc.content
+
+    def test_callout_context_with_empty_description(self):
+        space = {
+            "id": "space-1",
+            "profile": {"displayName": "S", "description": "Desc"},
+            "collaboration": {"calloutsSet": {"callouts": [{
+                "id": "co-1",
+                "framing": {"profile": {
+                    "displayName": "Just Name",
+                    "description": "",
+                }},
+                "contributions": [{
+                    "post": {
+                        "id": "post-1",
+                        "profile": {"displayName": "P", "description": "Body"},
+                    },
+                }],
+            }]}},
+            "subspaces": [],
+        }
+        documents = []
+        _process_space(space, documents, set(), depth=0)
+        post_doc = next(d for d in documents if d.metadata.document_id == "post-1")
+        # Context is just the name (no description separator)
+        assert post_doc.content.startswith("Just Name")
+        assert "Body" in post_doc.content
+
+    def test_callout_description_truncated_at_400_chars(self):
+        long_desc = "A" * 600  # plain text, no HTML
+        space = {
+            "id": "space-1",
+            "profile": {"displayName": "S", "description": "Desc"},
+            "collaboration": {"calloutsSet": {"callouts": [{
+                "id": "co-1",
+                "framing": {"profile": {
+                    "displayName": "Co",
+                    "description": long_desc,
+                }},
+                "contributions": [{
+                    "post": {
+                        "id": "post-1",
+                        "profile": {"displayName": "P", "description": "Body"},
+                    },
+                }],
+            }]}},
+            "subspaces": [],
+        }
+        documents = []
+        _process_space(space, documents, set(), depth=0)
+        post_doc = next(d for d in documents if d.metadata.document_id == "post-1")
+        # The callout context should contain at most 400 chars of description
+        # Split on the post title marker to isolate the context prefix
+        before_post = post_doc.content.split("# P")[0]
+        # The 400-char truncated portion must be present but the full 600 must not
+        assert "A" * 400 in before_post
+        assert "A" * 401 not in before_post
+
+    # ------------------------------------------------------------------
+    # URI propagation
+    # ------------------------------------------------------------------
+
+    def test_space_uri_propagated(self):
+        space = {
+            "id": "space-1",
+            "profile": {
+                "displayName": "S",
+                "description": "Desc",
+                "url": "https://app.alkemio.org/space-1",
+            },
+            "collaboration": {"calloutsSet": {"callouts": []}},
+            "subspaces": [],
+        }
+        documents = []
+        _process_space(space, documents, set(), depth=0)
+        assert documents[0].metadata.uri == "https://app.alkemio.org/space-1"
+
+    def test_post_uri_from_profile_url(self):
+        space = {
+            "id": "space-1",
+            "profile": {"displayName": "S", "description": "Desc"},
+            "collaboration": {"calloutsSet": {"callouts": [{
+                "id": "co-1",
+                "framing": {"profile": {"displayName": "C", "description": ""}},
+                "contributions": [{
+                    "post": {
+                        "id": "post-1",
+                        "profile": {
+                            "displayName": "P",
+                            "description": "Body",
+                            "url": "https://app.alkemio.org/post-1",
+                        },
+                    },
+                }],
+            }]}},
+            "subspaces": [],
+        }
+        documents = []
+        _process_space(space, documents, set(), depth=0)
+        post_doc = next(d for d in documents if d.metadata.document_id == "post-1")
+        assert post_doc.metadata.uri == "https://app.alkemio.org/post-1"
+
+    def test_link_uri_prefers_link_uri_over_profile_url(self):
+        space = {
+            "id": "space-1",
+            "profile": {"displayName": "S", "description": "Desc"},
+            "collaboration": {"calloutsSet": {"callouts": [{
+                "id": "co-1",
+                "framing": {"profile": {"displayName": "C", "description": ""}},
+                "contributions": [{
+                    "link": {
+                        "id": "link-1",
+                        "uri": "https://external.com",
+                        "profile": {
+                            "displayName": "Link Title",
+                            "description": "Link desc",
+                            "url": "https://app.alkemio.org/link-1",
+                        },
+                    },
+                }],
+            }]}},
+            "subspaces": [],
+        }
+        documents = []
+        _process_space(space, documents, set(), depth=0)
+        link_doc = next(d for d in documents if d.metadata.document_id == "link-1")
+        assert link_doc.metadata.uri == "https://external.com"
+
+    def test_empty_url_stored_as_none(self):
+        space = {
+            "id": "space-1",
+            "profile": {"displayName": "S", "description": "Desc", "url": ""},
+            "collaboration": {"calloutsSet": {"callouts": []}},
+            "subspaces": [],
+        }
+        documents = []
+        _process_space(space, documents, set(), depth=0)
+        assert documents[0].metadata.uri is None
+
+    def test_callout_uri_propagated(self):
+        space = {
+            "id": "space-1",
+            "profile": {"displayName": "S", "description": "Desc"},
+            "collaboration": {"calloutsSet": {"callouts": [{
+                "id": "co-1",
+                "framing": {"profile": {
+                    "displayName": "C",
+                    "description": "Callout desc",
+                    "url": "https://app.alkemio.org/callout-1",
+                }},
+                "contributions": [],
+            }]}},
+            "subspaces": [],
+        }
+        documents = []
+        _process_space(space, documents, set(), depth=0)
+        callout_doc = next(d for d in documents if d.metadata.document_id == "co-1")
+        assert callout_doc.metadata.uri == "https://app.alkemio.org/callout-1"
 
 
 class TestIngestSpacePlugin:
