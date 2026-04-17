@@ -49,11 +49,11 @@ def _content_key(content: str) -> str:
 # GraphQL query for space tree
 _CALLOUT_FIELDS = """
   id
-  framing { profile { displayName description } }
+  framing { profile { displayName description url } }
   contributions {
-    post { id profile { displayName description } }
-    whiteboard { id profile { displayName } content }
-    link { id profile { displayName description } uri }
+    post { id profile { displayName description url } }
+    whiteboard { id profile { displayName url } content }
+    link { id profile { displayName description url } uri }
   }
 """
 
@@ -62,7 +62,7 @@ query SpaceTree($spaceId: UUID!) {{
   lookup {{
     space(ID: $spaceId) {{
       id
-      profile {{ displayName description }}
+      profile {{ displayName description url }}
       collaboration {{
         calloutsSet {{
           callouts {{ {_CALLOUT_FIELDS} }}
@@ -70,7 +70,7 @@ query SpaceTree($spaceId: UUID!) {{
       }}
       subspaces {{
         id
-        profile {{ displayName description }}
+        profile {{ displayName description url }}
         collaboration {{
           calloutsSet {{
             callouts {{ {_CALLOUT_FIELDS} }}
@@ -78,7 +78,7 @@ query SpaceTree($spaceId: UUID!) {{
         }}
         subspaces {{
           id
-          profile {{ displayName description }}
+          profile {{ displayName description url }}
           collaboration {{
             calloutsSet {{
               callouts {{ {_CALLOUT_FIELDS} }}
@@ -115,6 +115,7 @@ def _append_unique(
     source: str,
     doc_type: str,
     title: str,
+    uri: str | None = None,
 ) -> bool:
     """Append a Document if its stripped content is non-empty and new."""
     cleaned = _strip_html(content)
@@ -131,6 +132,7 @@ def _append_unique(
             source=source,
             type=doc_type,
             title=_strip_html(title) or title,
+            uri=uri or None,
         ),
     ))
     return True
@@ -146,6 +148,7 @@ def _process_space(
     profile = space.get("profile") or {}
     space_name = profile.get("displayName", "") or ""
     description = profile.get("description", "") or ""
+    space_url = profile.get("url", "") or None
 
     if description:
         doc_type = DocumentType.SPACE if depth == 0 else DocumentType.SUBSPACE
@@ -156,6 +159,7 @@ def _process_space(
             source=f"space:{space['id']}",
             doc_type=doc_type.value,
             title=space_name,
+            uri=space_url,
         )
 
     # Process callouts
@@ -178,6 +182,7 @@ def _process_callout(
     framing = (callout.get("framing") or {}).get("profile") or {}
     callout_name = framing.get("displayName", "") or ""
     callout_desc = framing.get("description", "") or ""
+    callout_url = framing.get("url", "") or None
 
     if callout_desc:
         _append_unique(
@@ -187,22 +192,40 @@ def _process_callout(
             source=f"callout:{callout['id']}",
             doc_type=DocumentType.CALLOUT.value,
             title=callout_name,
+            uri=callout_url,
         )
+
+    # Build callout context to prepend to contributions
+    context_parts = [callout_name] if callout_name else []
+    if callout_desc:
+        short_desc = _strip_html(callout_desc)[:400]
+        if short_desc:
+            context_parts.append(short_desc)
+    callout_context = "\n\n".join(context_parts)
 
     for contrib in callout.get("contributions") or []:
         # Posts
         post = contrib.get("post")
         if post:
             post_profile = post.get("profile") or {}
+            post_title = post_profile.get("displayName", "") or ""
             content = post_profile.get("description", "") or ""
             if content:
+                enriched_parts = []
+                if callout_context:
+                    enriched_parts.append(callout_context)
+                if post_title:
+                    enriched_parts.append(f"# {post_title}")
+                enriched_parts.append(content)
+                enriched_content = "\n\n".join(enriched_parts)
                 _append_unique(
                     documents, seen,
-                    content=content,
+                    content=enriched_content,
                     document_id=post["id"],
                     source=f"post:{post['id']}",
                     doc_type=DocumentType.POST.value,
-                    title=post_profile.get("displayName", "") or "",
+                    title=post_title,
+                    uri=post_profile.get("url") or None,
                 )
 
         # Whiteboards
@@ -210,13 +233,23 @@ def _process_callout(
         if whiteboard:
             wb_content = whiteboard.get("content", "") or ""
             if wb_content:
+                wb_profile = whiteboard.get("profile") or {}
+                wb_title = wb_profile.get("displayName", "") or ""
+                enriched_parts = []
+                if callout_context:
+                    enriched_parts.append(callout_context)
+                if wb_title:
+                    enriched_parts.append(f"# {wb_title}")
+                enriched_parts.append(wb_content)
+                enriched_content = "\n\n".join(enriched_parts)
                 _append_unique(
                     documents, seen,
-                    content=wb_content,
+                    content=enriched_content,
                     document_id=whiteboard["id"],
                     source=f"whiteboard:{whiteboard['id']}",
                     doc_type=DocumentType.WHITEBOARD.value,
-                    title=(whiteboard.get("profile") or {}).get("displayName", "") or "",
+                    title=wb_title,
+                    uri=wb_profile.get("url") or None,
                 )
 
         # Links
@@ -227,7 +260,10 @@ def _process_callout(
             link_title = link_profile.get("displayName", "") or ""
             link_desc = link_profile.get("description", "") or ""
             if uri or link_title or link_desc:
-                parts = [p for p in (link_title, link_desc) if p]
+                parts = []
+                if callout_context:
+                    parts.append(callout_context)
+                parts.extend(p for p in (link_title, link_desc) if p)
                 parts.append(f"URL: {uri}" if uri else "")
                 content = "\n\n".join(p for p in parts if p)
                 _append_unique(
@@ -237,4 +273,5 @@ def _process_callout(
                     source=f"link:{link['id']}",
                     doc_type=DocumentType.LINK.value,
                     title=link_title,
+                    uri=uri or link_profile.get("url") or None,
                 )
