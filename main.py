@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import signal
 
 from core.config import BaseConfig
@@ -260,6 +261,23 @@ async def _run(config: BaseConfig) -> None:
         deps["summarize_concurrency"] = config.summarize_concurrency
     if "ingest_batch_size" in sig.parameters:
         deps["ingest_batch_size"] = config.ingest_batch_size
+    # Inject GraphQL client for ingest-space plugin
+    if "graphql_client" in sig.parameters:
+        from plugins.ingest_space.graphql_client import GraphQLClient
+        gql_endpoint = getattr(config, "api_endpoint_private_graphql", "") or os.environ.get("API_ENDPOINT_PRIVATE_GRAPHQL", "")
+        kratos_url = getattr(config, "auth_kratos_public_url", "") or os.environ.get("AUTH_ORY_KRATOS_PUBLIC_BASE_URL", "")
+        admin_email = getattr(config, "auth_admin_email", "") or os.environ.get("AUTH_ADMIN_EMAIL", "")
+        admin_password = getattr(config, "auth_admin_password", "") or os.environ.get("AUTH_ADMIN_PASSWORD", "")
+        if gql_endpoint and admin_email:
+            deps["graphql_client"] = GraphQLClient(
+                graphql_endpoint=gql_endpoint,
+                kratos_public_url=kratos_url,
+                email=admin_email,
+                password=admin_password,
+            )
+            logger.info("GraphQL client configured: %s", gql_endpoint)
+        else:
+            logger.warning("GraphQL client not configured — missing API_ENDPOINT_PRIVATE_GRAPHQL or AUTH_ADMIN_EMAIL")
     plugin = plugin_class(**deps)
 
     # Plugin lifecycle: startup
