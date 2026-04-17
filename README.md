@@ -18,6 +18,7 @@ Unified microkernel engine with pluggable handlers for AI-powered virtual contri
 - [Linting and Type Checking](#linting-and-type-checking)
 - [Adding a New Plugin](#adding-a-new-plugin)
 - [Architecture Decision Records](#architecture-decision-records)
+- [Feature Specifications](#feature-specifications)
 - [License](#license)
 
 ## Features
@@ -121,7 +122,8 @@ virtual-contributor/
 │   │   ├── ingest_pipeline.py         # Document, Chunk, IngestResult models
 │   │   ├── summarize_graph.py         # Summarize-then-refine pattern
 │   │   └── pipeline/                  # Ingest pipeline engine
-│   │       ├── engine.py              # Ordered step executor
+│   │       ├── README.md              # Pipeline architecture, flow diagrams, step reference
+│   │       ├── engine.py              # Ordered step executor (sequential + batched modes)
 │   │       └── steps.py              # Chunk, Hash, Detect, Summarize, Embed, Store, Cleanup
 │   ├── events/                        # Pydantic wire-format models
 │   │   ├── input.py                   # Input, HistoryItem, ExternalConfig
@@ -136,7 +138,7 @@ virtual-contributor/
 │   ├── health.py                      # HTTP health server (/healthz, /readyz)
 │   └── logging.py                     # JSON structured logging
 │
-├── plugins/                           # Plugin implementations
+├── plugins/                           # Plugin implementations (each has its own README.md)
 │   ├── expert/                        # PromptGraph + knowledge retrieval RAG
 │   ├── generic/                       # Direct LLM with history condensation
 │   ├── guidance/                      # Multi-collection RAG with score filtering
@@ -158,7 +160,8 @@ virtual-contributor/
 │   ├── core/                          # Core unit + contract tests
 │   └── plugins/                       # Plugin unit tests
 │
-├── docs/adr/                          # Architecture Decision Records
+├── specs/                             # Feature specifications (001-025)
+├── docs/adr/                          # Architecture Decision Records (0001-0011)
 ├── main.py                            # Single entry point
 ├── Dockerfile                         # Multi-stage build (PLUGIN_TYPE at runtime)
 ├── docker-compose.yaml                # All services from one image
@@ -316,77 +319,72 @@ Legacy Mistral-specific variables (`MISTRAL_API_KEY`, `MISTRAL_SMALL_MODEL_NAME`
 
 ## Plugins
 
-### Expert (`PLUGIN_TYPE=expert`)
+Each plugin has its own README with detailed documentation, flow diagrams, and configuration reference.
 
-**Queue**: `virtual-contributor-engine-expert`
+| Plugin | Type | Queue | README |
+|--------|------|-------|--------|
+| **Expert** | `expert` | `virtual-contributor-engine-expert` | [plugins/expert/README.md](plugins/expert/README.md) |
+| **Generic** | `generic` | `virtual-contributor-engine-generic` | [plugins/generic/README.md](plugins/generic/README.md) |
+| **Guidance** | `guidance` | `virtual-contributor-engine-guidance` | [plugins/guidance/README.md](plugins/guidance/README.md) |
+| **OpenAI Assistant** | `openai-assistant` | `virtual-contributor-engine-openai-assistant` | [plugins/openai_assistant/README.md](plugins/openai_assistant/README.md) |
+| **Ingest Website** | `ingest-website` | `virtual-contributor-ingest-website` | [plugins/ingest_website/README.md](plugins/ingest_website/README.md) |
+| **Ingest Space** | `ingest-space` | `virtual-contributor-ingest-body-of-knowledge` | [plugins/ingest_space/README.md](plugins/ingest_space/README.md) |
+
+### Expert (`PLUGIN_TYPE=expert`)
 
 PromptGraph-based plugin with single-collection RAG. If the incoming event includes a `prompt_graph` definition, it compiles a LangGraph workflow from JSON — nodes have prompt templates, input variables, and optional output schemas. A special "retrieve" node queries the knowledge store. Falls back to simple RAG if no graph is defined. Results are filtered by score threshold and capped by context budget.
 
 ### Generic (`PLUGIN_TYPE=generic`)
 
-**Queue**: `virtual-contributor-engine-generic`
-
 Direct LLM invocation with optional chat history condensation. When conversation history is present, it first condenses prior exchanges into a standalone question via the LLM, then builds a message array from system prompts and the condensed question. Returns raw LLM output with no sources.
 
 ### Guidance (`PLUGIN_TYPE=guidance`)
-
-**Queue**: `virtual-contributor-engine-guidance`
 
 Multi-collection RAG that queries three Alkemio knowledge bases in parallel (`alkem.io-knowledge`, `welcome.alkem.io-knowledge`, `www.alkemio.org-knowledge`). Merges results, deduplicates by source URL (keeping the highest score per page), filters by threshold, and enforces context budget. Context chunks are prefixed with `[source:N]` citations. Parses the LLM's JSON response to extract the answer.
 
 ### OpenAI Assistant (`PLUGIN_TYPE=openai-assistant`)
 
-**Queue**: `virtual-contributor-engine-openai-assistant`
-
 Wraps the OpenAI Assistants API with thread and run management. Requires per-request `external_config` with `api_key` and `assistant_id`. Creates or resumes threads (via `thread_id` in `external_metadata`), adds messages, polls runs to completion, and returns the answer with thread ID for conversation continuity.
 
 ### Ingest Website (`PLUGIN_TYPE=ingest-website`)
-
-**Queue**: `virtual-contributor-ingest-website`
 
 Web crawler that fetches pages from a base URL (configurable page limit), extracts text and titles from HTML via BeautifulSoup, then runs the full ingest pipeline. The collection is named `{domain}-knowledge`.
 
 ### Ingest Space (`PLUGIN_TYPE=ingest-space`)
 
-**Queue**: `virtual-contributor-ingest-body-of-knowledge`
-
 Fetches the Alkemio space tree via GraphQL, parses attached files (PDF, DOCX, XLSX), and runs the ingest pipeline with larger chunk sizes (9000 characters). The collection is named `{body_of_knowledge_id}-{purpose}`.
 
 ## Ingest Pipeline
 
-Both ingest plugins share a common pipeline engine (`core/domain/pipeline/`) that executes an ordered sequence of steps:
+Both ingest plugins share a common pipeline engine ([`core/domain/pipeline/`](core/domain/pipeline/README.md)) that executes an ordered sequence of steps. The engine supports both sequential and batched execution modes.
 
-```
-Documents
-    |
-    v
-ChunkStep                  # Split documents via RecursiveCharacterTextSplitter
-    |
-    v
-ContentHashStep             # SHA-256 fingerprint: content + title + source + type + document_id
-    |
-    v
-ChangeDetectionStep         # Query store for existing chunks, mark unchanged, identify orphans
-    |
-    v
-DocumentSummaryStep         # Per-document summaries (>= chunk_threshold chunks, refine pattern)
-    |
-    v
-BodyOfKnowledgeSummaryStep  # Single overview summary for entire knowledge base
-    |
-    v
-EmbedStep                   # Batch embed all chunks via EmbeddingsPort
-    |
-    v
-StoreStep                   # Persist to ChromaDB (content hash as ID)
-    |
-    v
-OrphanCleanupStep           # Delete orphaned/removed document chunks
+```mermaid
+flowchart TD
+    subgraph "Per-Batch Steps"
+        A[Documents] --> B["ChunkStep<br/><i>Split via RecursiveCharacterTextSplitter</i>"]
+        B --> C["ContentHashStep<br/><i>SHA-256 fingerprint per chunk</i>"]
+        C --> D["ChangeDetectionStep<br/><i>Query store, mark unchanged, find orphans</i>"]
+        D --> E["DocumentSummaryStep<br/><i>Per-document refine-pattern summary</i>"]
+        E --> F["EmbedStep<br/><i>Batch embed via EmbeddingsPort</i>"]
+        F --> G["StoreStep<br/><i>Persist to ChromaDB, skip unchanged</i>"]
+        G --> H{More batches?}
+    end
+
+    H -->|Yes| A
+    H -->|No| I[Finalize Steps]
+
+    subgraph "Finalize Steps"
+        I --> J["BodyOfKnowledgeSummaryStep<br/><i>Single overview summary</i>"]
+        J --> K["OrphanCleanupStep ⚠️<br/><i>Delete orphaned + removed chunks</i>"]
+        K --> L[IngestResult]
+    end
 ```
 
 **Content-hash deduplication**: Each chunk gets a SHA-256 fingerprint computed from its content, title, source, type, and document ID. During change detection, existing chunks in the store are compared by hash — unchanged chunks skip re-embedding, saving compute. Orphaned chunks (from deleted or modified documents) are cleaned up after the store step succeeds.
 
-Each step reports metrics (duration, items in/out, error count) and failures are caught per-step so the pipeline can continue with remaining steps.
+**Safety**: Steps marked as destructive (e.g., `OrphanCleanupStep`) are automatically skipped when prior pipeline errors exist, preventing data loss from partial processing.
+
+Each step reports metrics (duration, items in/out, error count) and failures are caught per-step so the pipeline can continue with remaining steps. See [core/domain/pipeline/README.md](core/domain/pipeline/README.md) for the full step reference and context field documentation.
 
 ## Docker Deployment
 
@@ -550,13 +548,49 @@ Detailed design rationale is documented in `docs/adr/`:
 
 | ADR | Decision |
 |-----|----------|
-| 0001 | Microkernel + hexagonal architecture consolidating 7 repositories |
-| 0002 | TypeScript-to-Python port for ingest-space plugin |
-| 0003 | Duck-typed plugin contract via Python Protocol |
-| 0004 | Sequential message processing with horizontal scaling |
-| 0005 | Unified LangChain adapter with provider factory |
-| 0006a | RAGAS as RAG evaluation framework |
-| 0006b | Content-hash deduplication and KnowledgeStorePort extension |
+| [0001](docs/adr/0001-microkernel-hexagonal-architecture.md) | Microkernel + hexagonal architecture consolidating 7 repositories |
+| [0002](docs/adr/0002-typescript-to-python-port.md) | TypeScript-to-Python port for ingest-space plugin |
+| [0003](docs/adr/0003-plugin-contract-design.md) | Duck-typed plugin contract via Python Protocol |
+| [0004](docs/adr/0004-sequential-processing-model.md) | Sequential message processing with horizontal scaling |
+| [0005](docs/adr/0005-unified-langchain-adapter.md) | Unified LangChain adapter with provider factory |
+| [0006](docs/adr/0006-content-hash-dedup.md) | Content-hash deduplication and KnowledgeStorePort extension |
+| [0007](docs/adr/0007-ragas-evaluation-framework.md) | RAGAS as RAG evaluation framework |
+| [0008](docs/adr/0008-composable-pipeline-engine.md) | Composable step-based ingest pipeline engine |
+| [0009](docs/adr/0009-configurable-summarization-llm.md) | Configurable summarization LLM with per-plugin retrieval parameters |
+| [0010](docs/adr/0010-pipeline-step-safety.md) | Pipeline destructive step safety via duck-typed gating |
+| [0011](docs/adr/0011-pipeline-reliability.md) | Pipeline reliability — thread pool sizing, partial failure resilience |
+
+## Feature Specifications
+
+Detailed design specifications for all features are in `specs/`:
+
+| # | Spec | Status |
+|---|------|--------|
+| 001 | [Unified Microkernel Engine](specs/001-microkernel-engine-impl/spec.md) | Draft |
+| 002 | [Multi-Provider LLM Support](specs/002-multi-provider-llm/spec.md) | Draft |
+| 003 | [Async Performance Optimizations](specs/003-async-perf-optimize/spec.md) | In Progress |
+| 004 | [Composable Ingest Pipeline Engine](specs/004-pipeline-engine-redesign/spec.md) | Implemented |
+| 005 | [Document Processing Reliability](specs/005-fix-document-reliability/spec.md) | Implemented |
+| 006 | [Content-Hash Deduplication](specs/006-content-hash-dedup/spec.md) | Draft |
+| 007 | [Configurable Summarization LLM](specs/007-configurable-summarization/spec.md) | Draft |
+| 008 | [Early ACK with Async Processing (PRD)](specs/008-early-ack-async-processing/spec.md) | Draft |
+| 009 | [Configurable Vector DB Distance Function](specs/009-vector-db-distance-fn/spec.md) | Implemented |
+| 010 | [BoK LLM & Factory Hardening](specs/010-bok-llm-factory-hardening/spec.md) | Implemented |
+| 011 | [Pipeline Destructive Step Safety](specs/011-pipeline-destructive-step-safety/spec.md) | Implemented |
+| 012 | [Empty Corpus Re-Ingestion](specs/012-empty-corpus-reingestion/spec.md) | Implemented |
+| 013 | [Summary Lifecycle Management](specs/013-summary-lifecycle-management/spec.md) | Implemented |
+| 014 | [Concurrent Document Summarization](specs/014-concurrent-document-summary/spec.md) | Implemented |
+| 015 | [Early ACK with Async Processing](specs/015-early-ack-async-processing/spec.md) | In Progress |
+| 016 | [Skip Unchanged Upsert](specs/016-skip-unchanged-upsert/spec.md) | Implemented |
+| 017 | [Incremental Embedding](specs/017-incremental-embedding/spec.md) | Implemented |
+| 018 | [Consistent Summarization](specs/018-consistent-summarization/spec.md) | Implemented |
+| 019 | [Batched Ingest Pipeline](specs/019-batched-ingest/spec.md) | Draft |
+| 020 | [Pipeline Reliability & BoK Resilience](specs/020-pipeline-reliability/spec.md) | Implemented |
+| 021 | [Website Content Quality](specs/021-website-content-quality/spec.md) | Implemented |
+| 022 | [Space Ingest Context & URI Tracking](specs/022-space-ingest-context-uri/spec.md) | Implemented |
+| 023 | [PromptGraph Robustness](specs/023-promptgraph-robustness/spec.md) | Implemented |
+| 024 | [Retry Error Reporting](specs/024-retry-error-reporting/spec.md) | Implemented |
+| 025 | [RAG Evaluation Framework](specs/025-rag-evaluation-framework/spec.md) | Draft |
 
 ## CI/CD
 

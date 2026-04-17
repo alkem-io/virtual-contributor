@@ -1,7 +1,7 @@
 # Implementation Plan: RAG Evaluation Framework and Golden Test Set
 
-**Branch**: `007-rag-evaluation-framework` | **Date**: 2026-04-06 | **Spec**: [spec.md](spec.md)
-**Input**: Feature specification from `/specs/007-rag-evaluation-framework/spec.md`
+**Branch**: `025-rag-evaluation-framework` | **Date**: 2026-04-06 | **Spec**: [spec.md](spec.md)
+**Input**: Feature specification from `/specs/025-rag-evaluation-framework/spec.md`
 
 ## Summary
 
@@ -44,7 +44,7 @@ Build an evaluation framework that measures RAG pipeline quality using four core
 ### Documentation (this feature)
 
 ```text
-specs/007-rag-evaluation-framework/
+specs/025-rag-evaluation-framework/
 ├── plan.md              # This file
 ├── research.md          # Phase 0 output
 ├── data-model.md        # Phase 1 output

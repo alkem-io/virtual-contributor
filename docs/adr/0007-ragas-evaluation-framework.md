@@ -1,4 +1,4 @@
-# ADR 0006: RAGAS as RAG Evaluation Framework
+# ADR 0007: RAGAS as RAG Evaluation Framework
 
 ## Status
 Accepted

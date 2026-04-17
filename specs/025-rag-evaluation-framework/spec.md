@@ -1,6 +1,6 @@
 # Feature Specification: RAG Evaluation Framework and Golden Test Set
 
-**Feature Branch**: `007-rag-evaluation-framework`  
+**Feature Branch**: `025-rag-evaluation-framework`  
 **Created**: 2026-04-06  
 **Status**: Draft  
 **Input**: User description: "implement https://github.com/orgs/alkem-io/projects/50/views/8?pane=issue&itemId=172807481&issue=alkem-io%7Cvirtual-contributor%7C25"  

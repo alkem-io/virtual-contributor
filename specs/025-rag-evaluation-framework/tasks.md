@@ -1,6 +1,6 @@
 # Tasks: RAG Evaluation Framework and Golden Test Set
 
-**Input**: Design documents from `/specs/007-rag-evaluation-framework/`
+**Input**: Design documents from `/specs/025-rag-evaluation-framework/`
 **Prerequisites**: plan.md (required), spec.md (required for user stories), research.md, data-model.md, contracts/cli.md, quickstart.md
 
 **Tests**: Included per plan.md constitution check (P4: "Framework itself will have meaningful tests", P7: "Tests will validate meaningful evaluation paths").

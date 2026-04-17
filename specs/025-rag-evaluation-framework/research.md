@@ -1,6 +1,6 @@
 # Research: RAG Evaluation Framework
 
-**Feature**: 007-rag-evaluation-framework  
+**Feature**: 025-rag-evaluation-framework  
 **Date**: 2026-04-06  
 **Status**: Complete
 
