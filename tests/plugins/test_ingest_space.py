@@ -38,7 +38,7 @@ class TestSpaceReader:
             "subspaces": [],
         }
         documents = []
-        _process_space(space, documents, depth=0)
+        _process_space(space, documents, set(), depth=0)
         assert len(documents) == 1
         assert "Test Space" in documents[0].content
 
@@ -47,19 +47,19 @@ class TestSpaceReader:
             "id": "space-1",
             "profile": {"displayName": "S", "description": "D"},
             "collaboration": {
-                "callouts": [{
+                "calloutsSet": {"callouts": [{
                     "id": "callout-1",
                     "type": "POST",
                     "framing": {"profile": {"displayName": "C", "description": "Callout desc"}},
                     "contributions": [{
                         "post": {"id": "post-1", "profile": {"displayName": "P", "description": "Post content"}},
                     }],
-                }],
+                }]},
             },
             "subspaces": [],
         }
         documents = []
-        _process_space(space, documents, depth=0)
+        _process_space(space, documents, set(), depth=0)
         # Space + callout + post = 3
         assert len(documents) == 3
 
@@ -67,16 +67,16 @@ class TestSpaceReader:
         space = {
             "id": "space-1",
             "profile": {"displayName": "Root", "description": "Root desc"},
-            "collaboration": {"callouts": []},
+            "collaboration": {"calloutsSet": {"callouts": []}},
             "subspaces": [{
                 "id": "sub-1",
                 "profile": {"displayName": "Sub", "description": "Sub desc"},
-                "collaboration": {"callouts": []},
+                "collaboration": {"calloutsSet": {"callouts": []}},
                 "subspaces": [],
             }],
         }
         documents = []
-        _process_space(space, documents, depth=0)
+        _process_space(space, documents, set(), depth=0)
         assert len(documents) == 2  # Root + subspace
 
 

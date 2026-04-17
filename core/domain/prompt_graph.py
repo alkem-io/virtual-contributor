@@ -103,13 +103,13 @@ class PromptGraph:
             return None
         # Drop null values for required fields so the validator can use
         # defaults or report the real missing-field error.
-        for name, field in model.model_fields.items():
-            if field.is_required() and found.get(name) is None:
+        for name, finfo in model.model_fields.items():
+            if finfo.is_required() and found.get(name) is None:
                 found.pop(name, None)
 
         required = {
-            name for name, field in model.model_fields.items()
-            if field.is_required()
+            name for name, finfo in model.model_fields.items()
+            if finfo.is_required()
         }
         if required - found.keys():
             return None
