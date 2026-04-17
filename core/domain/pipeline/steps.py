@@ -767,14 +767,17 @@ class StoreStep:
                 else:
                     # BoK summary or fallback
                     storage_id = f"{c.metadata.document_id}-{c.chunk_index}"
-                metadatas.append({
+                meta_entry = {
                     "documentId": c.metadata.document_id,
                     "source": c.metadata.source,
                     "type": c.metadata.type,
                     "title": c.metadata.title,
                     "embeddingType": c.metadata.embedding_type,
                     "chunkIndex": c.chunk_index,
-                })
+                }
+                if getattr(c.metadata, "uri", None):
+                    meta_entry["uri"] = c.metadata.uri
+                metadatas.append(meta_entry)
                 ids.append(storage_id)
             batch_embeddings = [c.embedding for c in batch]
 
