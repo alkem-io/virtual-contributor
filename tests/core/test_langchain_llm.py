@@ -129,6 +129,48 @@ class TestConnectionError:
         assert mock_llm.invoke.call_count == 1
 
 
+class TestTimeoutError:
+    """Test asyncio.TimeoutError raises immediately without retry."""
+
+    @pytest.mark.asyncio
+    async def test_timeout_raises_immediately_no_retry(self) -> None:
+        """asyncio.TimeoutError produces TimeoutError with no retries."""
+        import asyncio
+
+        mock_llm = MagicMock()
+
+        adapter = LangChainLLMAdapter(mock_llm, timeout=0.001)
+
+        async def raise_timeout(*args, **kwargs):
+            raise asyncio.TimeoutError()
+
+        with patch("core.adapters.langchain_llm.asyncio.wait_for", side_effect=raise_timeout):
+            with pytest.raises(TimeoutError, match="LLM call timed out"):
+                await adapter.invoke([{"role": "human", "content": "Hi"}])
+
+    @pytest.mark.asyncio
+    async def test_timeout_not_retried_unlike_generic_errors(self) -> None:
+        """Generic errors retry 3 times, but timeout should not retry at all."""
+        import asyncio
+
+        mock_llm = MagicMock()
+        adapter = LangChainLLMAdapter(mock_llm, timeout=0.001)
+
+        call_count = 0
+
+        async def timeout_then_succeed(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            raise asyncio.TimeoutError()
+
+        with patch("core.adapters.langchain_llm.asyncio.wait_for", side_effect=timeout_then_succeed):
+            with pytest.raises(TimeoutError):
+                await adapter.invoke([{"role": "human", "content": "Hi"}])
+
+        # Only 1 attempt — no retries on timeout
+        assert call_count == 1
+
+
 class TestStream:
     """Test stream yields chunks."""
 
