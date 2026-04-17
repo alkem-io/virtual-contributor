@@ -1668,7 +1668,7 @@ class TestBoKSummaryStepDedup:
         await store.ingest(
             collection="test",
             documents=["existing bok"],
-            metadatas=[{"documentId": "body-of-knowledge-summary", "embeddingType": "body-of-knowledge",
+            metadatas=[{"documentId": "body-of-knowledge-summary", "embeddingType": "summary",
                         "source": "generated", "type": "bodyOfKnowledgeSummary", "title": "T", "chunkIndex": 0}],
             ids=["body-of-knowledge-summary-0"],
             embeddings=[[0.1] * 384],

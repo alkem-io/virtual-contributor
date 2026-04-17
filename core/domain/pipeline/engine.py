@@ -76,6 +76,8 @@ class IngestEngine:
             raise ValueError("Must specify either 'steps' or 'batch_steps'")
         if batch_steps is not None and finalize_steps is None:
             raise ValueError("'finalize_steps' is required when using 'batch_steps'")
+        if steps is not None and finalize_steps is not None:
+            raise ValueError("'finalize_steps' cannot be used with 'steps' (sequential mode)")
 
         self._steps = steps
         self._batch_steps = batch_steps
@@ -104,6 +106,7 @@ class IngestEngine:
         context = PipelineContext(
             collection_name=collection_name,
             documents=documents,
+            all_document_ids={d.metadata.document_id for d in documents},
         )
         await self._run_steps(self._steps, context)
         return self._build_result(context, len(documents))

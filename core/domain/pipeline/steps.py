@@ -634,6 +634,7 @@ class BodyOfKnowledgeSummaryStep:
             )
             bok_chunk = Chunk(content=bok_summary, metadata=bok_meta, chunk_index=0)
 
+            stored_inline = False
             # Persist inline when both ports are available — this eliminates
             # the window where BoK is generated but not stored, so a later
             # EmbedStep/StoreStep failure can't discard the LLM work.
@@ -657,13 +658,15 @@ class BodyOfKnowledgeSummaryStep:
                     )
                     context.chunks_stored += 1
                     logger.info("BoK summary embedded and stored inline")
+                    stored_inline = True
                 except Exception as exc:
                     logger.warning(
                         "BoK inline persist failed, deferring to finalize "
                         "EmbedStep/StoreStep: %s", exc,
                     )
 
-            context.chunks.append(bok_chunk)
+            if not stored_inline:
+                context.chunks.append(bok_chunk)
         except Exception as exc:
             context.errors.append(
                 f"BodyOfKnowledgeSummaryStep: overview generation failed: {exc}"
