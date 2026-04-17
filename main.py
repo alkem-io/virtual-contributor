@@ -268,7 +268,7 @@ async def _run(config: BaseConfig) -> None:
         kratos_url = getattr(config, "auth_kratos_public_url", "") or os.environ.get("AUTH_ORY_KRATOS_PUBLIC_BASE_URL", "")
         admin_email = getattr(config, "auth_admin_email", "") or os.environ.get("AUTH_ADMIN_EMAIL", "")
         admin_password = getattr(config, "auth_admin_password", "") or os.environ.get("AUTH_ADMIN_PASSWORD", "")
-        if gql_endpoint and admin_email:
+        if gql_endpoint and admin_email and admin_password:
             deps["graphql_client"] = GraphQLClient(
                 graphql_endpoint=gql_endpoint,
                 kratos_public_url=kratos_url,
@@ -277,7 +277,7 @@ async def _run(config: BaseConfig) -> None:
             )
             logger.info("GraphQL client configured: %s", gql_endpoint)
         else:
-            logger.warning("GraphQL client not configured — missing API_ENDPOINT_PRIVATE_GRAPHQL or AUTH_ADMIN_EMAIL")
+            logger.warning("GraphQL client not configured — missing API_ENDPOINT_PRIVATE_GRAPHQL, AUTH_ADMIN_EMAIL, or AUTH_ADMIN_PASSWORD")
     plugin = plugin_class(**deps)
 
     # Plugin lifecycle: startup
