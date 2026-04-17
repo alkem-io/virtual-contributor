@@ -62,7 +62,7 @@ As a developer maintaining the message handler, the error response construction 
 
 - **SC-001**: Users see exactly one error message per failed query, not one per retry attempt.
 - **SC-002**: Zero code duplication of error response construction in `on_message`.
-- **SC-003**: Terminal error response is published for 100% of queries that exhaust all retries.
+- **SC-003**: Terminal error response is attempted for all queries that exhaust all retries; publish failures are logged.
 
 ## Assumptions
 

@@ -34,7 +34,7 @@ class TestSpaceReader:
         space = {
             "id": "space-1",
             "profile": {"displayName": "Test Space", "description": "A test space"},
-            "collaboration": {"callouts": []},
+            "collaboration": {"calloutsSet": {"callouts": []}},
             "subspaces": [],
         }
         documents = []
