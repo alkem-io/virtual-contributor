@@ -381,27 +381,40 @@ async def _run(config: BaseConfig) -> None:
                         config.pipeline_timeout,
                         type(event).__name__,
                     )
-                    from core.events.response import Response
-                    error_response = Response(
-                        result=f"Error: handler timed out after {config.pipeline_timeout}s",
+                    await _retry_or_reject(
+                        message, body,
+                        event=event,
+                        error_text=(
+                            f"Error: handler timed out after "
+                            f"{config.pipeline_timeout}s"
+                        ),
                     )
-                    envelope = router.build_response_envelope(error_response, event)
-                    await _publish_result(envelope)
-                    await _retry_or_reject(message, body)
                 except Exception as exc:
                     logger.exception("Error handling engine query: %s", exc)
-                    from core.events.response import Response
-                    error_response = Response(result=f"Error: {exc}")
-                    envelope = router.build_response_envelope(error_response, event)
-                    await _publish_result(envelope)
-                    await _retry_or_reject(message, body)
+                    await _retry_or_reject(
+                        message, body,
+                        event=event,
+                        error_text=f"Error: {exc}",
+                    )
         except Exception as exc:
             # parse_event failed — reject the message
             logger.exception("Failed to parse message: %s", exc)
             await _retry_or_reject(message, body)
 
-    async def _retry_or_reject(message: object, body: dict) -> None:
-        """Replicate the adapter's retry/reject logic for engine queries."""
+    async def _retry_or_reject(
+        message: object,
+        body: dict,
+        *,
+        event: object | None = None,
+        error_text: str | None = None,
+    ) -> None:
+        """Requeue for another attempt or publish a final error.
+
+        Intermediate retries stay silent — publishing on every attempt
+        would spam the room with failure messages.  Only on the last
+        attempt do we emit ``error_text`` as the response so the user
+        gets closure.
+        """
         headers = getattr(message, "headers", None) or {}
         retry_count = int(headers.get("x-retry-count", 0))
         max_retries = config.rabbitmq_max_retries
@@ -427,6 +440,19 @@ async def _run(config: BaseConfig) -> None:
                 "Message failed after %d attempts, discarding",
                 max_retries,
             )
+            if event is not None and error_text:
+                try:
+                    from core.events.response import Response
+                    error_response = Response(result=error_text)
+                    envelope = router.build_response_envelope(
+                        error_response, event,
+                    )
+                    await _publish_result(envelope)
+                except Exception as pub_exc:
+                    logger.error(
+                        "Failed to publish terminal error response: %s",
+                        pub_exc,
+                    )
             await message.reject(requeue=False)  # type: ignore[union-attr]
 
     # Start consuming with message handle exposed for ACK control
