@@ -118,3 +118,69 @@ class TestExpertPlugin:
     async def test_startup_shutdown(self, plugin):
         await plugin.startup()
         await plugin.shutdown()
+
+    async def test_handle_with_graph_populates_conversation(self):
+        from unittest.mock import AsyncMock, patch, MagicMock
+
+        captured_state = {}
+
+        async def fake_invoke(initial_state):
+            captured_state.update(initial_state)
+            return {
+                "final_answer": "Graph answer",
+                "result_language": "EN",
+            }
+
+        mock_graph = MagicMock()
+        mock_graph.compile = MagicMock(return_value=mock_graph)
+        mock_graph.invoke = AsyncMock(side_effect=fake_invoke)
+
+        with patch(
+            "core.domain.prompt_graph.PromptGraph"
+        ) as MockPromptGraph:
+            MockPromptGraph.from_definition.return_value = mock_graph
+
+            plugin = ExpertPlugin(
+                llm=MockLLMPort(response="ignored"),
+                knowledge_store=MockKnowledgeStorePort(),
+            )
+            event = make_input(
+                bodyOfKnowledgeID="bok-1",
+                promptGraph={
+                    "nodes": [{"name": "n1"}],
+                    "edges": [{"from": "START", "to": "END"}],
+                },
+                history=[
+                    {"content": "Hi there", "role": "human"},
+                    {"content": "Hello!", "role": "assistant"},
+                ],
+            )
+            result = await plugin.handle(event)
+
+        # Verify the graph was compiled with a retrieve special node
+        mock_graph.compile.assert_called_once()
+        compile_kwargs = mock_graph.compile.call_args
+        assert "retrieve" in compile_kwargs.kwargs.get(
+            "special_nodes", compile_kwargs[1].get("special_nodes", {})
+        )
+
+        # Verify initial_state has populated messages and conversation
+        assert "messages" in captured_state
+        assert len(captured_state["messages"]) == 3  # 2 history + 1 current
+        assert captured_state["messages"][0]["role"] == "human"
+        assert captured_state["messages"][0]["content"] == "Hi there"
+        assert captured_state["messages"][1]["role"] == "assistant"
+        assert captured_state["messages"][1]["content"] == "Hello!"
+        assert captured_state["messages"][2]["role"] == "human"
+        assert captured_state["messages"][2]["content"] == "What is Alkemio?"
+
+        # Verify conversation is a formatted string
+        assert "conversation" in captured_state
+        assert "human:\nHi there" in captured_state["conversation"]
+        assert "assistant:\nHello!" in captured_state["conversation"]
+
+        # Verify current_question is the event message
+        assert captured_state["current_question"] == "What is Alkemio?"
+
+        # Verify the final response used the graph answer
+        assert result.result == "Graph answer"

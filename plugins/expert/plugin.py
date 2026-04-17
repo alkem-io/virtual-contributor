@@ -145,21 +145,47 @@ class ExpertPlugin:
         enforce_budget = self._enforce_context_budget
 
         async def retrieve_node(state: dict) -> dict:
-            query = state.get("current_question", event.message)
+            query = (
+                state.get("rephrased_question")
+                or state.get("current_question")
+                or event.message
+            )
             result = await self._knowledge_store.query(
                 collection=collection, query_texts=[query], n_results=n_results,
             )
             docs, filtered_result = _filter_and_format(result, score_threshold)
             docs, filtered_result = enforce_budget(docs, filtered_result)
             knowledge = "\n".join(docs)
-            return {"knowledge": knowledge, "sources": filtered_result}
+            # The expert state schema expects ``combined_knowledge_docs``
+            # — that's what the answer_question node reads via its
+            # ``{combined_knowledge_docs}`` prompt variable.  ``sources``
+            # is not in the schema and would be dropped on state merge,
+            # so the Response ends up with an empty sources list and the
+            # server won't append the "- [title](uri)" block.
+            return {"combined_knowledge_docs": knowledge}
 
         graph.compile(llm=self._llm, special_nodes={"retrieve": retrieve_node})
 
+        # Build messages list and conversation text from event history +
+        # the current user message.  The graph's `check_input` node expects
+        # a formatted `conversation` string of ``role:\ncontent`` turns.
+        history = list(event.history or [])
+        messages = [
+            {
+                "role": h.role.value if hasattr(h.role, "value") else str(h.role),
+                "content": h.content,
+            }
+            for h in history
+        ]
+        messages.append({"role": "human", "content": event.message})
+        conversation = "\n".join(
+            f"{m['role']}:\n{m['content']}" for m in messages
+        )
+
         initial_state = {
-            "messages": [],
+            "messages": messages,
             "current_question": event.message,
-            "conversation": "",
+            "conversation": conversation,
             "bok_id": event.body_of_knowledge_id or "",
             "description": event.description,
             "display_name": event.display_name,
