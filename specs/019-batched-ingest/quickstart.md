@@ -72,7 +72,7 @@ store_batch_1: duration=0.42s, items_in=14, items_out=14
 | File | What Changed |
 |------|-------------|
 | `core/domain/pipeline/engine.py` | PipelineContext: `all_document_ids`, `raw_chunks_by_doc` fields. IngestEngine: `batch_steps`/`finalize_steps` constructor, `_run_batched()`, `_run_steps()`, `_build_result()`. |
-| `core/domain/pipeline/steps.py` | ChangeDetectionStep uses `all_document_ids`. BoKSummaryStep supports `raw_chunks_by_doc`. |
+| `core/domain/pipeline/steps.py` | ChangeDetectionStep uses `all_document_ids`. BodyOfKnowledgeSummaryStep supports `raw_chunks_by_doc`. |
 | `core/config.py` | `batch_size` renamed to `ingest_batch_size`, default 5. |
 | `main.py` | Injects `ingest_batch_size` into plugin constructors. |
 | `plugins/ingest_website/plugin.py` | Split steps into `batch_steps` + `finalize_steps`. Added `ingest_batch_size` param. |
@@ -107,7 +107,7 @@ poetry run pytest tests/core/domain/test_pipeline_steps.py::TestIngestEngineBatc
 poetry run pytest tests/core/domain/test_pipeline_steps.py::TestChangeDetectionStepBatched
 
 # Batched BoK tests
-poetry run pytest tests/core/domain/test_pipeline_steps.py::TestBoKSummaryStepBatchedMode
+poetry run pytest tests/core/domain/test_pipeline_steps.py::TestBodyOfKnowledgeSummaryStepBatchedMode
 
 # Plugin tests (verify batch_steps/finalize_steps wiring)
 poetry run pytest tests/plugins/test_ingest_website.py::TestIngestWebsiteSummarizationBehavior
