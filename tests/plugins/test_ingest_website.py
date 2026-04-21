@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
@@ -365,16 +365,17 @@ class TestEmptyDocFilterAfterDedup:
 
         with patch("plugins.ingest_website.plugin.crawl", return_value=pages), \
              patch("plugins.ingest_website.plugin.IngestEngine") as mock_engine:
-            import asyncio
-            mock_engine.return_value.run = lambda *a, **kw: asyncio.coroutine(
-                lambda: MagicMock(success=True, errors=[])
-            )()
+            mock_engine.return_value.run = AsyncMock(
+                return_value=MagicMock(success=True, errors=[])
+            )
             await plugin.handle(event)
 
-        # IngestEngine.run receives the document list — check it doesn't include empty docs
-        run_call = mock_engine.return_value.run
-        # The engine was called — verify it was constructed
+        # Verify documents passed to engine.run exclude empty docs
         assert mock_engine.called
+        run_args, _ = mock_engine.return_value.run.await_args
+        docs = run_args[0]
+        assert len(docs) == 4
+        assert all(d.content.strip() for d in docs)
 
 
 # ---------------------------------------------------------------------------
@@ -389,15 +390,21 @@ class TestCrawlerRedirectURL:
         transport = httpx.MockTransport(handler)
         return patch(
             "plugins.ingest_website.crawler.httpx.AsyncClient",
-            return_value=httpx.AsyncClient(transport=transport),
+            return_value=httpx.AsyncClient(transport=transport, follow_redirects=True),
         )
 
     async def test_records_redirect_url(self):
-        """When a page redirects, the final URL is recorded."""
+        """When a page redirects, the final URL (post-redirect) is recorded."""
         def handler(request: httpx.Request) -> httpx.Response:
             url = str(request.url)
             if "/old-page" in url:
-                # Simulate redirect by returning response with different URL
+                # Simulate redirect: /old-page -> 302 -> /new-page
+                return httpx.Response(
+                    302,
+                    headers={"location": "https://example.com/new-page"},
+                    request=request,
+                )
+            if "/new-page" in url:
                 return httpx.Response(
                     200,
                     headers={"content-type": "text/html"},
@@ -408,15 +415,17 @@ class TestCrawlerRedirectURL:
                 200,
                 headers={"content-type": "text/html"},
                 text=_html_page("Home", "Home content.", ["https://example.com/old-page"]),
+                request=request,
             )
 
         with self._patch_transport(handler):
             results = await crawl("https://example.com", page_limit=10)
 
-        # All URLs should be from response.url, not the request URL
         urls = [r["url"] for r in results]
-        assert all(url.startswith("https://example.com") for url in urls)
-        assert len(results) >= 1
+        # The redirected page should be recorded under its final URL
+        assert "https://example.com/new-page" in urls
+        # The original /old-page should NOT appear as a recorded URL
+        assert "https://example.com/old-page" not in urls
 
 
 class TestIngestWebsitePlugin:
@@ -555,10 +564,9 @@ class TestIngestWebsiteSummarizationBehavior:
 
         with patch("plugins.ingest_website.plugin.crawl", return_value=self._MOCK_PAGES), \
              patch("plugins.ingest_website.plugin.IngestEngine") as mock_engine:
-            mock_engine.return_value.run = MagicMock(return_value=MagicMock(success=True, errors=[]))
-            # Make run() a coroutine
-            import asyncio
-            mock_engine.return_value.run = lambda *a, **kw: asyncio.coroutine(lambda: MagicMock(success=True, errors=[]))()
+            mock_engine.return_value.run = AsyncMock(
+                return_value=MagicMock(success=True, errors=[])
+            )
             await plugin.handle(event)
 
         # Inspect the steps passed to IngestEngine
@@ -585,8 +593,9 @@ class TestIngestWebsiteSummarizationBehavior:
 
         with patch("plugins.ingest_website.plugin.crawl", return_value=self._MOCK_PAGES), \
              patch("plugins.ingest_website.plugin.IngestEngine") as mock_engine:
-            import asyncio
-            mock_engine.return_value.run = lambda *a, **kw: asyncio.coroutine(lambda: MagicMock(success=True, errors=[]))()
+            mock_engine.return_value.run = AsyncMock(
+                return_value=MagicMock(success=True, errors=[])
+            )
             await plugin.handle(event)
 
         call_kwargs = mock_engine.call_args
@@ -608,8 +617,9 @@ class TestIngestWebsiteSummarizationBehavior:
 
         with patch("plugins.ingest_website.plugin.crawl", return_value=self._MOCK_PAGES), \
              patch("plugins.ingest_website.plugin.IngestEngine") as mock_engine:
-            import asyncio
-            mock_engine.return_value.run = lambda *a, **kw: asyncio.coroutine(lambda: MagicMock(success=True, errors=[]))()
+            mock_engine.return_value.run = AsyncMock(
+                return_value=MagicMock(success=True, errors=[])
+            )
             await plugin.handle(event)
 
         call_kwargs = mock_engine.call_args
