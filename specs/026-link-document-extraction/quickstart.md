@@ -44,13 +44,13 @@ The plugin listens for `IngestBodyOfKnowledge` events on RabbitMQ. When a space 
 
 Look for log messages from the space reader indicating successful extraction:
 
-```
+```text
 Extracted 15432 chars from https://dev.alkem.io/api/private/rest/storage/document/abc-123 (application/pdf)
 ```
 
 At the end of ingestion, a summary line appears:
 
-```
+```text
 Space tree: emitted 42 unique documents (link bodies fetched=8, skipped=2)
 ```
 
