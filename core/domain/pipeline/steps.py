@@ -13,16 +13,12 @@ from core.domain.ingest_pipeline import Chunk, DocumentMetadata
 from core.domain.pipeline.engine import PipelineContext
 from core.domain.pipeline.prompts import (
     BOK_MAP_TEMPLATE,
-    BOK_OVERVIEW_INITIAL,
-    BOK_OVERVIEW_SUBSEQUENT,
     BOK_OVERVIEW_SYSTEM,
     BOK_REDUCE_SYSTEM,
     BOK_REDUCE_TEMPLATE,
     DOCUMENT_MAP_TEMPLATE,
     DOCUMENT_REDUCE_SYSTEM,
     DOCUMENT_REDUCE_TEMPLATE,
-    DOCUMENT_REFINE_INITIAL,
-    DOCUMENT_REFINE_SUBSEQUENT,
     DOCUMENT_REFINE_SYSTEM,
 )
 from core.ports.embeddings import EmbeddingsPort
@@ -534,6 +530,14 @@ class DocumentSummaryStep:
                         concurrency=self._concurrency,
                         reduce_fanin=10,
                     )
+                    if not summary or not summary.strip():
+                        return _SummaryResult(
+                            doc_id=doc_id,
+                            error=(
+                                f"DocumentSummaryStep: summarization produced "
+                                f"no content for {doc_id}"
+                            ),
+                        )
                     source_meta = doc_chunks[0].metadata
                     summary_meta = DocumentMetadata(
                         document_id=f"{doc_id}-summary",

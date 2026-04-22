@@ -94,6 +94,16 @@ Failed to fetch https://example.com/broken: <error details>
 Link body too large (15728640 bytes) for https://example.com/huge.zip -- skipping
 ```
 
+## Running Tests
+
+```bash
+# All tests for this feature
+poetry run pytest tests/plugins/test_link_extractor.py tests/plugins/test_graphql_client_fetch.py tests/plugins/test_ingest_space.py -v
+
+# Full test suite
+poetry run pytest
+```
+
 ## Troubleshooting
 
 | Symptom | Likely Cause | Fix |

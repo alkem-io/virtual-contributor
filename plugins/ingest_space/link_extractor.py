@@ -36,8 +36,8 @@ _MIME_KIND = {
 # Fallback: sniff the first few bytes when the server didn't set a
 # useful content-type.  ZIP-based Office formats all start with "PK".
 _MAGIC = [
-    (b"%PDF", "pdf"),
-    (b"<!DOC", "html"),
+    (b"%pdf", "pdf"),
+    (b"<!doc", "html"),
     (b"<html", "html"),
     (b"<?xml", "html"),
 ]
@@ -82,9 +82,10 @@ def _detect_kind(body: bytes, content_type: str) -> str | None:
     for token, kind in _MIME_KIND.items():
         if token in ct:
             return kind
-    head = body[:8]
+    head = body[:32]
+    head_lower = head.lower()
     for signature, kind in _MAGIC:
-        if head.startswith(signature):
+        if head_lower.startswith(signature):
             return kind
     # ZIP magic (PK\x03\x04) may be DOCX or XLSX — we can't tell without
     # peeking inside.  Try DOCX first, then XLSX; both extractors are

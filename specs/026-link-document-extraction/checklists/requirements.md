@@ -39,12 +39,12 @@
 
 ## Test Coverage Assessment
 
-- [ ] Unit tests cover core extraction logic (link_extractor module)
-- [ ] Unit tests cover fetch_url() error handling paths
+- [x] Unit tests cover core extraction logic (link_extractor module)
+- [x] Unit tests cover fetch_url() error handling paths
 - [ ] Integration tests verify end-to-end link extraction during space ingestion
 
 ## Notes
 
 - The "No implementation details leak" item is marked unchecked because the functional requirements (FR-004 through FR-008) reference specific format names (PDF, DOCX, XLSX) and behaviors. These are retained because the formats are part of the feature's functional scope, not implementation choices -- the user story explicitly requires these specific format families to be supported. If the team prefers a more abstract specification, these could be generalized to "common document formats."
-- The test coverage items are marked unchecked because no tests were included in this implementation. This is a known gap documented in the plan.md constitution check (P4) and should be addressed in a follow-up.
+- Unit tests for `link_extractor` (`tests/plugins/test_link_extractor.py`) and `fetch_url()` (`tests/plugins/test_graphql_client_fetch.py`) are included. Integration tests remain a follow-up item.
 - This is a retrospec -- the specification was generated from existing code changes. All user stories and requirements accurately reflect the implemented behavior.
