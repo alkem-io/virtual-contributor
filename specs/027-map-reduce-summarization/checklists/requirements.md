@@ -39,10 +39,10 @@
 
 | Criterion | Status | Notes |
 |-----------|--------|-------|
-| Unit tests for new function | GAP | No tests for `_map_reduce_summarize` |
-| Integration tests for split-model | GAP | No tests verifying different map/reduce models are called |
-| Error tolerance tests | GAP | No tests for map failure skip or reduce concatenation fallback |
-| Existing tests still pass | UNVERIFIED | Existing step tests may need updating if they mock refine calls |
+| Unit tests for new function | PASS | 11 tests in `tests/core/domain/test_map_reduce.py` covering empty, single, multi-chunk, concurrency, tree-reduce, budget, and `reduce_fanin` guard |
+| Integration tests for split-model | PASS | Tests verify `reduce_llm_port` and `map_llm_port` wiring on `DocumentSummaryStep` and `BodyOfKnowledgeSummaryStep` |
+| Error tolerance tests | PASS | Tests cover map failure skip, all-maps-fail empty return, reduce failure concatenation fallback |
+| Existing tests still pass | PASS | Existing step tests updated to match map-reduce behavior (empty summary = error) |
 
 ### Documentation
 
@@ -56,12 +56,12 @@
 
 ## Summary
 
-**Overall assessment**: The specification is complete, correct, and architecturally aligned. The primary gap is the absence of unit tests for the new map-reduce function and its error tolerance paths. This is documented in the plan (P4 constitution check) and should be addressed in a follow-up spec or story.
+**Overall assessment**: The specification is complete, correct, and architecturally aligned. Unit tests cover the map-reduce function, split-model wiring, error tolerance paths, and the `reduce_fanin` guard.
 
 | Category | Score |
 |----------|-------|
 | Completeness | 9/10 |
 | Correctness | 10/10 |
 | Architecture | 10/10 |
-| Test coverage | 5/10 (gap) |
+| Test coverage | 9/10 |
 | Documentation | 10/10 |

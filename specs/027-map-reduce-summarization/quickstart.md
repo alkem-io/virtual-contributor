@@ -33,22 +33,22 @@ PLUGIN_TYPE=ingest-website poetry run python main.py
 
 Look for these log patterns:
 
-```
+```text
 INFO  Map-reduce: N/M partial summaries produced
 ```
 This confirms the map phase completed. `N` is the number of successful partial summaries, `M` is the total chunk count.
 
-```
+```text
 INFO  Map-reduce: level X reduced N -> M
 ```
 This confirms the tree-reduce is working. Each level merges batches of up to 10 partial summaries.
 
-```
+```text
 INFO  Summarized document <doc_id>
 ```
 This confirms a document summary was produced successfully.
 
-```
+```text
 INFO  Generating body-of-knowledge summary (N sections) [model=...]
 ```
 This confirms the BoK summary step is running with map-reduce.
@@ -90,7 +90,9 @@ Both should exist in the collection after a successful ingest run with sufficien
 ## Running Tests
 
 ```bash
+# All tests
 poetry run pytest tests/ -v
-```
 
-Note: As of this changeset, dedicated unit tests for the map-reduce function are not yet written (identified as a gap in the implementation plan).
+# Map-reduce specific tests
+poetry run pytest tests/core/domain/test_map_reduce.py -v
+```

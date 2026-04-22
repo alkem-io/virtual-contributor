@@ -31,10 +31,10 @@ Switches summarization from O(n) sequential refine to O(log n) parallel map-redu
 | P1 AI-Native Development | PASS | LLM summarization is a core AI capability of the system |
 | P2 SOLID Architecture | PASS | `_map_reduce_summarize` is a shared domain function with single responsibility; step classes extend (not modify) their constructor contract via optional parameters; split-model is additive, not breaking |
 | P3 No Vendor Lock-in | PASS | Works with any `LLMPort` implementation (Mistral, OpenAI, Anthropic); no vendor-specific API calls |
-| P4 Optimised Feedback Loops | GAP | No unit tests added for `_map_reduce_summarize`, the new constructor parameters, or the error tolerance paths. The refine-based tests (if any) are not updated. This is a test gap that should be addressed in a follow-up. |
+| P4 Optimised Feedback Loops | PASS | Unit tests cover `_map_reduce_summarize` (empty, single, multi-chunk, concurrency, tree-reduce, error tolerance) and split-model wiring for both `DocumentSummaryStep` and `BodyOfKnowledgeSummaryStep`. |
 | P5 Best Available Infrastructure | N/A | No infrastructure changes |
 | P6 SDD | PASS | Retrospec — spec generated from implemented code changes |
-| P7 No Filling Tests | N/A | No tests were added or modified in this changeset |
+| P7 No Filling Tests | PASS | All tests verify meaningful behavior: concurrency bounds, tree-reduce levels, error tolerance paths, split-model wiring |
 | P8 ADR | N/A | No new port, contract, or deployment topology changes; the algorithm change is internal to existing step classes |
 
 ### Architecture Standards
