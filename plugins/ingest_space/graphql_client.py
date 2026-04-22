@@ -59,6 +59,7 @@ class GraphQLClient:
             and parts.netloc != self._base_netloc
             and not parts.netloc.endswith("alkem.io")
         ):
+
             return url
         if path.startswith("/api/") or path.startswith("/rest/"):
             return urlunsplit((

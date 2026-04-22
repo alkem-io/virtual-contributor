@@ -59,6 +59,8 @@ async def _map_reduce_summarize(
     """
     if not chunks:
         return ""
+    if reduce_fanin < 2:
+        raise ValueError("reduce_fanin must be >= 2")
     if len(chunks) == 1:
         try:
             return await map_invoke([
