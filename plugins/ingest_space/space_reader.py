@@ -8,6 +8,7 @@ import logging
 import re
 
 from core.domain.ingest_pipeline import Document, DocumentMetadata, DocumentType
+from plugins.ingest_space.link_extractor import extract_text
 
 logger = logging.getLogger(__name__)
 
@@ -101,8 +102,16 @@ async def read_space_tree(graphql_client, space_id: str) -> list[Document]:
 
     documents: list[Document] = []
     seen: set[str] = set()
-    _process_space(space, documents, seen, depth=0)
-    logger.info("Space tree: emitted %d unique documents", len(documents))
+    stats = {"fetched": 0, "skipped": 0}
+    await _process_space(
+        space, documents, seen, graphql_client=graphql_client,
+        stats=stats, depth=0,
+    )
+    logger.info(
+        "Space tree: emitted %d unique documents "
+        "(link bodies fetched=%d, skipped=%d)",
+        len(documents), stats["fetched"], stats["skipped"],
+    )
     return documents
 
 
@@ -138,10 +147,13 @@ def _append_unique(
     return True
 
 
-def _process_space(
+async def _process_space(
     space: dict,
     documents: list[Document],
     seen: set[str],
+    *,
+    graphql_client,
+    stats: dict,
     depth: int,
 ) -> None:
     """Process a space node and its children recursively."""
@@ -166,17 +178,26 @@ def _process_space(
     collaboration = space.get("collaboration") or {}
     callouts_set = collaboration.get("calloutsSet") or {}
     for callout in callouts_set.get("callouts") or []:
-        _process_callout(callout, documents, seen)
+        await _process_callout(
+            callout, documents, seen,
+            graphql_client=graphql_client, stats=stats,
+        )
 
     # Recurse into subspaces
     for subspace in space.get("subspaces") or []:
-        _process_space(subspace, documents, seen, depth + 1)
+        await _process_space(
+            subspace, documents, seen,
+            graphql_client=graphql_client, stats=stats, depth=depth + 1,
+        )
 
 
-def _process_callout(
+async def _process_callout(
     callout: dict,
     documents: list[Document],
     seen: set[str],
+    *,
+    graphql_client,
+    stats: dict,
 ) -> None:
     """Process a callout and its contributions."""
     framing = (callout.get("framing") or {}).get("profile") or {}
@@ -252,7 +273,8 @@ def _process_callout(
                     uri=wb_profile.get("url") or None,
                 )
 
-        # Links
+        # Links — fetch the body and extract text so the actual
+        # referenced document becomes searchable, not just its URL.
         link = contrib.get("link")
         if link:
             uri = link.get("uri", "") or ""
@@ -260,11 +282,46 @@ def _process_callout(
             link_title = link_profile.get("displayName", "") or ""
             link_desc = link_profile.get("description", "") or ""
             if uri or link_title or link_desc:
+                fetched_text: str | None = None
+                if uri:
+                    fetched = await graphql_client.fetch_url(uri)
+                    if fetched is not None:
+                        body, content_type = fetched
+                        fetched_text = extract_text(body, content_type)
+                        if fetched_text:
+                            stats["fetched"] += 1
+                            logger.info(
+                                "Extracted %d chars from %s (%s)",
+                                len(fetched_text), uri, content_type or "?",
+                            )
+                        else:
+                            stats["skipped"] += 1
+                    else:
+                        stats["skipped"] += 1
+
                 parts = []
-                if callout_context:
-                    parts.append(callout_context)
-                parts.extend(p for p in (link_title, link_desc) if p)
-                parts.append(f"URL: {uri}" if uri else "")
+                if fetched_text:
+                    # We have the real document body — the callout
+                    # context would just mislead the answer LLM into
+                    # treating the PDF as part of the parent callout.
+                    # Keep a short title header for readability.
+                    if link_title:
+                        parts.append(f"# {link_title}")
+                    if link_desc:
+                        parts.append(link_desc)
+                    parts.append(fetched_text)
+                else:
+                    # No body fetched — fall back to lightweight
+                    # metadata enriched with callout context so the
+                    # fact that the link exists is still retrievable.
+                    if callout_context:
+                        parts.append(callout_context)
+                    if link_title:
+                        parts.append(f"# {link_title}")
+                    if link_desc:
+                        parts.append(link_desc)
+                    if uri:
+                        parts.append(f"URL: {uri}")
                 content = "\n\n".join(p for p in parts if p)
                 _append_unique(
                     documents, seen,

@@ -12,11 +12,13 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from core.domain.ingest_pipeline import Chunk, DocumentMetadata
 from core.domain.pipeline.engine import PipelineContext
 from core.domain.pipeline.prompts import (
-    BOK_OVERVIEW_INITIAL,
-    BOK_OVERVIEW_SUBSEQUENT,
+    BOK_MAP_TEMPLATE,
     BOK_OVERVIEW_SYSTEM,
-    DOCUMENT_REFINE_INITIAL,
-    DOCUMENT_REFINE_SUBSEQUENT,
+    BOK_REDUCE_SYSTEM,
+    BOK_REDUCE_TEMPLATE,
+    DOCUMENT_MAP_TEMPLATE,
+    DOCUMENT_REDUCE_SYSTEM,
+    DOCUMENT_REDUCE_TEMPLATE,
     DOCUMENT_REFINE_SYSTEM,
 )
 from core.ports.embeddings import EmbeddingsPort
@@ -29,6 +31,123 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Shared refine helper
 # ---------------------------------------------------------------------------
+
+async def _map_reduce_summarize(
+    chunks: list[str],
+    *,
+    map_invoke,
+    reduce_invoke,
+    max_length: int,
+    map_system: str,
+    map_template: str,
+    reduce_system: str,
+    reduce_template: str,
+    concurrency: int = 5,
+    reduce_fanin: int = 6,
+) -> str:
+    """Parallel map + tree-reduce summarisation.
+
+    The small ``map_invoke`` summarises each chunk in parallel (bounded
+    by ``concurrency``); the larger ``reduce_invoke`` merges the mini
+    summaries in batches of ``reduce_fanin`` until one remains.  Using
+    different models lets each phase play to its strengths — fast
+    per-chunk work vs. high-quality synthesis.
+
+    Failures in any single map call are logged and skipped — a partial
+    result is strictly better than none.  Reduce failures fall back to
+    concatenation so we never return empty when we have data.
+    """
+    if not chunks:
+        return ""
+    if reduce_fanin < 2:
+        raise ValueError("reduce_fanin must be >= 2")
+    if len(chunks) == 1:
+        try:
+            return await map_invoke([
+                {"role": "system", "content": map_system},
+                {"role": "human", "content": map_template.format(
+                    text=chunks[0], budget=max_length,
+                )},
+            ])
+        except Exception as exc:
+            logger.warning("Single-chunk summary failed: %s", exc)
+            return ""
+
+    # Map: per-chunk budget scales down so each mini stays small and
+    # the reduce step gets manageable input.  Floor at 500 so short
+    # summaries still carry meaningful facts.
+    per_chunk_budget = max(500, max_length // max(2, len(chunks)))
+    sem = asyncio.Semaphore(max(1, concurrency))
+
+    async def _map_one(idx: int, chunk: str) -> tuple[int, str | None]:
+        async with sem:
+            logger.debug(
+                "Map chunk %d/%d start (%d chars)",
+                idx + 1, len(chunks), len(chunk),
+            )
+            try:
+                mini = await map_invoke([
+                    {"role": "system", "content": map_system},
+                    {"role": "human", "content": map_template.format(
+                        text=chunk, budget=per_chunk_budget,
+                    )},
+                ])
+                logger.debug(
+                    "Map chunk %d/%d done (%d chars in → %d chars out)",
+                    idx + 1, len(chunks), len(chunk), len(mini),
+                )
+                return idx, mini
+            except Exception as exc:
+                logger.warning(
+                    "Map chunk %d/%d failed: %s", idx + 1, len(chunks), exc,
+                )
+                return idx, None
+
+    mapped = await asyncio.gather(
+        *[_map_one(i, c) for i, c in enumerate(chunks)]
+    )
+    minis = [m for _, m in sorted(mapped) if m]
+    logger.info(
+        "Map-reduce: %d/%d partial summaries produced",
+        len(minis), len(chunks),
+    )
+    if not minis:
+        return ""
+
+    # Reduce: merge in fanin-sized batches until one summary remains.
+    level = 0
+    while len(minis) > 1:
+        level += 1
+        next_level: list[str] = []
+        for i in range(0, len(minis), reduce_fanin):
+            batch = minis[i : i + reduce_fanin]
+            if len(batch) == 1:
+                next_level.append(batch[0])
+                continue
+            try:
+                merged = await reduce_invoke([
+                    {"role": "system", "content": reduce_system},
+                    {"role": "human", "content": reduce_template.format(
+                        summaries="\n\n---\n\n".join(batch),
+                        budget=max_length,
+                    )},
+                ])
+                next_level.append(merged)
+            except Exception as exc:
+                logger.warning(
+                    "Reduce level %d batch %d failed (%d inputs): %s; "
+                    "falling back to concatenation",
+                    level, i // reduce_fanin, len(batch), exc,
+                )
+                next_level.append("\n\n---\n\n".join(batch))
+        logger.info(
+            "Map-reduce: level %d reduced %d → %d",
+            level, len(minis), len(next_level),
+        )
+        minis = next_level
+
+    return minis[0]
+
 
 async def _refine_summarize(
     chunks: list[str],
@@ -297,12 +416,18 @@ class DocumentSummaryStep:
         chunk_threshold: int = 4,
         embeddings_port: EmbeddingsPort | None = None,
         embed_batch_size: int = 50,
+        reduce_llm_port: LLMPort | None = None,
     ) -> None:
         if chunk_threshold < 1:
             raise ValueError("chunk_threshold must be >= 1")
         if embed_batch_size < 1:
             raise ValueError("embed_batch_size must be >= 1")
         self._llm = llm_port
+        # Use the larger BoK model for the reduce phase when provided —
+        # it does the cross-chunk synthesis work and benefits from
+        # bigger context + better merge quality.  Falls back to the
+        # summarize LLM so existing deployments keep working.
+        self._reduce_llm = reduce_llm_port or llm_port
         self._summary_length = summary_length
         self._concurrency = concurrency
         self._chunk_threshold = chunk_threshold
@@ -395,14 +520,26 @@ class DocumentSummaryStep:
                         "Summarizing document %s (%d chunks) [model=%s]",
                         doc_id, len(doc_chunks), self._model_name,
                     )
-                    summary = await _refine_summarize(
+                    summary = await _map_reduce_summarize(
                         [c.content for c in doc_chunks],
-                        self._llm.invoke,
-                        self._summary_length,
-                        DOCUMENT_REFINE_SYSTEM,
-                        DOCUMENT_REFINE_INITIAL,
-                        DOCUMENT_REFINE_SUBSEQUENT,
+                        map_invoke=self._llm.invoke,
+                        reduce_invoke=self._reduce_llm.invoke,
+                        max_length=self._summary_length,
+                        map_system=DOCUMENT_REFINE_SYSTEM,
+                        map_template=DOCUMENT_MAP_TEMPLATE,
+                        reduce_system=DOCUMENT_REDUCE_SYSTEM,
+                        reduce_template=DOCUMENT_REDUCE_TEMPLATE,
+                        concurrency=self._concurrency,
+                        reduce_fanin=10,
                     )
+                    if not summary or not summary.strip():
+                        return _SummaryResult(
+                            doc_id=doc_id,
+                            error=(
+                                f"DocumentSummaryStep: summarization produced "
+                                f"no content for {doc_id}"
+                            ),
+                        )
                     source_meta = doc_chunks[0].metadata
                     summary_meta = DocumentMetadata(
                         document_id=f"{doc_id}-summary",
@@ -504,8 +641,13 @@ class BodyOfKnowledgeSummaryStep:
         max_section_chars: int = 30000,
         knowledge_store_port: "KnowledgeStorePort | None" = None,
         embeddings_port: "EmbeddingsPort | None" = None,
+        map_llm_port: LLMPort | None = None,
     ) -> None:
         self._llm = llm_port
+        # Optional cheap model for the map phase — each call just
+        # distils one section, so a fast model is fine and saves the
+        # big model for the reduce tree where synthesis quality matters.
+        self._map_llm = map_llm_port or llm_port
         self._summary_length = summary_length
         self._max_section_chars = max(1000, max_section_chars)
         self._store = knowledge_store_port
@@ -617,13 +759,17 @@ class BodyOfKnowledgeSummaryStep:
                 "Generating body-of-knowledge summary (%d sections) [model=%s]",
                 len(sections), self._model_name,
             )
-            bok_summary = await _refine_summarize(
+            bok_summary = await _map_reduce_summarize(
                 sections,
-                self._llm.invoke,
-                self._summary_length,
-                BOK_OVERVIEW_SYSTEM,
-                BOK_OVERVIEW_INITIAL,
-                BOK_OVERVIEW_SUBSEQUENT,
+                map_invoke=self._map_llm.invoke,
+                reduce_invoke=self._llm.invoke,
+                max_length=self._summary_length,
+                map_system=BOK_OVERVIEW_SYSTEM,
+                map_template=BOK_MAP_TEMPLATE,
+                reduce_system=BOK_REDUCE_SYSTEM,
+                reduce_template=BOK_REDUCE_TEMPLATE,
+                concurrency=5,
+                reduce_fanin=10,
             )
             bok_meta = DocumentMetadata(
                 document_id="body-of-knowledge-summary",

@@ -79,3 +79,75 @@ BOK_OVERVIEW_SUBSEQUENT = (
     "4. Keep all content specific and factual - no generic statements\n\n"
     "Refined overview:"
 )
+
+
+# ---------------------------------------------------------------------------
+# Map-reduce prompts (parallel chunk summaries + hierarchical merge)
+# ---------------------------------------------------------------------------
+
+DOCUMENT_MAP_TEMPLATE = (
+    "Summarize this portion of a larger document. Capture every specific "
+    "entity, number, name, date, URL, or technical term verbatim.\n"
+    "Use markdown: ### headers and bullet points. No filler, no opinions, "
+    "no repetition.\n"
+    "Target length: around {budget} characters; exceed only when needed to "
+    "preserve a fact.\n\n"
+    "Content:\n{text}\n\nPartial summary:"
+)
+
+DOCUMENT_REDUCE_SYSTEM = (
+    "You merge several partial summaries of the SAME document into one "
+    "cohesive summary without losing facts.\n\n"
+    "FORMAT:\n"
+    "- Markdown with ### headers and bullet points grouped by theme\n"
+    "- Dense factual bullets with specific entities, dates, numbers\n\n"
+    "REQUIREMENTS:\n"
+    "- Preserve every distinct fact from every partial summary\n"
+    "- Deduplicate: if two partials state the same fact, keep it once\n"
+    "- Reorder and regroup for coherence; do NOT add new facts\n\n"
+    "FORBIDDEN:\n"
+    "- No filler, no generic statements, no opinions\n"
+    "- No source attributions like \"one summary says\""
+)
+
+DOCUMENT_REDUCE_TEMPLATE = (
+    "Merge these partial summaries of a single document into one unified "
+    "summary.\n"
+    "Target length: around {budget} characters; exceed if needed to keep "
+    "a fact.\n\n"
+    "Partial summaries (separated by ---):\n{summaries}\n\n"
+    "Unified summary:"
+)
+
+BOK_MAP_TEMPLATE = (
+    "Extract the key themes, entities and facts from this section of a "
+    "body of knowledge. Focus on what makes it searchable — organization "
+    "names, participants, initiatives, dates, topic areas.\n"
+    "Use markdown (### headers, bullets). No filler.\n"
+    "Target length: around {budget} characters.\n\n"
+    "Section:\n{text}\n\nPartial overview:"
+)
+
+BOK_REDUCE_SYSTEM = (
+    "You merge partial overviews of a single body of knowledge into one "
+    "cohesive, search-optimised overview.\n\n"
+    "FORMAT:\n"
+    "- Markdown headers grouped by theme\n"
+    "- Bullet points of specific, searchable facts\n\n"
+    "REQUIREMENTS:\n"
+    "- Preserve every distinct theme, entity, date and connection\n"
+    "- Deduplicate shared facts\n"
+    "- Regroup by topic for coherence; do NOT invent facts\n\n"
+    "FORBIDDEN:\n"
+    "- No filler or generic statements\n"
+    "- No \"according to one summary\" attributions"
+)
+
+BOK_REDUCE_TEMPLATE = (
+    "Merge these partial overviews of a body of knowledge into one unified "
+    "overview.\n"
+    "Target length: around {budget} characters; exceed if needed to keep "
+    "a cross-cutting theme or entity.\n\n"
+    "Partial overviews (separated by ---):\n{summaries}\n\n"
+    "Unified overview:"
+)
