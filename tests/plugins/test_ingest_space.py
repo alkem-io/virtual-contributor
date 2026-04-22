@@ -461,10 +461,9 @@ class TestIngestSpaceSummarizationBehavior:
 
         with patch("plugins.ingest_space.space_reader.read_space_tree", return_value=mock_docs), \
              patch("plugins.ingest_space.plugin.IngestEngine") as mock_engine:
-            import asyncio
-            mock_engine.return_value.run = lambda *a, **kw: asyncio.coroutine(
-                lambda: MagicMock(success=True, errors=[])
-            )()
+            mock_engine.return_value.run = AsyncMock(
+                return_value=MagicMock(success=True, errors=[])
+            )
             await plugin.handle(event)
 
         return mock_engine

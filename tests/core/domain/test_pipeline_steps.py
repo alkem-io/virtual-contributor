@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import time
 
+import pytest
+
 from core.domain.ingest_pipeline import Chunk, Document, DocumentMetadata, IngestResult
 from core.domain.pipeline.engine import IngestEngine, PipelineContext
 from core.ports.knowledge_store import GetResult
@@ -2736,3 +2738,240 @@ class TestBoKSummaryStepBatchedMode:
         await step.execute(ctx)
 
         assert "body-of-knowledge-summary-0" in ctx.orphan_ids
+
+
+# ---------------------------------------------------------------------------
+# Spec 020: _refine_summarize partial summary on mid-stream failure
+# ---------------------------------------------------------------------------
+
+class TestRefineSummarizePartialFailure:
+    """Verify _refine_summarize returns partial summary on mid-stream failure."""
+
+    async def test_partial_summary_returned_on_midstream_failure(self):
+        """When round N fails after rounds 1..N-1 succeeded, return partial."""
+        from core.domain.pipeline.steps import _refine_summarize
+
+        call_count = 0
+
+        async def failing_invoke(messages):
+            nonlocal call_count
+            call_count += 1
+            if call_count <= 2:
+                return f"Summary after round {call_count}"
+            raise RuntimeError("LLM exploded on round 3")
+
+        result = await _refine_summarize(
+            chunks=["chunk1", "chunk2", "chunk3"],
+            llm_invoke=failing_invoke,
+            max_length=5000,
+            system_prompt="sys",
+            initial_template="initial: {budget} {text}",
+            subsequent_template="refine: {summary} {text} {budget}",
+        )
+        assert result == "Summary after round 2"
+        assert call_count == 3
+
+    async def test_first_round_failure_raises(self):
+        """When round 1 fails (no partial exists), exception propagates."""
+        from core.domain.pipeline.steps import _refine_summarize
+
+        async def always_fail(messages):
+            raise RuntimeError("Round 1 failure")
+
+        with pytest.raises(RuntimeError, match="Round 1 failure"):
+            await _refine_summarize(
+                chunks=["chunk1", "chunk2"],
+                llm_invoke=always_fail,
+                max_length=5000,
+                system_prompt="sys",
+                initial_template="initial: {budget} {text}",
+                subsequent_template="refine: {summary} {text} {budget}",
+            )
+
+    async def test_empty_chunks_returns_empty(self):
+        """Empty chunk list returns empty string without calling LLM."""
+        from core.domain.pipeline.steps import _refine_summarize
+
+        async def should_not_be_called(messages):
+            raise AssertionError("LLM should not be called")
+
+        result = await _refine_summarize(
+            chunks=[],
+            llm_invoke=should_not_be_called,
+            max_length=5000,
+            system_prompt="sys",
+            initial_template="initial: {budget} {text}",
+            subsequent_template="refine: {summary} {text} {budget}",
+        )
+        assert result == ""
+
+
+# ---------------------------------------------------------------------------
+# Spec 020: BoK section grouping reduces refinement rounds
+# ---------------------------------------------------------------------------
+
+class TestBoKSectionGrouping:
+    """Verify BodyOfKnowledgeSummaryStep groups sections to reduce LLM rounds."""
+
+    async def test_groups_sections_to_reduce_rounds(self):
+        """Many small sections get grouped, resulting in fewer LLM calls."""
+        llm = MockLLMPort(response="BoK overview")
+        ctx = PipelineContext(
+            collection_name="test",
+            documents=[_make_doc(doc_id=f"d{i}") for i in range(10)],
+            chunks=[],
+        )
+        # Populate chunks: one short chunk per document
+        for i in range(10):
+            ctx.chunks.append(Chunk(
+                content=f"Short content for doc {i}",
+                metadata=DocumentMetadata(
+                    document_id=f"d{i}", source="s", type="t",
+                    title="T", embedding_type="chunk",
+                ),
+                chunk_index=0,
+            ))
+
+        # max_section_chars large enough to group all 10 into fewer rounds
+        step = BodyOfKnowledgeSummaryStep(
+            llm_port=llm, max_section_chars=5000,
+        )
+        await step.execute(ctx)
+
+        # 10 sections should be grouped into fewer LLM calls
+        # (initial + subsequent rounds). Without grouping: 10 calls.
+        # With grouping (each ~25 chars, limit 5000): should be 1-2 calls.
+        assert len(llm.calls) < 10
+
+    async def test_no_grouping_for_single_section(self):
+        """A single section should not trigger grouping logic."""
+        llm = MockLLMPort(response="BoK overview")
+        ctx = PipelineContext(
+            collection_name="test",
+            documents=[_make_doc(doc_id="d0")],
+            chunks=[Chunk(
+                content="content",
+                metadata=DocumentMetadata(
+                    document_id="d0", source="s", type="t",
+                    title="T", embedding_type="chunk",
+                ),
+                chunk_index=0,
+            )],
+        )
+
+        step = BodyOfKnowledgeSummaryStep(llm_port=llm, max_section_chars=100)
+        await step.execute(ctx)
+
+        # Single section = 1 LLM call (initial only, no grouping)
+        assert len(llm.calls) == 1
+
+    async def test_max_section_chars_floor(self):
+        """max_section_chars below 1000 gets clamped to 1000."""
+        llm = MockLLMPort()
+        step = BodyOfKnowledgeSummaryStep(llm_port=llm, max_section_chars=500)
+        assert step._max_section_chars == 1000
+
+
+# ---------------------------------------------------------------------------
+# Spec 020: BoK inline embed+store persistence
+# ---------------------------------------------------------------------------
+
+class TestBoKInlinePersistence:
+    """Verify BoK is embedded and stored inline when both ports are provided."""
+
+    async def test_bok_stored_inline_when_ports_provided(self):
+        """BoK is embedded and stored immediately when embeddings+store are given."""
+        llm = MockLLMPort(response="BoK inline summary")
+        store = MockKnowledgeStorePort()
+        embeddings = MockEmbeddingsPort()
+
+        ctx = PipelineContext(
+            collection_name="test-col",
+            documents=[_make_doc(doc_id="d0")],
+            chunks=[Chunk(
+                content="chunk text",
+                metadata=DocumentMetadata(
+                    document_id="d0", source="s", type="t",
+                    title="T", embedding_type="chunk",
+                ),
+                chunk_index=0,
+            )],
+        )
+
+        step = BodyOfKnowledgeSummaryStep(
+            llm_port=llm,
+            knowledge_store_port=store,
+            embeddings_port=embeddings,
+        )
+        await step.execute(ctx)
+
+        # BoK should be stored inline
+        assert ctx.chunks_stored == 1
+        stored = store.collections.get("test-col", [])
+        bok_entries = [e for e in stored if e["id"] == "body-of-knowledge-summary-0"]
+        assert len(bok_entries) == 1
+        assert bok_entries[0]["document"] == "BoK inline summary"
+
+        # BoK should NOT be appended to context.chunks (stored inline)
+        bok_chunks = [c for c in ctx.chunks if c.metadata.document_id == "body-of-knowledge-summary"]
+        assert len(bok_chunks) == 0
+
+    async def test_bok_falls_back_to_context_on_inline_failure(self):
+        """When inline persist fails, BoK is appended to context.chunks."""
+        llm = MockLLMPort(response="BoK fallback summary")
+        embeddings = MockEmbeddingsPort()
+
+        # Store that raises on ingest
+        store = MockKnowledgeStorePort()
+
+        async def failing_ingest(*args, **kwargs):
+            raise RuntimeError("Store unavailable")
+
+        store.ingest = failing_ingest
+
+        ctx = PipelineContext(
+            collection_name="test-col",
+            documents=[_make_doc(doc_id="d0")],
+            chunks=[Chunk(
+                content="chunk text",
+                metadata=DocumentMetadata(
+                    document_id="d0", source="s", type="t",
+                    title="T", embedding_type="chunk",
+                ),
+                chunk_index=0,
+            )],
+        )
+
+        step = BodyOfKnowledgeSummaryStep(
+            llm_port=llm,
+            knowledge_store_port=store,
+            embeddings_port=embeddings,
+        )
+        await step.execute(ctx)
+
+        # BoK should be appended to chunks (fallback path)
+        bok_chunks = [c for c in ctx.chunks if c.metadata.document_id == "body-of-knowledge-summary"]
+        assert len(bok_chunks) == 1
+        assert bok_chunks[0].content == "BoK fallback summary"
+
+    async def test_bok_appended_to_chunks_without_ports(self):
+        """Without store/embeddings ports, BoK goes into context.chunks."""
+        llm = MockLLMPort(response="BoK no-port summary")
+        ctx = PipelineContext(
+            collection_name="test-col",
+            documents=[_make_doc(doc_id="d0")],
+            chunks=[Chunk(
+                content="chunk text",
+                metadata=DocumentMetadata(
+                    document_id="d0", source="s", type="t",
+                    title="T", embedding_type="chunk",
+                ),
+                chunk_index=0,
+            )],
+        )
+
+        step = BodyOfKnowledgeSummaryStep(llm_port=llm)
+        await step.execute(ctx)
+
+        bok_chunks = [c for c in ctx.chunks if c.metadata.document_id == "body-of-knowledge-summary"]
+        assert len(bok_chunks) == 1
