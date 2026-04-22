@@ -127,6 +127,7 @@ class IngestWebsitePlugin:
             if self._summarize_enabled:
                 batch_steps.append(DocumentSummaryStep(
                     llm_port=summary_llm,
+                    reduce_llm_port=self._bok_llm or summary_llm,
                     concurrency=self._summarize_concurrency,
                     chunk_threshold=self._chunk_threshold,
                     embeddings_port=self._embeddings,
@@ -141,6 +142,7 @@ class IngestWebsitePlugin:
                 bok_llm = self._bok_llm or summary_llm
                 finalize_steps.append(BodyOfKnowledgeSummaryStep(
                     llm_port=bok_llm,
+                    map_llm_port=summary_llm,
                     knowledge_store_port=self._knowledge_store,
                     embeddings_port=self._embeddings,
                 ))
