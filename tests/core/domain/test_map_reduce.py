@@ -13,7 +13,7 @@ from core.domain.pipeline.steps import (
     DocumentSummaryStep,
     _map_reduce_summarize,
 )
-from tests.conftest import MockEmbeddingsPort, MockLLMPort
+from tests.conftest import MockLLMPort
 
 
 # ---------------------------------------------------------------------------
@@ -260,6 +260,19 @@ class TestMapReduceSummarize:
         for call in mock_map.calls:
             human_content = call[1]["content"]
             assert "Budget: 500" in human_content
+
+    async def test_reduce_fanin_below_2_raises(self):
+        """reduce_fanin=1 would cause an infinite reduce loop; must reject."""
+        mock_map = MockLLMPort(response="mini")
+        mock_reduce = MockLLMPort(response="final")
+        with pytest.raises(ValueError, match="reduce_fanin must be >= 2"):
+            await _map_reduce_summarize(
+                ["c0", "c1"],
+                map_invoke=mock_map.invoke,
+                reduce_invoke=mock_reduce.invoke,
+                reduce_fanin=1,
+                **_DEFAULT_KWARGS,
+            )
 
 
 # ---------------------------------------------------------------------------

@@ -29,8 +29,18 @@ class TestFileParsers:
         assert result is None or isinstance(result, str)
 
 
+def _mock_graphql_client():
+    mock = AsyncMock()
+    mock.fetch_url = AsyncMock(return_value=None)
+    return mock
+
+
+def _default_stats():
+    return {"fetched": 0, "skipped": 0}
+
+
 class TestSpaceReader:
-    def test_process_space_extracts_description(self):
+    async def test_process_space_extracts_description(self):
         space = {
             "id": "space-1",
             "profile": {"displayName": "Test Space", "description": "A test space"},
@@ -38,11 +48,11 @@ class TestSpaceReader:
             "subspaces": [],
         }
         documents = []
-        _process_space(space, documents, set(), depth=0)
+        await _process_space(space, documents, set(), graphql_client=_mock_graphql_client(), stats=_default_stats(), depth=0)
         assert len(documents) == 1
         assert "Test Space" in documents[0].content
 
-    def test_process_callouts(self):
+    async def test_process_callouts(self):
         space = {
             "id": "space-1",
             "profile": {"displayName": "S", "description": "D"},
@@ -59,11 +69,11 @@ class TestSpaceReader:
             "subspaces": [],
         }
         documents = []
-        _process_space(space, documents, set(), depth=0)
+        await _process_space(space, documents, set(), graphql_client=_mock_graphql_client(), stats=_default_stats(), depth=0)
         # Space + callout + post = 3
         assert len(documents) == 3
 
-    def test_recursive_subspaces(self):
+    async def test_recursive_subspaces(self):
         space = {
             "id": "space-1",
             "profile": {"displayName": "Root", "description": "Root desc"},
@@ -76,14 +86,14 @@ class TestSpaceReader:
             }],
         }
         documents = []
-        _process_space(space, documents, set(), depth=0)
+        await _process_space(space, documents, set(), graphql_client=_mock_graphql_client(), stats=_default_stats(), depth=0)
         assert len(documents) == 2  # Root + subspace
 
     # ------------------------------------------------------------------
     # Callout context enrichment
     # ------------------------------------------------------------------
 
-    def test_callout_context_prepended_to_post(self):
+    async def test_callout_context_prepended_to_post(self):
         space = {
             "id": "space-1",
             "profile": {"displayName": "S", "description": "Desc"},
@@ -106,7 +116,7 @@ class TestSpaceReader:
             "subspaces": [],
         }
         documents = []
-        _process_space(space, documents, set(), depth=0)
+        await _process_space(space, documents, set(), graphql_client=_mock_graphql_client(), stats=_default_stats(), depth=0)
         post_doc = next(d for d in documents if d.metadata.document_id == "post-1")
         # Context comes before post content
         assert post_doc.content.startswith("Topic A")
@@ -117,7 +127,7 @@ class TestSpaceReader:
         body_start = post_doc.content.index("Post body here")
         assert ctx_end < body_start
 
-    def test_callout_context_prepended_to_whiteboard(self):
+    async def test_callout_context_prepended_to_whiteboard(self):
         space = {
             "id": "space-1",
             "profile": {"displayName": "S", "description": "Desc"},
@@ -138,13 +148,13 @@ class TestSpaceReader:
             "subspaces": [],
         }
         documents = []
-        _process_space(space, documents, set(), depth=0)
+        await _process_space(space, documents, set(), graphql_client=_mock_graphql_client(), stats=_default_stats(), depth=0)
         wb_doc = next(d for d in documents if d.metadata.document_id == "wb-1")
         assert wb_doc.content.startswith("Topic B")
         assert "About topic B" in wb_doc.content
         assert "whiteboard data" in wb_doc.content
 
-    def test_callout_context_prepended_to_link(self):
+    async def test_callout_context_prepended_to_link(self):
         space = {
             "id": "space-1",
             "profile": {"displayName": "S", "description": "Desc"},
@@ -168,14 +178,14 @@ class TestSpaceReader:
             "subspaces": [],
         }
         documents = []
-        _process_space(space, documents, set(), depth=0)
+        await _process_space(space, documents, set(), graphql_client=_mock_graphql_client(), stats=_default_stats(), depth=0)
         link_doc = next(d for d in documents if d.metadata.document_id == "link-1")
         assert link_doc.content.startswith("Resources")
         assert "Useful links" in link_doc.content
         assert "Example" in link_doc.content
         assert "https://example.com" in link_doc.content
 
-    def test_callout_context_with_empty_description(self):
+    async def test_callout_context_with_empty_description(self):
         space = {
             "id": "space-1",
             "profile": {"displayName": "S", "description": "Desc"},
@@ -195,13 +205,13 @@ class TestSpaceReader:
             "subspaces": [],
         }
         documents = []
-        _process_space(space, documents, set(), depth=0)
+        await _process_space(space, documents, set(), graphql_client=_mock_graphql_client(), stats=_default_stats(), depth=0)
         post_doc = next(d for d in documents if d.metadata.document_id == "post-1")
         # Context is just the name (no description separator)
         assert post_doc.content.startswith("Just Name")
         assert "Body" in post_doc.content
 
-    def test_callout_description_truncated_at_400_chars(self):
+    async def test_callout_description_truncated_at_400_chars(self):
         long_desc = "A" * 600  # plain text, no HTML
         space = {
             "id": "space-1",
@@ -222,7 +232,7 @@ class TestSpaceReader:
             "subspaces": [],
         }
         documents = []
-        _process_space(space, documents, set(), depth=0)
+        await _process_space(space, documents, set(), graphql_client=_mock_graphql_client(), stats=_default_stats(), depth=0)
         post_doc = next(d for d in documents if d.metadata.document_id == "post-1")
         # The callout context should contain at most 400 chars of description
         # Split on the post title marker to isolate the context prefix
@@ -235,7 +245,7 @@ class TestSpaceReader:
     # URI propagation
     # ------------------------------------------------------------------
 
-    def test_space_uri_propagated(self):
+    async def test_space_uri_propagated(self):
         space = {
             "id": "space-1",
             "profile": {
@@ -247,10 +257,10 @@ class TestSpaceReader:
             "subspaces": [],
         }
         documents = []
-        _process_space(space, documents, set(), depth=0)
+        await _process_space(space, documents, set(), graphql_client=_mock_graphql_client(), stats=_default_stats(), depth=0)
         assert documents[0].metadata.uri == "https://app.alkemio.org/space-1"
 
-    def test_post_uri_from_profile_url(self):
+    async def test_post_uri_from_profile_url(self):
         space = {
             "id": "space-1",
             "profile": {"displayName": "S", "description": "Desc"},
@@ -271,11 +281,11 @@ class TestSpaceReader:
             "subspaces": [],
         }
         documents = []
-        _process_space(space, documents, set(), depth=0)
+        await _process_space(space, documents, set(), graphql_client=_mock_graphql_client(), stats=_default_stats(), depth=0)
         post_doc = next(d for d in documents if d.metadata.document_id == "post-1")
         assert post_doc.metadata.uri == "https://app.alkemio.org/post-1"
 
-    def test_link_uri_prefers_link_uri_over_profile_url(self):
+    async def test_link_uri_prefers_link_uri_over_profile_url(self):
         space = {
             "id": "space-1",
             "profile": {"displayName": "S", "description": "Desc"},
@@ -297,11 +307,11 @@ class TestSpaceReader:
             "subspaces": [],
         }
         documents = []
-        _process_space(space, documents, set(), depth=0)
+        await _process_space(space, documents, set(), graphql_client=_mock_graphql_client(), stats=_default_stats(), depth=0)
         link_doc = next(d for d in documents if d.metadata.document_id == "link-1")
         assert link_doc.metadata.uri == "https://external.com"
 
-    def test_empty_url_stored_as_none(self):
+    async def test_empty_url_stored_as_none(self):
         space = {
             "id": "space-1",
             "profile": {"displayName": "S", "description": "Desc", "url": ""},
@@ -309,10 +319,10 @@ class TestSpaceReader:
             "subspaces": [],
         }
         documents = []
-        _process_space(space, documents, set(), depth=0)
+        await _process_space(space, documents, set(), graphql_client=_mock_graphql_client(), stats=_default_stats(), depth=0)
         assert documents[0].metadata.uri is None
 
-    def test_callout_uri_propagated(self):
+    async def test_callout_uri_propagated(self):
         space = {
             "id": "space-1",
             "profile": {"displayName": "S", "description": "Desc"},
@@ -328,7 +338,7 @@ class TestSpaceReader:
             "subspaces": [],
         }
         documents = []
-        _process_space(space, documents, set(), depth=0)
+        await _process_space(space, documents, set(), graphql_client=_mock_graphql_client(), stats=_default_stats(), depth=0)
         callout_doc = next(d for d in documents if d.metadata.document_id == "co-1")
         assert callout_doc.metadata.uri == "https://app.alkemio.org/callout-1"
 

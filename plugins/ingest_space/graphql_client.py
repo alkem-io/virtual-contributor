@@ -43,11 +43,17 @@ class GraphQLClient:
         ``https://alkem.io/api/private/rest/storage/document/<id>``) even
         on dev installations.  If the URI path looks like an Alkemio
         internal API call, swap in our deployment's scheme+host.
+
+        Only rewrites when the host is the configured Alkemio host, a
+        known ``*.alkem.io`` domain, or missing (relative URL).
         """
         if not url:
             return url
         parts = urlsplit(url)
         path = parts.path or ""
+        # Only rewrite if host is known Alkemio or missing (relative URL)
+        if parts.netloc and parts.netloc != self._base_netloc and not parts.netloc.endswith("alkem.io"):
+            return url
         if path.startswith("/api/") or path.startswith("/rest/"):
             return urlunsplit((
                 self._base_scheme,
@@ -78,15 +84,17 @@ class GraphQLClient:
                 return None
 
         target = self._rewrite_alkemio_uri(url)
+        target_parts = urlsplit(target)
+        headers: dict[str, str] = {}
+        if target_parts.netloc == self._base_netloc and self._session_token:
+            headers["Authorization"] = f"Bearer {self._session_token}"
         try:
             async with httpx.AsyncClient(
                 timeout=60.0, follow_redirects=True,
             ) as client:
                 resp = await client.get(
                     target,
-                    headers={
-                        "Authorization": f"Bearer {self._session_token}",
-                    },
+                    headers=headers,
                 )
                 if resp.status_code != 200:
                     logger.info(
