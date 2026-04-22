@@ -30,9 +30,10 @@ class TestFileParsers:
 
 
 def _mock_graphql_client():
-    mock = AsyncMock()
-    mock.fetch_url = AsyncMock(return_value=None)
-    return mock
+    """Create an AsyncMock graphql_client with fetch_url returning None."""
+    client = AsyncMock()
+    client.fetch_url = AsyncMock(return_value=None)
+    return client
 
 
 def _default_stats():
@@ -533,3 +534,158 @@ class TestIngestSpaceSummarizationBehavior:
         finalize_names = [type(s).__name__ for s in call_kwargs.kwargs["finalize_steps"]]
         assert "DocumentSummaryStep" not in batch_names
         assert "BodyOfKnowledgeSummaryStep" not in finalize_names
+
+
+class TestLinkFetching:
+    """Tests for link contribution body fetching in _process_space."""
+
+    def _link_space(self, link_uri="https://example.com/doc.pdf"):
+        """Build a minimal space dict with a single link contribution."""
+        return {
+            "id": "space-1",
+            "profile": {"displayName": "S", "description": "Desc"},
+            "collaboration": {"calloutsSet": {"callouts": [{
+                "id": "co-1",
+                "framing": {"profile": {
+                    "displayName": "Resources",
+                    "description": "Useful resources",
+                }},
+                "contributions": [{
+                    "link": {
+                        "id": "link-1",
+                        "uri": link_uri,
+                        "profile": {
+                            "displayName": "My Document",
+                            "description": "A document about things",
+                        },
+                    },
+                }],
+            }]}},
+            "subspaces": [],
+        }
+
+    async def test_link_with_successful_fetch(self):
+        """When fetch_url succeeds and extract_text returns content, the
+        document body contains the extracted text instead of just URL metadata."""
+        gc = _mock_graphql_client()
+        gc.fetch_url = AsyncMock(return_value=(b"pdf bytes", "application/pdf"))
+        stats = _default_stats()
+
+        with patch(
+            "plugins.ingest_space.space_reader.extract_text",
+            return_value="Extracted PDF content here",
+        ):
+            documents = []
+            await _process_space(
+                self._link_space(), documents, set(),
+                graphql_client=gc, stats=stats, depth=0,
+            )
+
+        link_doc = next(d for d in documents if d.metadata.document_id == "link-1")
+        assert "Extracted PDF content here" in link_doc.content
+        # The title header should still be present
+        assert "My Document" in link_doc.content
+        # Callout context should NOT be prepended when we have real content
+        assert not link_doc.content.startswith("Resources")
+        assert stats["fetched"] == 1
+        assert stats["skipped"] == 0
+
+    async def test_link_with_failed_fetch(self):
+        """When fetch_url returns None, fallback to metadata (callout context
+        + title + URL)."""
+        gc = _mock_graphql_client()
+        gc.fetch_url = AsyncMock(return_value=None)
+        stats = _default_stats()
+
+        documents = []
+        await _process_space(
+            self._link_space(), documents, set(),
+            graphql_client=gc, stats=stats, depth=0,
+        )
+
+        link_doc = next(d for d in documents if d.metadata.document_id == "link-1")
+        # Fallback: callout context is prepended
+        assert link_doc.content.startswith("Resources")
+        assert "Useful resources" in link_doc.content
+        assert "My Document" in link_doc.content
+        assert "https://example.com/doc.pdf" in link_doc.content
+        assert stats["skipped"] == 1
+        assert stats["fetched"] == 0
+
+    async def test_link_with_unsupported_format(self):
+        """When fetch succeeds but extract_text returns None (unsupported
+        format), fallback to metadata."""
+        gc = _mock_graphql_client()
+        gc.fetch_url = AsyncMock(return_value=(b"\x00\x01binary", "application/octet-stream"))
+        stats = _default_stats()
+
+        with patch(
+            "plugins.ingest_space.space_reader.extract_text",
+            return_value=None,
+        ):
+            documents = []
+            await _process_space(
+                self._link_space(), documents, set(),
+                graphql_client=gc, stats=stats, depth=0,
+            )
+
+        link_doc = next(d for d in documents if d.metadata.document_id == "link-1")
+        # Fallback path: callout context + URL metadata
+        assert link_doc.content.startswith("Resources")
+        assert "https://example.com/doc.pdf" in link_doc.content
+        assert stats["skipped"] == 1
+        assert stats["fetched"] == 0
+
+    async def test_stats_tracking_multiple_links(self):
+        """Stats correctly count fetched and skipped across multiple links."""
+        space = {
+            "id": "space-1",
+            "profile": {"displayName": "S", "description": "Desc"},
+            "collaboration": {"calloutsSet": {"callouts": [{
+                "id": "co-1",
+                "framing": {"profile": {"displayName": "Links", "description": ""}},
+                "contributions": [
+                    {
+                        "link": {
+                            "id": "link-ok",
+                            "uri": "https://example.com/good.pdf",
+                            "profile": {"displayName": "Good", "description": "A good doc"},
+                        },
+                    },
+                    {
+                        "link": {
+                            "id": "link-fail",
+                            "uri": "https://example.com/bad",
+                            "profile": {"displayName": "Bad", "description": "A bad link"},
+                        },
+                    },
+                ],
+            }]}},
+            "subspaces": [],
+        }
+
+        call_count = 0
+
+        async def side_effect(url):
+            nonlocal call_count
+            call_count += 1
+            if "good" in url:
+                return (b"pdf data", "application/pdf")
+            return None
+
+        gc = _mock_graphql_client()
+        gc.fetch_url = AsyncMock(side_effect=side_effect)
+        stats = _default_stats()
+
+        with patch(
+            "plugins.ingest_space.space_reader.extract_text",
+            return_value="Extracted text",
+        ):
+            documents = []
+            await _process_space(
+                space, documents, set(),
+                graphql_client=gc, stats=stats, depth=0,
+            )
+
+        assert stats["fetched"] == 1
+        assert stats["skipped"] == 1
