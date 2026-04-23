@@ -17,6 +17,7 @@ BASE_DELAY = 1.0
 class EmbedFn(Protocol):
     """Minimal protocol for an async embed function."""
     async def embed(self, texts: list[str]) -> list[list[float]]: ...
+    async def embed_query(self, texts: list[str]) -> list[list[float]]: ...
 
 
 class ChromaDBAdapter:
@@ -55,7 +56,7 @@ class ChromaDBAdapter:
                 "ChromaDBAdapter requires an embeddings provider when "
                 "embedding_function=None"
             )
-        query_embeddings = await self._embeddings.embed(query_texts)
+        query_embeddings = await self._embeddings.embed_query(query_texts)
 
         def _query():
             col = self._client.get_or_create_collection(

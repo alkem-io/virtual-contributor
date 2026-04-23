@@ -122,6 +122,7 @@ def _create_adapters(config: BaseConfig, container: Container) -> None:
                 api_key=config.embeddings_api_key,
                 endpoint=config.embeddings_endpoint,
                 model_name=config.embeddings_model_name or "qwen3-embedding-8b",
+                query_instruction=config.embeddings_query_instruction,
             ),
         )
 
