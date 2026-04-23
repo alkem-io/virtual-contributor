@@ -241,6 +241,10 @@ class BaseConfig(BaseSettings):
     embeddings_api_key: str | None = None
     embeddings_endpoint: str | None = None
     embeddings_model_name: str | None = None
+    # Query-side instruction prefix for retrieval. If None, adapters auto-apply
+    # the Qwen3 retrieval prompt when the model name starts with
+    # "qwen3-embedding"; any explicit value (including "") is used verbatim.
+    embeddings_query_instruction: str | None = None
 
     # Summarization LLM — optional separate model for summarization tasks
     summarize_llm_provider: LLMProvider | None = None

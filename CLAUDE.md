@@ -84,6 +84,19 @@ Config → logging → plugin discovery → adapter wiring (via container) → p
 - Event factories: `make_input(...)`, `make_ingest_website(...)` for building test events with sensible defaults.
 - Plugin tests instantiate with mock ports, call `handle()`, and assert on LLM calls, knowledge store queries, and response content.
 
+## Commit Conventions
+
+This repo uses [Conventional Commits](https://www.conventionalcommits.org/) for automatic versioning via `python-semantic-release`. The commit prefix determines the version bump:
+
+| Prefix | Version bump | Example |
+|--------|-------------|---------|
+| `fix:` | Patch (0.1.0 → 0.1.1) | `fix: handle empty RAG results` |
+| `feat:` | Minor (0.1.0 → 0.2.0) | `feat: add PDF ingestion step` |
+| `feat!:` or `BREAKING CHANGE:` footer | Major (0.1.0 → 1.0.0) | `feat!: redesign plugin contract` |
+| `chore:`, `docs:`, `test:`, `refactor:`, `ci:` | No release | `docs: update README` |
+
+Scopes are optional: `feat(ingest): add retry logic`. All commits merged to `main` are analyzed — the highest bump wins.
+
 ## Key Design Decisions
 
 - `docs/adr/` contains Architecture Decision Records (microkernel, plugin contract, unified LLM adapter, content hash dedup).

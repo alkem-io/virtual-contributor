@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "alkemio-virtual-contributor"
-version = "0.1.0"
+version = "1.0.0"
 description = "Alkemio Virtual Contributor — unified microkernel engine with pluggable handlers"
 authors = ["Alkemio BV <info@alkem.io>"]
 license = "EUPL-1.2"
@@ -68,6 +68,12 @@ omit = [
     "main.py",
     "plugins/ingest_space/graphql_client.py",
 ]
+
+[tool.semantic_release]
+version_toml = ["pyproject.toml:tool.poetry.version"]
+branch = "main"
+commit_message = "chore(release): {version}"
+build_command = ""
 
 [build-system]
 requires = ["poetry-core"]

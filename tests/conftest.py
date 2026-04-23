@@ -43,9 +43,14 @@ class MockEmbeddingsPort:
     def __init__(self, dimension: int = 384) -> None:
         self.dimension = dimension
         self.calls: list[list[str]] = []
+        self.query_calls: list[list[str]] = []
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
         self.calls.append(texts)
+        return [[0.1] * self.dimension for _ in texts]
+
+    async def embed_query(self, texts: list[str]) -> list[list[float]]:
+        self.query_calls.append(texts)
         return [[0.1] * self.dimension for _ in texts]
 
 
