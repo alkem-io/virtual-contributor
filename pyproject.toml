@@ -69,6 +69,12 @@ omit = [
     "plugins/ingest_space/graphql_client.py",
 ]
 
+[tool.semantic_release]
+version_toml = ["pyproject.toml:tool.poetry.version"]
+branch = "main"
+commit_message = "chore(release): {version}"
+build_command = ""
+
 [build-system]
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
