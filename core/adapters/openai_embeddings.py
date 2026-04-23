@@ -12,7 +12,11 @@ BASE_DELAY = 1.0
 
 
 class OpenAIEmbeddingsAdapter:
-    """OpenAI embeddings adapter behind EmbeddingsPort."""
+    """OpenAI embeddings adapter behind EmbeddingsPort.
+
+    OpenAI's text-embedding-3-* models are not instruction-aware, so
+    :meth:`embed_query` delegates to :meth:`embed` without wrapping.
+    """
 
     def __init__(self, api_key: str, model_name: str = "text-embedding-3-small") -> None:
         self._client = AsyncOpenAI(api_key=api_key)
@@ -34,3 +38,6 @@ class OpenAIEmbeddingsAdapter:
                     logger.warning("OpenAI embed attempt %d failed, retrying: %s", attempt + 1, exc)
                     await asyncio.sleep(delay)
         raise last_exc
+
+    async def embed_query(self, texts: list[str]) -> list[list[float]]:
+        return await self.embed(texts)
