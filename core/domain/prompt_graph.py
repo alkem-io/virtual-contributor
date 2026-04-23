@@ -53,13 +53,53 @@ class PromptGraph:
         self._compiled = None
 
     @staticmethod
+    def _default_for_annotation(annotation: Any) -> Any:
+        """Pick a permissive default value for a Pydantic field annotation.
+
+        Used by :meth:`_recover_fields` to fill in fields that the LLM
+        dropped entirely. The intent is to keep the response flowing when
+        a small model omits an auxiliary required field (e.g.
+        ``answer_language``) rather than dead-lettering the whole message.
+        """
+        import typing
+
+        origin = typing.get_origin(annotation)
+
+        # Unwrap Optional[X] / Union[X, None] → X (first non-None arg).
+        if origin is typing.Union or origin is getattr(
+            __import__("types"), "UnionType", None
+        ):
+            args = [a for a in typing.get_args(annotation) if a is not type(None)]
+            if not args:
+                return None
+            annotation = args[0]
+            origin = typing.get_origin(annotation)
+
+        if annotation is str:
+            return ""
+        if annotation is bool:
+            return False
+        if annotation in (int, float):
+            return 0
+        if origin is list or annotation is list:
+            return []
+        if origin is dict or annotation is dict:
+            return {}
+        # Nested BaseModel or unknown → try {}; Pydantic will coerce or fail.
+        if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+            return {}
+        return None
+
+    @staticmethod
     def _recover_fields(raw_text: str, model: type[BaseModel]) -> dict | None:
         """Best-effort recovery of model fields from free-form LLM output.
 
         Used when ``PydanticOutputParser`` fails because the LLM wrapped
-        the required keys under extra objects.  We find the JSON body,
-        walk it and pluck any key matching a model field.  Missing
-        required fields abort the recovery.
+        the required keys under extra objects, or dropped a required
+        auxiliary field (common with small/terse models). We find the JSON
+        body, walk it, pluck any key matching a model field, and fill
+        missing required fields with type-appropriate defaults so the
+        response can still flow.
         """
         import json as _json
         import re as _re
@@ -102,7 +142,7 @@ class PromptGraph:
         if not found:
             return None
         # Drop null values for required fields so the validator can use
-        # defaults or report the real missing-field error.
+        # defaults or we can fill them below.
         for name, finfo in model.model_fields.items():
             if finfo.is_required() and found.get(name) is None:
                 found.pop(name, None)
@@ -111,8 +151,23 @@ class PromptGraph:
             name for name, finfo in model.model_fields.items()
             if finfo.is_required()
         }
-        if required - found.keys():
-            return None
+        missing_required = required - found.keys()
+        if missing_required:
+            # Fill missing required fields with type-appropriate defaults.
+            # This keeps responses flowing when a small LLM drops an
+            # auxiliary field (e.g. ``answer_language``) rather than
+            # failing the whole message.
+            filled = []
+            for name in missing_required:
+                finfo = model.model_fields[name]
+                found[name] = PromptGraph._default_for_annotation(
+                    finfo.annotation
+                )
+                filled.append(name)
+            logger.warning(
+                "Recovery filled missing required fields with defaults: %s",
+                ", ".join(sorted(filled)),
+            )
         try:
             return model.model_validate(found).model_dump()
         except Exception:
