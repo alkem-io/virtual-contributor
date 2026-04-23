@@ -29,4 +29,4 @@ None. No new environment variables, settings, or configuration changes.
 | File | Change |
 |------|--------|
 | `core/domain/prompt_graph.py` | Added `_default_for_annotation` static method; updated `_recover_fields` to fill missing required fields with type defaults and log a warning |
-| `tests/core/domain/test_prompt_graph.py` | Added 7 new tests: `test_fills_missing_str_with_empty_string`, `test_fills_missing_dict_with_empty_dict`, `test_fills_missing_list_with_empty_list`, `test_fills_missing_bool_with_false`, `test_fills_missing_int_with_zero`, `test_real_world_answer_response_shape`, plus type-default coverage via the existing recovery test class |
+| `tests/core/domain/test_prompt_graph.py` | Added 6 new tests: `test_fills_missing_str_with_empty_string`, `test_fills_missing_dict_with_empty_dict`, `test_fills_missing_list_with_empty_list`, `test_fills_missing_bool_with_false`, `test_fills_missing_int_with_zero`, `test_real_world_answer_response_shape` |

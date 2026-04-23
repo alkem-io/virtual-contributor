@@ -56,7 +56,7 @@ specs/029-promptgraph-field-recovery/
 
 ```text
 core/domain/prompt_graph.py                    # ~40 lines added: _default_for_annotation + _recover_fields fill logic
-tests/core/domain/test_prompt_graph.py         # ~80 lines added: 7 new tests in TestRecoverFields
+tests/core/domain/test_prompt_graph.py         # ~80 lines added: 6 new tests in TestRecoverFields
 ```
 
 **Structure Decision**: Two-file change -- the recovery logic and its tests. Both are in `core/domain/`, consistent with the Domain Logic Isolation standard.

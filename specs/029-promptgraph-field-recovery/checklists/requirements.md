@@ -40,4 +40,4 @@
 
 - No contracts/ directory needed -- no external interface changes
 - No new configuration -- recovery behavior is automatic
-- 7 new tests cover: str, dict, list, bool, int defaults, plus text-alias recovery and real-world Mistral-Small regression
+- 6 new tests cover: str, dict, list, bool, int defaults, and real-world Mistral-Small regression

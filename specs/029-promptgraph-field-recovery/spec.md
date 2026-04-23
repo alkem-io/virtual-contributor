@@ -86,7 +86,7 @@ As a developer monitoring production logs, when `_recover_fields` fills missing 
 ### Measurable Outcomes
 
 - **SC-001**: Queries that previously returned errors due to dropped auxiliary fields now deliver valid responses with filled defaults.
-- **SC-002**: All 7 new tests pass, covering each type default and the real-world Mistral-Small regression case.
+- **SC-002**: All 6 new tests pass, covering each type default and the real-world Mistral-Small regression case.
 - **SC-003**: Warning logs identify which fields were filled, enabling prompt/model tuning.
 - **SC-004**: No existing tests regress.
 
