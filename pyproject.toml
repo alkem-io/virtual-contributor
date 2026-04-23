@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "alkemio-virtual-contributor"
-version = "0.1.0"
+version = "1.0.0"
 description = "Alkemio Virtual Contributor — unified microkernel engine with pluggable handlers"
 authors = ["Alkemio BV <info@alkem.io>"]
 license = "EUPL-1.2"
