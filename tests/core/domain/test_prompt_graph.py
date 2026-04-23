@@ -274,6 +274,87 @@ class TestRecoverFields:
         assert result is not None
         assert result["answer"] == "found"
 
+    def test_fills_missing_str_with_empty_string(self):
+        from pydantic import BaseModel
+
+        class AnswerModel(BaseModel):
+            answer: str
+            answer_language: str
+
+        # Classic Mistral-Small regression: drops the auxiliary field.
+        raw = '{"answer": "Hi there"}'
+        result = PromptGraph._recover_fields(raw, AnswerModel)
+        assert result is not None
+        assert result["answer"] == "Hi there"
+        assert result["answer_language"] == ""
+
+    def test_fills_missing_dict_with_empty_dict(self):
+        from pydantic import BaseModel
+
+        class AnswerModel(BaseModel):
+            answer: str
+            source_scores: dict
+
+        raw = '{"answer": "Hi"}'
+        result = PromptGraph._recover_fields(raw, AnswerModel)
+        assert result is not None
+        assert result["source_scores"] == {}
+
+    def test_fills_missing_list_with_empty_list(self):
+        from pydantic import BaseModel
+
+        class AnswerModel(BaseModel):
+            answer: str
+            tags: list[str]
+
+        raw = '{"answer": "Hi"}'
+        result = PromptGraph._recover_fields(raw, AnswerModel)
+        assert result is not None
+        assert result["tags"] == []
+
+    def test_fills_missing_bool_with_false(self):
+        from pydantic import BaseModel
+
+        class AnswerModel(BaseModel):
+            answer: str
+            requires_followup: bool
+
+        raw = '{"answer": "Hi"}'
+        result = PromptGraph._recover_fields(raw, AnswerModel)
+        assert result is not None
+        assert result["requires_followup"] is False
+
+    def test_fills_missing_int_with_zero(self):
+        from pydantic import BaseModel
+
+        class AnswerModel(BaseModel):
+            answer: str
+            confidence: int
+
+        raw = '{"answer": "Hi"}'
+        result = PromptGraph._recover_fields(raw, AnswerModel)
+        assert result is not None
+        assert result["confidence"] == 0
+
+    def test_real_world_answer_response_shape(self):
+        """Reproduces the Mistral-Small / oasisbot query failure."""
+        from pydantic import BaseModel
+
+        class AnswerResponse(BaseModel):
+            knowledge_answer: str
+            answer_language: str
+            source_scores: dict
+
+        raw = (
+            '{"knowledge_answer": "Maria\'s phone number is +359 88 6111122.",'
+            ' "source_scores": {"0": 7, "1": 0, "2": 0, "3": 0, "4": 0}}'
+        )
+        result = PromptGraph._recover_fields(raw, AnswerResponse)
+        assert result is not None
+        assert "Maria" in result["knowledge_answer"]
+        assert result["source_scores"] == {"0": 7, "1": 0, "2": 0, "3": 0, "4": 0}
+        assert result["answer_language"] == ""  # filled default, message flows
+
 
 # ---------------------------------------------------------------------------
 # _state_to_dict and wrappers
