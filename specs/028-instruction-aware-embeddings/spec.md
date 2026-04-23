@@ -123,7 +123,7 @@ The `_create_adapters()` function in `main.py` shall pass `config.embeddings_que
 
 ## Assumptions
 
-- The Qwen3-Embedding retrieval instruction format (`Instruct: ... \nQuery: `) is stable across Qwen3-Embedding model variants (0.6B, 8B, etc.).
+- The Qwen3-Embedding retrieval instruction format (`Instruct: ... \nQuery:` followed by a trailing space) is stable across Qwen3-Embedding model variants (0.6B, 8B, etc.).
 - Instruction-aware wrapping is a query-side concern only -- document embeddings must remain in the plain space for the asymmetric retrieval to work correctly.
 - The `QWEN3_RETRIEVAL_INSTRUCTION` constant is appropriate for general-purpose retrieval. Domain-specific use cases may need the explicit override.
 - Other future instruction-aware models (e.g., E5-v2, BGE-v2) can be added to the auto-detection logic without breaking the existing API surface.

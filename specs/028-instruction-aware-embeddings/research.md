@@ -42,7 +42,7 @@
 ## Decision 3: Qwen3 retrieval instruction as a module-level constant
 
 **Context**: The instruction prefix for Qwen3-Embedding retrieval queries is:
-```
+```text
 Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:
 ```
 

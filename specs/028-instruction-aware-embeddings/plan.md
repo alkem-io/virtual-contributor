@@ -54,7 +54,7 @@ Splits the `EmbeddingsPort` protocol into `embed()` (indexing) and `embed_query(
 
 Files changed:
 
-```
+```text
 core/ports/embeddings.py                                    # +embed_query() method to protocol
 core/adapters/openai_compatible_embeddings.py               # +_resolve_query_instruction(), +_call(),
                                                             #  +embed_query(), QWEN3_RETRIEVAL_INSTRUCTION
