@@ -1,6 +1,28 @@
 # CHANGELOG
 
 
+## v0.1.1 (2026-04-23)
+
+### Bug Fixes
+
+- **ci**: Use org infrastructure bot token for semantic release
+  ([`7440b84`](https://github.com/alkem-io/virtual-contributor/commit/7440b844c15bc42c843a42765d7987321e5084b0))
+
+Replace RELEASE_TOKEN with ALKEMIO_INFRASTRUCTURE_BOT_PUSH_TOKEN, the org-level PAT already
+  available across alkem-io repositories.
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+
+### Chores
+
+- Revert version to 0.1.0
+  ([`e5c00b7`](https://github.com/alkem-io/virtual-contributor/commit/e5c00b7e01e1c777e8b7997fa05a95093807dbee))
+
+Let semantic-release determine the version from commit history.
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+
+
 ## v0.1.0 (2026-04-23)
 
 ### Bug Fixes
