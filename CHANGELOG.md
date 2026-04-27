@@ -1,9 +1,17 @@
 # CHANGELOG
 
 
-## v0.1.1 (2026-04-23)
+## v0.1.1 (2026-04-27)
 
 ### Bug Fixes
+
+- **ci**: Use bot token for checkout to allow pushing to main
+  ([`89db36d`](https://github.com/alkem-io/virtual-contributor/commit/89db36d053be27633fc2a96edc89ef0dbf107a83))
+
+The checkout action sets git remote auth — must use the bot token so semantic-release can push the
+  version bump commit and tag.
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
 
 - **ci**: Use org infrastructure bot token for semantic release
   ([`7440b84`](https://github.com/alkem-io/virtual-contributor/commit/7440b844c15bc42c843a42765d7987321e5084b0))
