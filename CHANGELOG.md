@@ -1,6 +1,18 @@
 # CHANGELOG
 
 
+## v0.1.2 (2026-04-27)
+
+### Bug Fixes
+
+- **ci**: Add v prefix to Docker Hub semver tags
+  ([`62d404b`](https://github.com/alkem-io/virtual-contributor/commit/62d404b1c5e822e90576b136593131f580d4cfdb))
+
+Align with Alkemio convention: alkemio/[repo]:v[version].
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+
+
 ## v0.1.1 (2026-04-27)
 
 ### Bug Fixes
