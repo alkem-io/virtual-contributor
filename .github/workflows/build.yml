@@ -43,7 +43,7 @@ jobs:
           images: ${{ github.event_name == 'release' && 'alkemio/virtual-contributor' || format('ghcr.io/{0}', env.IMAGE_NAME) }}
           tags: |
             type=ref,event=branch
-            type=semver,pattern={{version}}
+            type=semver,pattern=v{{version}}
             type=raw,value=latest,enable=${{ github.event_name == 'release' }}
             type=sha
 
