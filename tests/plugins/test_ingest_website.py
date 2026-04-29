@@ -448,6 +448,12 @@ class TestIngestWebsitePlugin:
         # delete_collection is no longer called — incremental dedup replaces it
         assert plugin._knowledge_store.deleted == []
         assert "example.com-knowledge" in plugin._knowledge_store.collections
+        # Identification fields must be propagated from the request event
+        # so the alkemio-server result handler can correlate the result
+        # back to the persona.
+        assert result.persona_id == event.persona_id
+        assert result.type == event.type
+        assert result.purpose == event.purpose
 
     async def test_empty_crawl_runs_cleanup(self):
         """When crawl returns [], cleanup deletes pre-existing chunks."""
@@ -476,6 +482,10 @@ class TestIngestWebsitePlugin:
         assert result.result == "success"
         # All pre-existing chunks should have been deleted
         assert len(store.collections.get(collection, [])) == 0
+        # Cleanup-only path must still propagate identification fields.
+        assert result.persona_id == event.persona_id
+        assert result.type == event.type
+        assert result.purpose == event.purpose
 
     async def test_empty_extract_runs_cleanup(self):
         """When crawl returns pages but extraction yields nothing, cleanup runs."""
