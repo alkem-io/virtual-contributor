@@ -113,6 +113,9 @@ class IngestWebsitePlugin:
                 ])
                 cleanup_result = await cleanup_engine.run([], collection_name)
                 return IngestWebsiteResult(
+                    type=event.type,
+                    purpose=event.purpose,
+                    persona_id=event.persona_id,
                     result=IngestionResult.SUCCESS if cleanup_result.success else IngestionResult.FAILURE,
                     error="; ".join(cleanup_result.errors) if cleanup_result.errors else "",
                 )
@@ -158,6 +161,9 @@ class IngestWebsitePlugin:
             result = await engine.run(documents, collection_name)
 
             return IngestWebsiteResult(
+                type=event.type,
+                purpose=event.purpose,
+                persona_id=event.persona_id,
                 result=IngestionResult.SUCCESS if result.success else IngestionResult.FAILURE,
                 error="; ".join(result.errors) if result.errors else "",
             )
@@ -165,6 +171,9 @@ class IngestWebsitePlugin:
         except Exception as exc:
             logger.exception("Website ingestion failed: %s", exc)
             return IngestWebsiteResult(
+                type=event.type,
+                purpose=event.purpose,
+                persona_id=event.persona_id,
                 result=IngestionResult.FAILURE,
                 error=str(exc),
             )

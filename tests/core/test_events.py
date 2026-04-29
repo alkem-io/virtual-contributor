@@ -201,6 +201,13 @@ class TestIngestWebsiteSerialization:
         assert dumped["result"] == "success"
         assert dumped["error"] == ""
         assert isinstance(dumped["timestamp"], int)
+        # Identification fields must be present in the dumped payload
+        # (camelCase aliases) so the alkemio-server result handler can
+        # correlate the result back to a persona.
+        assert dumped["bodyOfKnowledgeId"] == ""
+        assert dumped["personaId"] == ""
+        assert dumped["type"] == ""
+        assert dumped["purpose"] == ""
 
     def test_result_failure(self):
         result = IngestWebsiteResult(
@@ -209,6 +216,21 @@ class TestIngestWebsiteSerialization:
         dumped = result.model_dump()
         assert dumped["result"] == "failure"
         assert dumped["error"] == "Connection timeout"
+
+    def test_result_with_identification_fields(self):
+        result = IngestWebsiteResult(
+            body_of_knowledge_id="bok-1",
+            type="website",
+            purpose="knowledge",
+            persona_id="persona-1",
+            result=IngestionResult.SUCCESS,
+        )
+        dumped = result.model_dump()
+        assert dumped["bodyOfKnowledgeId"] == "bok-1"
+        assert dumped["personaId"] == "persona-1"
+        assert dumped["type"] == "website"
+        assert dumped["purpose"] == "knowledge"
+        assert dumped["result"] == "success"
 
 
 # ---------------------------------------------------------------------------
