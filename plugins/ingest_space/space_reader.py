@@ -12,6 +12,11 @@ from plugins.ingest_space.link_extractor import extract_text
 
 logger = logging.getLogger(__name__)
 
+# Wire-format values of IngestBodyOfKnowledge.type — must match what the
+# Alkemio server publishes on the ingest queue.
+BOK_TYPE_SPACE = "alkemio-space"
+BOK_TYPE_KNOWLEDGE_BASE = "alkemio-knowledge-base"
+
 # HTML cleanup ----------------------------------------------------------------
 
 _SCRIPT_STYLE_RE = re.compile(r"<(script|style)[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL)
@@ -92,6 +97,21 @@ query SpaceTree($spaceId: UUID!) {{
 }}
 """
 
+# Knowledge bases are flat: a profile and a single calloutsSet, no subspaces.
+KNOWLEDGE_BASE_QUERY = f"""
+query KnowledgeBaseTree($kbId: UUID!) {{
+  lookup {{
+    knowledgeBase(ID: $kbId) {{
+      id
+      profile {{ displayName description url }}
+      calloutsSet {{
+        callouts {{ {_CALLOUT_FIELDS} }}
+      }}
+    }}
+  }}
+}}
+"""
+
 
 async def read_space_tree(graphql_client, space_id: str) -> list[Document]:
     """Read the full space tree and convert to Documents."""
@@ -113,6 +133,50 @@ async def read_space_tree(graphql_client, space_id: str) -> list[Document]:
         len(documents), stats["fetched"], stats["skipped"],
     )
     return documents
+
+
+async def read_knowledge_base_tree(graphql_client, kb_id: str) -> list[Document]:
+    """Read a knowledge base and convert its callouts to Documents."""
+    data = await graphql_client.query(KNOWLEDGE_BASE_QUERY, {"kbId": kb_id})
+    kb = (data.get("lookup") or {}).get("knowledgeBase")
+    if not kb:
+        return []
+
+    # Reshape into the dict layout _process_space expects: a synthetic
+    # `collaboration.calloutsSet` wrapper and no `subspaces`.
+    space_shaped = {
+        **kb,
+        "collaboration": {"calloutsSet": kb.get("calloutsSet")},
+        "subspaces": [],
+    }
+
+    documents: list[Document] = []
+    seen: set[str] = set()
+    stats = {"fetched": 0, "skipped": 0}
+    await _process_space(
+        space_shaped, documents, seen,
+        graphql_client=graphql_client, stats=stats, depth=0,
+        top_doc_type=DocumentType.KNOWLEDGE.value,
+    )
+    logger.info(
+        "Knowledge base tree: emitted %d unique documents "
+        "(link bodies fetched=%d, skipped=%d)",
+        len(documents), stats["fetched"], stats["skipped"],
+    )
+    return documents
+
+
+async def read_body_of_knowledge(
+    graphql_client, bok_id: str, bok_type: str,
+) -> list[Document]:
+    """Dispatch to the correct reader based on the BoK type.
+
+    Unknown types fall back to the space reader, which matches the dominant
+    case on the platform today.
+    """
+    if bok_type == BOK_TYPE_KNOWLEDGE_BASE:
+        return await read_knowledge_base_tree(graphql_client, bok_id)
+    return await read_space_tree(graphql_client, bok_id)
 
 
 def _append_unique(
@@ -155,21 +219,32 @@ async def _process_space(
     graphql_client,
     stats: dict,
     depth: int,
+    top_doc_type: str | None = None,
 ) -> None:
-    """Process a space node and its children recursively."""
+    """Process a space node and its children recursively.
+
+    `top_doc_type` overrides the doc type used for the depth-0 document
+    (so knowledge bases can be tagged as KNOWLEDGE instead of SPACE).
+    """
     profile = space.get("profile") or {}
     space_name = profile.get("displayName", "") or ""
     description = profile.get("description", "") or ""
     space_url = profile.get("url", "") or None
 
     if description:
-        doc_type = DocumentType.SPACE if depth == 0 else DocumentType.SUBSPACE
+        if depth == 0 and top_doc_type is not None:
+            doc_type_value = top_doc_type
+        else:
+            doc_type_value = (
+                DocumentType.SPACE.value if depth == 0
+                else DocumentType.SUBSPACE.value
+            )
         _append_unique(
             documents, seen,
             content=f"{space_name}\n\n{description}",
             document_id=space["id"],
             source=f"space:{space['id']}",
-            doc_type=doc_type.value,
+            doc_type=doc_type_value,
             title=space_name,
             uri=space_url,
         )
