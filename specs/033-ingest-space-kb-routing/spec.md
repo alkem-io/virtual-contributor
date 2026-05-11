@@ -88,7 +88,7 @@ As a **downstream consumer of the knowledge store** (expert / guidance plugins),
 ### Measurable Outcomes
 
 - **SC-001**: 100 % of `IngestBodyOfKnowledge` events with `type="alkemio-knowledge-base"` are routed to `lookup.knowledgeBase()`. None are routed to `lookup.space()`.
-- **SC-002**: On the acceptance environment, the population of BoK ids producing `Unable to find Space using options 'undefined'` errors drops to zero for knowledge-base-backed VCs after the change is deployed.
+- **SC-002**: Zero `IngestBodyOfKnowledgeResult` envelopes are emitted with `result="failure"` and an `error.message` containing `Unable to find Space` for events whose `type="alkemio-knowledge-base"`. This is observable directly from the VC's own published RabbitMQ result stream — no server-side log access required.
 - **SC-003**: The empty-`{bok_id}-knowledge` collections that the bulk refresh previously created for the ~69 knowledge-base-backed VCs are populated (or cleanly cleaned up, if the KB itself contains no callouts) on the next refresh wave.
 - **SC-004**: Test suite gates the routing decision: tests fail if a future change causes an `alkemio-knowledge-base` event to call `lookup.space()`, or vice versa.
 

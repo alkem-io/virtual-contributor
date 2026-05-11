@@ -89,7 +89,7 @@ Single project (microkernel + plugins). Paths anchored at repository root.
 
 - [X] T018 Run `poetry run ruff check core/ plugins/ tests/` and `poetry run pyright core/ plugins/` — both clean (no new errors)
 - [X] T019 Run `poetry run pytest tests/plugins/test_ingest_space.py -q` — full ingest_space suite green (37 tests)
-- [X] T020 Run `poetry run pytest --ignore=tests/evaluation -q` — full suite green to confirm no regression elsewhere (528 tests)
+- [X] T020 Run `poetry run pytest --ignore=tests/evaluation -q` — full non-evaluation test suite green to confirm no regression elsewhere
 
 ---
 
