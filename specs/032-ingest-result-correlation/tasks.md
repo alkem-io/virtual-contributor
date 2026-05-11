@@ -54,12 +54,11 @@
 
 ### Tests for User Story 2
 
-- [X] T020 [P] [US2] Extend `test_result_model` in `tests/core/test_events.py` to assert default payload includes `bodyOfKnowledgeId == ""`, `personaId == ""`, `type == ""`, `purpose == ""`.
+- [X] T020 [P] [US2] Extend `test_result_model` in `tests/core/test_events.py` to assert default payload includes `bodyOfKnowledgeId == ""`, `personaId == ""`, `type == ""`, `purpose == ""`. The same test also confirms the pre-existing `timestamp`, `result`, `error` fields keep their names and types.
 
 ### Implementation for User Story 2
 
-- [X] T021 [US2] Use empty-string defaults on every new field in `IngestWebsiteResult` (covered by T013 — same edit).
-- [X] T022 [US2] Verify pre-existing fields (`timestamp`, `result`, `error`) are unchanged in name and type (covered by `test_result_failure` continuing to pass).
+User Story 2 is delivered by the same edit as T013: every new field on `IngestWebsiteResult` carries an empty-string default, and no pre-existing field is renamed or retyped. No additional implementation tasks beyond T020.
 
 **Checkpoint**: User Story 2 fully functional — the wire format is additive, no consumer migration required.
 
@@ -91,6 +90,8 @@
 
 - T010, T011, T012, T020 — different test functions, no shared state — can be drafted in parallel.
 - T015, T016, T017 — same file but distinct return sites — can be applied in one edit pass.
+
+> Note: earlier revisions of this file enumerated separate tasks T021 ("use empty-string defaults") and T022 ("verify pre-existing fields unchanged"). They were placeholder "covered-by" entries with no independent work and were folded into T013 (schema edit) and T020 (test assertion) respectively.
 
 ---
 

@@ -92,6 +92,8 @@ The `ingest_website` plugin is the sole producer. After this change, `IngestWebs
 
 The alkemio-server result handler MAY use any of the new fields to correlate the result back to a persona record. The recommended primary correlation key is `personaId`. `type` and `purpose` are advisory tags that the server may use for status reporting. `bodyOfKnowledgeId` is reserved and SHOULD be treated as advisory until a producer plugin begins populating it.
 
+**Consumer-side implementation is out of scope for this repo.** The actual handler logic — which field(s) the alkemio-server reads, how it maps `personaId` to a persona row, and how status is surfaced to the persona's owner — lives in the alkemio-server repository. This contract specifies only the wire-format guarantees the producer (virtual-contributor) provides; reviewers verifying end-to-end correlation should consult the corresponding server-side change.
+
 ## Verification
 
 | Check | Where |
