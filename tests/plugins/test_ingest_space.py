@@ -6,10 +6,17 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from core.domain.ingest_pipeline import DocumentType
 from core.events.ingest_space import IngestBodyOfKnowledgeResult
 from plugins.ingest_space.file_parsers import parse_file
 from plugins.ingest_space.plugin import IngestSpacePlugin
-from plugins.ingest_space.space_reader import _process_space
+from plugins.ingest_space.space_reader import (
+    BOK_TYPE_KNOWLEDGE_BASE,
+    BOK_TYPE_SPACE,
+    _process_space,
+    read_body_of_knowledge,
+    read_knowledge_base_tree,
+)
 from tests.conftest import (
     MockEmbeddingsPort,
     MockKnowledgeStorePort,
@@ -689,3 +696,167 @@ class TestLinkFetching:
 
         assert stats["fetched"] == 1
         assert stats["skipped"] == 1
+
+
+class TestKnowledgeBaseReader:
+    """Tests for read_knowledge_base_tree — the alkemio-knowledge-base path."""
+
+    def _kb_payload(self, *, with_callout: bool = True):
+        callouts = []
+        if with_callout:
+            callouts.append({
+                "id": "co-1",
+                "framing": {"profile": {
+                    "displayName": "KB Callout",
+                    "description": "Callout desc",
+                }},
+                "contributions": [{
+                    "post": {
+                        "id": "post-1",
+                        "profile": {
+                            "displayName": "P",
+                            "description": "Post body",
+                        },
+                    },
+                }],
+            })
+        return {
+            "lookup": {
+                "knowledgeBase": {
+                    "id": "kb-1",
+                    "profile": {
+                        "displayName": "KB Root",
+                        "description": "Root description",
+                    },
+                    "calloutsSet": {"callouts": callouts},
+                },
+            },
+        }
+
+    async def test_walks_callouts(self):
+        gc = _mock_graphql_client()
+        gc.query = AsyncMock(return_value=self._kb_payload())
+        documents = await read_knowledge_base_tree(gc, "kb-1")
+        # KB root + callout + post
+        ids = {d.metadata.document_id for d in documents}
+        assert "kb-1" in ids
+        assert "co-1" in ids
+        assert "post-1" in ids
+
+    async def test_top_doc_type_is_knowledge(self):
+        gc = _mock_graphql_client()
+        gc.query = AsyncMock(return_value=self._kb_payload(with_callout=False))
+        documents = await read_knowledge_base_tree(gc, "kb-1")
+        root = next(d for d in documents if d.metadata.document_id == "kb-1")
+        assert root.metadata.type == DocumentType.KNOWLEDGE.value
+
+    async def test_empty_knowledge_base_returns_empty_list(self):
+        gc = _mock_graphql_client()
+        gc.query = AsyncMock(return_value={"lookup": {"knowledgeBase": None}})
+        documents = await read_knowledge_base_tree(gc, "kb-missing")
+        assert documents == []
+
+    async def test_issues_knowledge_base_query(self):
+        """Ensure we call lookup.knowledgeBase(), not lookup.space()."""
+        gc = _mock_graphql_client()
+        gc.query = AsyncMock(return_value={"lookup": {"knowledgeBase": None}})
+        await read_knowledge_base_tree(gc, "kb-1")
+        # Inspect the GraphQL query string passed to the client
+        call_args = gc.query.call_args
+        query_str = call_args.args[0]
+        variables = call_args.args[1] if len(call_args.args) > 1 else call_args.kwargs.get("variables", {})
+        assert "knowledgeBase(ID:" in query_str
+        assert "space(ID:" not in query_str
+        assert variables == {"kbId": "kb-1"}
+
+
+class TestBodyOfKnowledgeDispatcher:
+    """Tests for the read_body_of_knowledge type-routing dispatcher."""
+
+    async def test_routes_alkemio_space_to_space_reader(self):
+        gc = MagicMock()
+        with patch(
+            "plugins.ingest_space.space_reader.read_space_tree",
+            new=AsyncMock(return_value=[]),
+        ) as space_mock, patch(
+            "plugins.ingest_space.space_reader.read_knowledge_base_tree",
+            new=AsyncMock(return_value=[]),
+        ) as kb_mock:
+            await read_body_of_knowledge(gc, "bok-1", BOK_TYPE_SPACE)
+        space_mock.assert_awaited_once_with(gc, "bok-1")
+        kb_mock.assert_not_awaited()
+
+    async def test_routes_alkemio_knowledge_base_to_kb_reader(self):
+        gc = MagicMock()
+        with patch(
+            "plugins.ingest_space.space_reader.read_space_tree",
+            new=AsyncMock(return_value=[]),
+        ) as space_mock, patch(
+            "plugins.ingest_space.space_reader.read_knowledge_base_tree",
+            new=AsyncMock(return_value=[]),
+        ) as kb_mock:
+            await read_body_of_knowledge(gc, "bok-1", BOK_TYPE_KNOWLEDGE_BASE)
+        kb_mock.assert_awaited_once_with(gc, "bok-1")
+        space_mock.assert_not_awaited()
+
+    async def test_unknown_type_defaults_to_space_reader(self):
+        """Unknown bok_type strings fall back to the space path (dominant case)."""
+        gc = MagicMock()
+        with patch(
+            "plugins.ingest_space.space_reader.read_space_tree",
+            new=AsyncMock(return_value=[]),
+        ) as space_mock, patch(
+            "plugins.ingest_space.space_reader.read_knowledge_base_tree",
+            new=AsyncMock(return_value=[]),
+        ) as kb_mock:
+            await read_body_of_knowledge(gc, "bok-1", "something-unexpected")
+        space_mock.assert_awaited_once_with(gc, "bok-1")
+        kb_mock.assert_not_awaited()
+
+
+class TestIngestSpacePluginDispatchesOnType:
+    """The plugin must pass event.type through to the dispatcher."""
+
+    async def test_plugin_uses_knowledge_base_reader_for_alkemio_knowledge_base(self):
+        store = MockKnowledgeStorePort()
+        plugin = IngestSpacePlugin(
+            llm=MockLLMPort(),
+            embeddings=MockEmbeddingsPort(),
+            knowledge_store=store,
+            graphql_client=AsyncMock(),
+        )
+        event = make_ingest_body_of_knowledge(type=BOK_TYPE_KNOWLEDGE_BASE)
+        with patch(
+            "plugins.ingest_space.space_reader.read_knowledge_base_tree",
+            new=AsyncMock(return_value=[]),
+        ) as kb_mock, patch(
+            "plugins.ingest_space.space_reader.read_space_tree",
+            new=AsyncMock(return_value=[]),
+        ) as space_mock:
+            result = await plugin.handle(event)
+
+        assert result.result == "success"
+        kb_mock.assert_awaited_once()
+        space_mock.assert_not_awaited()
+
+    async def test_plugin_uses_space_reader_for_alkemio_space(self):
+        store = MockKnowledgeStorePort()
+        plugin = IngestSpacePlugin(
+            llm=MockLLMPort(),
+            embeddings=MockEmbeddingsPort(),
+            knowledge_store=store,
+            graphql_client=AsyncMock(),
+        )
+        event = make_ingest_body_of_knowledge(type=BOK_TYPE_SPACE)
+        with patch(
+            "plugins.ingest_space.space_reader.read_knowledge_base_tree",
+            new=AsyncMock(return_value=[]),
+        ) as kb_mock, patch(
+            "plugins.ingest_space.space_reader.read_space_tree",
+            new=AsyncMock(return_value=[]),
+        ) as space_mock:
+            result = await plugin.handle(event)
+
+        assert result.result == "success"
+        space_mock.assert_awaited_once()
+        kb_mock.assert_not_awaited()

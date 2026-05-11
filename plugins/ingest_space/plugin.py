@@ -74,8 +74,14 @@ class IngestSpacePlugin:
             if self._graphql_client is None:
                 raise RuntimeError("GraphQL client not configured")
 
-            from plugins.ingest_space.space_reader import read_space_tree
-            documents = await read_space_tree(self._graphql_client, bok_id)
+            from plugins.ingest_space.space_reader import read_body_of_knowledge
+            logger.info(
+                "Ingesting BoK %s (type=%s, purpose=%s)",
+                bok_id, event.type, event.purpose,
+            )
+            documents = await read_body_of_knowledge(
+                self._graphql_client, bok_id, event.type,
+            )
 
             if not documents:
                 # Fetch succeeded but returned zero documents — run cleanup
