@@ -1,6 +1,117 @@
 # CHANGELOG
 
 
+## v0.1.3 (2026-05-11)
+
+### Bug Fixes
+
+- **ingest-space**: Route alkemio-knowledge-base BoKs to lookup.knowledgeBase() (spec 033)
+  ([#100](https://github.com/alkem-io/virtual-contributor/pull/100),
+  [`6b9beb9`](https://github.com/alkem-io/virtual-contributor/commit/6b9beb964a6638edb91d7dde73c48d07f1ecfc57))
+
+* fix(ingest-space): route alkemio-knowledge-base BoKs to lookup.knowledgeBase()
+
+The ingest_space plugin always issued lookup.space() regardless of bodyOfKnowledgeType. ~29% of VCs
+  (69 of 238 on acceptance) are backed by an alkemio-knowledge-base, which lives in a different
+  table and 404s on lookup.space(), causing the ingest pipeline to abort and leaving an empty
+  collection that produces hallucinated answers downstream.
+
+Add read_knowledge_base_tree() that issues lookup.knowledgeBase() and a read_body_of_knowledge()
+  dispatcher that selects the reader based on event.type. Unknown types fall back to the space
+  reader (dominant case).
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+
+* docs: SDD spec 033 — ingest space knowledge-base routing
+
+Retrospec for the routing fix that branches IngestBodyOfKnowledge events to lookup.knowledgeBase()
+  vs lookup.space() based on event.type.
+
+Records: spec, plan, research decisions, data model, GraphQL contract, quickstart, task breakdown
+  (all complete), and quality checklist.
+
+* docs(033): apply /speckit.analyze remediations (A5, A6)
+
+A5: Reframe spec.md SC-002 as a VC-side observable — counts result envelopes with the specific
+  failure signature on the VC's own RabbitMQ result stream — so the criterion is verifiable without
+  server-log access.
+
+A6: Drop the hardcoded "528 tests" count from tasks.md T020 so the task description doesn't drift as
+  the codebase grows.
+
+* fix(ingest-space): generalize log messages and tighten dispatch tests
+
+Address CodeRabbit review on PR #100:
+
+- Rename "Space" -> "BoK" in the zero-document cleanup info log and the catch-all exception log so
+  that logs reflect the post-routing semantics (both alkemio-space and alkemio-knowledge-base events
+  now flow through this plugin). Aids incident triage. - Extend the two
+  TestIngestSpacePluginDispatchesOnType cases to assert, in addition to leaf-reader routing, that no
+  LLM/embeddings work was performed on the empty-document cleanup branch (llm.calls,
+  embeddings.calls, embeddings.query_calls all empty) and that no collection deletion was issued
+  (store.deleted empty). This satisfies the repo testing convention of asserting LLM and
+  knowledge-store interactions in plugin tests.
+
+---------
+
+Co-authored-by: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+
+- **ingest-website**: Include identification fields in result envelope (spec 032)
+  ([#99](https://github.com/alkem-io/virtual-contributor/pull/99),
+  [`e607059`](https://github.com/alkem-io/virtual-contributor/commit/e607059e9b5dbeda7282b1a6490acbff39be197b))
+
+* fix(ingest-website): include identification fields in result envelope
+
+The result-message wire format published by ingest plugins is `{"response": {...IngestWebsiteResult
+  fields...}}`. The alkemio-server `IngestWebsiteResultHandler` reads identification fields from
+  `event.response` to call `updatePersonaBoKLastUpdated()` against the right persona.
+
+Pre-fix `IngestWebsiteResult` only carried `timestamp`, `result` and `error` — no way for the server
+  to correlate a successful website ingest back to a persona, which crashed the handler with `Cannot
+  read properties of undefined (reading 'personaId')` on every incoming result on dev.
+
+Adding the identification fields and propagating them from the incoming `IngestWebsite` request
+  through every code path that constructs `IngestWebsiteResult` (cleanup-only branch, success
+  branch, exception branch). `bodyOfKnowledgeId` defaults to an empty string because website-typed
+  bodies of knowledge are URL-identified, not UUID-keyed.
+
+Pairs with the matching server-side fix on alkem-io/server which makes both ingest result handlers
+  read from `event.response.*` to match what the wire actually carries.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+
+* docs: SDD spec 032 — ingest website result correlation fields
+
+Retrospec for the additive change that adds bodyOfKnowledgeId, type, purpose, and personaId to the
+  IngestWebsiteResult envelope so the alkemio-server can correlate every result back to its
+  originating persona.
+
+Records: spec, plan, research decisions, data model, wire contract, quickstart, task breakdown (all
+  complete), and quality checklist.
+
+* docs(032): apply /speckit.analyze remediations (A4, A2)
+
+A4: Clarify in contracts/ingest-website-result.md that consumer-side implementation lives in the
+  alkemio-server repo and is out of scope for this contract; producer-side guarantees only.
+
+A2: Drop placeholder tasks T021/T022 ("covered-by" entries with no independent work); fold their
+  intent into T013 (schema edit) and T020 (test assertion). Note left in tasks.md explaining the
+  consolidation.
+
+* docs(032): apply CodeRabbit feedback on PR #99
+
+- data-model.md: add `text` language tag to the request-to-response field-mapping fence to satisfy
+  markdownlint MD040. - tasks.md: drop stale `T021` reference from Phase 3 dependency text so it
+  stays consistent with the later note that T021 was folded into T013. -
+  tests/plugins/test_ingest_website.py: assert `result.body_of_knowledge_id == ""` on both the
+  normal-ingest and cleanup-only paths to lock in the full result envelope contract documented in
+  data-model.md.
+
+---------
+
+Co-authored-by: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+
+
 ## v0.1.2 (2026-04-27)
 
 ### Bug Fixes
