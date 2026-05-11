@@ -454,6 +454,9 @@ class TestIngestWebsitePlugin:
         assert result.persona_id == event.persona_id
         assert result.type == event.type
         assert result.purpose == event.purpose
+        # bodyOfKnowledgeId defaults to "" for the website plugin
+        # (websites are URL-identified, not UUID-keyed) — lock in the contract.
+        assert result.body_of_knowledge_id == ""
 
     async def test_empty_crawl_runs_cleanup(self):
         """When crawl returns [], cleanup deletes pre-existing chunks."""
@@ -486,6 +489,8 @@ class TestIngestWebsitePlugin:
         assert result.persona_id == event.persona_id
         assert result.type == event.type
         assert result.purpose == event.purpose
+        # bodyOfKnowledgeId defaults to "" — covers the cleanup-only path too.
+        assert result.body_of_knowledge_id == ""
 
     async def test_empty_extract_runs_cleanup(self):
         """When crawl returns pages but extraction yields nothing, cleanup runs."""

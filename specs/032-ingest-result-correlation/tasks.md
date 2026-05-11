@@ -77,7 +77,7 @@ User Story 2 is delivered by the same edit as T013: every new field on `IngestWe
 
 - Phase 1 (Foundational): trivial — verified state of the existing code, no work.
 - Phase 2 (US1): depends on Phase 1.
-- Phase 3 (US2): may proceed in parallel with Phase 2 because they share the same edit (T013/T021), and US2's test (T020) operates on the same file as US1's (T010).
+- Phase 3 (US2): may proceed in parallel with Phase 2 because both rely on the same schema edit (T013), and US2's test (T020) operates on the same file as US1's (T010).
 - Phase 4 (Polish): after Phase 2 and Phase 3.
 
 ### Within Each User Story

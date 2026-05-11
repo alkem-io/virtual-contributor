@@ -29,7 +29,7 @@ Defined in `core/events/ingest_website.py`. Inherits from `EventBase`.
 
 `IngestWebsite` (request) → `IngestWebsiteResult` (response): the plugin handler copies three of the four new fields directly from the request:
 
-```
+```text
 IngestWebsite.type        → IngestWebsiteResult.type
 IngestWebsite.purpose     → IngestWebsiteResult.purpose
 IngestWebsite.persona_id  → IngestWebsiteResult.persona_id
