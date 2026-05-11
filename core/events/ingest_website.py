@@ -30,8 +30,19 @@ class IngestWebsite(EventBase):
 
 
 class IngestWebsiteResult(EventBase):
-    """Result of a website ingestion run."""
+    """Result of a website ingestion run.
 
+    Carries the identification fields (``bodyOfKnowledgeId``, ``type``,
+    ``purpose``, ``personaId``) so the alkemio-server result handler can
+    correlate the result back to the persona that owns the body of
+    knowledge. ``bodyOfKnowledgeId`` defaults to an empty string because
+    website-typed bodies of knowledge are URL-identified, not UUID-keyed.
+    """
+
+    body_of_knowledge_id: str = Field(default="", alias="bodyOfKnowledgeId")
+    type: str = ""
+    purpose: str = ""
+    persona_id: str = Field(default="", alias="personaId")
     timestamp: int = Field(
         default_factory=lambda: int(time.time() * 1000)
     )
