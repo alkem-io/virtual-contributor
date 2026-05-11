@@ -87,7 +87,7 @@ class IngestSpacePlugin:
                 # Fetch succeeded but returned zero documents — run cleanup
                 # pipeline to remove any previously stored chunks.
                 logger.info(
-                    "Space %s returned zero documents; running cleanup pipeline for collection %s",
+                    "BoK %s returned zero documents; running cleanup pipeline for collection %s",
                     bok_id,
                     collection_name,
                 )
@@ -154,7 +154,7 @@ class IngestSpacePlugin:
             )
 
         except Exception as exc:
-            logger.exception("Space ingestion failed: %s", exc)
+            logger.exception("BoK ingestion failed: %s", exc)
             return IngestBodyOfKnowledgeResult(
                 body_of_knowledge_id=event.body_of_knowledge_id,
                 type=event.type,

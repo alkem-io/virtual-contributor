@@ -819,9 +819,11 @@ class TestIngestSpacePluginDispatchesOnType:
 
     async def test_plugin_uses_knowledge_base_reader_for_alkemio_knowledge_base(self):
         store = MockKnowledgeStorePort()
+        llm = MockLLMPort()
+        embeddings = MockEmbeddingsPort()
         plugin = IngestSpacePlugin(
-            llm=MockLLMPort(),
-            embeddings=MockEmbeddingsPort(),
+            llm=llm,
+            embeddings=embeddings,
             knowledge_store=store,
             graphql_client=AsyncMock(),
         )
@@ -838,12 +840,20 @@ class TestIngestSpacePluginDispatchesOnType:
         assert result.result == "success"
         kb_mock.assert_awaited_once()
         space_mock.assert_not_awaited()
+        # Zero-document cleanup branch: no LLM/embeddings work,
+        # and no collection-level deletion either.
+        assert llm.calls == []
+        assert embeddings.calls == []
+        assert embeddings.query_calls == []
+        assert store.deleted == []
 
     async def test_plugin_uses_space_reader_for_alkemio_space(self):
         store = MockKnowledgeStorePort()
+        llm = MockLLMPort()
+        embeddings = MockEmbeddingsPort()
         plugin = IngestSpacePlugin(
-            llm=MockLLMPort(),
-            embeddings=MockEmbeddingsPort(),
+            llm=llm,
+            embeddings=embeddings,
             knowledge_store=store,
             graphql_client=AsyncMock(),
         )
@@ -860,3 +870,9 @@ class TestIngestSpacePluginDispatchesOnType:
         assert result.result == "success"
         space_mock.assert_awaited_once()
         kb_mock.assert_not_awaited()
+        # Zero-document cleanup branch: no LLM/embeddings work,
+        # and no collection-level deletion either.
+        assert llm.calls == []
+        assert embeddings.calls == []
+        assert embeddings.query_calls == []
+        assert store.deleted == []
