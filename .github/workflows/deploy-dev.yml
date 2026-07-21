@@ -14,7 +14,7 @@ jobs:
       matrix:
         plugin: [expert, generic, guidance, openai-assistant, ingest-website, ingest-space]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Deploy ${{ matrix.plugin }}
         run: |
