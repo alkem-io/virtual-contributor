@@ -48,11 +48,10 @@ class TestPromptGraphStructure:
         assert graph.nodes == {}
         assert graph.edges == []
 
-    def test_invoke_without_compile_raises(self):
+    async def test_invoke_without_compile_raises(self):
         graph = PromptGraph(nodes={}, edges=[])
         with pytest.raises(RuntimeError, match="not compiled"):
-            import asyncio
-            asyncio.get_event_loop().run_until_complete(graph.invoke({}))
+            await graph.invoke({})
 
     def test_state_model_building(self):
         schema = {
