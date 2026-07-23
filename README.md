@@ -163,15 +163,19 @@ virtual-contributor/
 ├── specs/                             # Feature specifications (001-025)
 ├── docs/adr/                          # Architecture Decision Records (0001-0011)
 ├── main.py                            # Single entry point
-├── Dockerfile                         # Multi-stage build (PLUGIN_TYPE at runtime)
+├── Dockerfile                         # Distroless build: 3.13-slim-trixie builder -> distroless/python3-debian13
+├── docker/
+│   ├── native-imports.py              # Derives native-extension modules from poetry.lock
+│   └── image-verify.sh                # Persisted regression: structure, interpreter match, imports, 6-plugin matrix
 ├── docker-compose.yaml                # All services from one image
+├── poetry.lock                        # Committed — lock-only installs, `poetry check --lock` gated
 ├── pyproject.toml                     # Poetry config + test/coverage settings
-└── .github/workflows/                 # CI/CD (lint, test, build, deploy)
+└── .github/workflows/                 # CI/CD (lint, test, build, deploy) — Python 3.13
 ```
 
 ## Prerequisites
 
-- Python 3.12+
+- Python 3.13 (matches the distroless runtime interpreter; CI and the image builder both pin 3.13)
 - [Poetry](https://python-poetry.org/) (dependency management)
 - Docker + Docker Compose (for local infrastructure or full deployment)
 
@@ -390,16 +394,44 @@ Each step reports metrics (duration, items in/out, error count) and failures are
 
 ### Image
 
-The project uses a multi-stage Docker build:
+The project ships a **distroless** runtime image (workspace#026-distroless-runtime-images),
+built as a matched Python 3.13 pair:
 
-- **Builder stage**: Installs Poetry, resolves dependencies with `--no-root`
-- **Runtime stage**: Copies only `site-packages`, `core/`, `plugins/`, and `main.py`
-- Exposes port `8080` for the health server
-- Default `PLUGIN_TYPE=generic`, overridable at runtime
+- **Builder stage** (`python:3.13.<patch>-slim-trixie`, glibc/Debian, digest-pinned):
+  installs Poetry, verifies the committed `poetry.lock` is in sync with
+  `pyproject.toml` (`poetry check --lock` — the build fails on a stale lock),
+  and installs production dependencies **exclusively from the lock** into a
+  relocatable `/venv` (`POETRY_VIRTUALENVS_CREATE=false` against an
+  already-activated venv). The exact interpreter patch version is recorded
+  into `/venv/PYTHON_VERSION` for the runtime match check below.
+- **Runtime stage** (`gcr.io/distroless/python3-debian13:nonroot`, digest-pinned):
+  contains only `/venv`, `core/`, `plugins/`, and `main.py` — no shell, no
+  package manager, no Poetry/pip. Runs as UID 65532 (`nonroot`).
+  `PYTHONPATH=/venv/lib/python3.13/site-packages` exposes the relocated
+  dependencies; `CMD ["main.py"]` runs against the distroless image's own
+  `python3` entrypoint.
+- The builder's and runtime's Python interpreters MUST match at
+  major.minor (3.13 == 3.13) — the compiled-extension wheels installed by
+  the builder must be ABI-compatible with the runtime interpreter. Verified
+  mechanically by `docker/image-verify.sh`.
+- Exposes port `8080` for the health server (`HEALTH_PORT`, `/healthz`,
+  `/readyz` — see [Startup Sequence](#startup-sequence)).
+- Default `PLUGIN_TYPE=generic`, overridable at runtime.
 
 ```bash
 docker build -t alkemio/virtual-contributor .
+
+# Persisted regression (US3 contract `vc-runtime-image`): structure, interpreter
+# match, every native-extension import from poetry.lock, and a live six-plugin
+# start matrix (expert, generic, guidance, openai-assistant, ingest_website,
+# ingest_space) against RabbitMQ + ChromaDB.
+docker/image-verify.sh alkemio/virtual-contributor
 ```
+
+`poetry.lock` is committed (not gitignored) — dependencies are installed
+**only** from the lock, both locally (`poetry install`) and in the image
+build. `poetry check --lock` is a required gate; run `poetry lock` and
+re-commit the lock whenever `pyproject.toml` changes.
 
 ### Docker Compose
 
