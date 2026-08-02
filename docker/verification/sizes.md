@@ -17,10 +17,13 @@ fix for the `ragas` finding (see `US5-AS1-cve-assessment.md`) was to move
 `ragas`/`click` out of `[tool.poetry.dependencies]` into the `dev` group:
 `evaluation/` (the only code that imports `ragas`) is never copied into the
 Docker runtime image, so `ragas` and its heavy transitive tree (scipy,
-networkx, scikit-network, pillow, instructor, rich, typer, docstring-parser,
-...) were pure dead weight in every distroless build to date. Excluding them
-via the Dockerfile's existing `poetry install --only main --no-root` shed
-~70MB in addition to the CVE fix itself.
+networkx, scikit-network, pillow, instructor, rich, typer) were pure dead
+weight in every distroless build to date. Excluding them via the
+Dockerfile's existing `poetry install --only main --no-root` shed ~70MB in
+addition to the CVE fix itself. `click` and `docstring-parser` are *not* part
+of this reduction — both remain in the shipped image via unrelated
+`main`-group transitive paths (`langchain-mistralai`/`langchain-anthropic`);
+see `US5-AS1-cve-assessment.md` for the reachability trace.
 
 ## Base image digests (this pass, unchanged from the original distroless build)
 

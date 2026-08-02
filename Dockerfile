@@ -21,7 +21,11 @@ FROM python:3.13.7-slim-trixie@sha256:5f55cdf0c5d9dc1a415637a5ccc4a9e18663ad2036
 RUN pip install --no-cache-dir poetry==2.3.3
 
 # Build a relocatable venv independent of the builder's own site-packages.
-RUN python -m venv /venv
+# --without-pip: poetry (installed above, into the builder's system
+# site-packages) does all the installing here — pip is never needed inside
+# /venv, and leaving it out keeps the "no pip in the runtime image" claim
+# (see below) true of the venv itself, not just of the distroless base.
+RUN python -m venv --without-pip /venv
 ENV VIRTUAL_ENV=/venv \
     PATH="/venv/bin:${PATH}" \
     POETRY_VIRTUALENVS_CREATE=false \

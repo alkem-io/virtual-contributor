@@ -10,17 +10,24 @@
 #   4. Six-plugin start matrix: expert, generic, guidance, openai-assistant,
 #      ingest_website, ingest_space each start against a live RabbitMQ (+
 #      ChromaDB) and answer /healthz 200 + /readyz 200.
-#   5. Evidence: emits IMAGE_DIGEST=/IMAGE_SIZE_BYTES= lines and, when a
-#      baseline image is available locally, a size-reduction check.
+#   5. Evidence: emits IMAGE_DIGEST=/IMAGE_SIZE_BYTES= lines and enforces the
+#      SC-001 size-reduction floor (>= 40% vs. baseline; the baseline is
+#      pulled if not already present locally — never skipped).
 #
 # Usage: docker/image-verify.sh <image> [baseline-image]
 #   VC_BASELINE_IMAGE env var overrides the default baseline
-#   (alkemio/virtual-contributor:v0.1.2).
+#   (alkemio/virtual-contributor@sha256:133a9d5d37468ba3babce678ba1fb10f0859b31746af353d48eb946d25b13513,
+#   i.e. v0.1.2, pre-distroless).
 
 set -euo pipefail
 
 IMAGE="${1:?Usage: docker/image-verify.sh <image> [baseline-image]}"
-BASELINE_IMAGE="${2:-${VC_BASELINE_IMAGE:-alkemio/virtual-contributor:v0.1.2}}"
+BASELINE_IMAGE="${2:-${VC_BASELINE_IMAGE:-alkemio/virtual-contributor@sha256:133a9d5d37468ba3babce678ba1fb10f0859b31746af353d48eb946d25b13513}}"
+
+# Verification-tooling images (never shipped — used only to run this script),
+# pinned to digests so the evidence they produce doesn't drift under us.
+RABBITMQ_IMAGE="rabbitmq@sha256:e582c0bc7766f3342496d8485efb5a1df782b5ce3886ad017e2eaae442311f69"       # 3-management
+CHROMA_IMAGE="chromadb/chroma@sha256:1e0b73a187a28757c572acba508c46f48c9e8b0acaf5c20e6d95cdedce1acdf6" # latest
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -111,12 +118,12 @@ start_rabbitmq() {
   docker rm -f "$RABBITMQ_NAME" >/dev/null 2>&1 || true
   docker run -d --name "$RABBITMQ_NAME" --network "$NETWORK_NAME" \
     -e RABBITMQ_DEFAULT_USER=alkemio-admin -e RABBITMQ_DEFAULT_PASS='alkemio!' \
-    rabbitmq:3-management >/dev/null
+    "$RABBITMQ_IMAGE" >/dev/null
 }
 
 start_rabbitmq
 docker run -d --name "$CHROMA_NAME" --network "$NETWORK_NAME" \
-  chromadb/chroma:latest >/dev/null
+  "$CHROMA_IMAGE" >/dev/null
 
 echo "waiting for rabbitmq to accept connections..."
 RABBITMQ_READY=0
@@ -226,18 +233,28 @@ SIZE_BYTES="$(docker inspect "$IMAGE" --format '{{.Size}}')"
 echo "IMAGE_DIGEST=${DIGEST}"
 echo "IMAGE_SIZE_BYTES=${SIZE_BYTES}"
 
-if docker image inspect "$BASELINE_IMAGE" >/dev/null 2>&1; then
-  BASELINE_SIZE="$(docker inspect "$BASELINE_IMAGE" --format '{{.Size}}')"
-  echo "BASELINE_IMAGE=${BASELINE_IMAGE}"
-  echo "BASELINE_SIZE_BYTES=${BASELINE_SIZE}"
-  if [ "$SIZE_BYTES" -ge "$BASELINE_SIZE" ]; then
-    echo "FAIL: new image (${SIZE_BYTES} bytes) is not smaller than baseline (${BASELINE_SIZE} bytes)"
+MIN_SIZE_REDUCTION_PCT=40
+
+if ! docker image inspect "$BASELINE_IMAGE" >/dev/null 2>&1; then
+  echo "baseline image ${BASELINE_IMAGE} not present locally — pulling it to enforce the SC-001 size-reduction floor..."
+  docker pull "$BASELINE_IMAGE" >/dev/null || {
+    echo "FAIL: could not pull baseline image ${BASELINE_IMAGE} — SC-001 size-reduction floor (${MIN_SIZE_REDUCTION_PCT}%) cannot be enforced without it"
     exit 1
-  fi
-  PCT=$(( (BASELINE_SIZE - SIZE_BYTES) * 100 / BASELINE_SIZE ))
-  echo "SIZE_REDUCTION_PCT=${PCT}"
-else
-  echo "WARN: baseline image ${BASELINE_IMAGE} not present locally — pull it to enable the size-reduction assertion (SC-001)."
+  }
 fi
+
+BASELINE_SIZE="$(docker inspect "$BASELINE_IMAGE" --format '{{.Size}}')"
+echo "BASELINE_IMAGE=${BASELINE_IMAGE}"
+echo "BASELINE_SIZE_BYTES=${BASELINE_SIZE}"
+if [ "$SIZE_BYTES" -ge "$BASELINE_SIZE" ]; then
+  echo "FAIL: new image (${SIZE_BYTES} bytes) is not smaller than baseline (${BASELINE_SIZE} bytes)"
+  exit 1
+fi
+PCT=$(( (BASELINE_SIZE - SIZE_BYTES) * 100 / BASELINE_SIZE ))
+echo "SIZE_REDUCTION_PCT=${PCT}"
+[ "$PCT" -ge "$MIN_SIZE_REDUCTION_PCT" ] || {
+  echo "FAIL: size reduction ${PCT}% is below the SC-001 floor of ${MIN_SIZE_REDUCTION_PCT}%"
+  exit 1
+}
 
 echo "== virtual-contributor image-verify: PASS =="
