@@ -1,6 +1,14 @@
 # CHANGELOG
 
 
+## v0.2.0 (2026-08-04)
+
+### Features
+
+- Distroless non-root runtime image (workspace#026)
+  ([`471474a`](https://github.com/alkem-io/virtual-contributor/commit/471474a1be78437654425ab9a4c88266ac70fc04))
+
+
 ## v0.1.3 (2026-05-11)
 
 ### Bug Fixes
