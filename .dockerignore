@@ -22,5 +22,6 @@ tests/
 .flake8
 .pre-commit-config.yaml
 *.md
+!README.md
 docker-compose.yaml
 Dockerfile
