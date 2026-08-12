@@ -47,6 +47,16 @@ class BaseConfig(BaseSettings):
     # Pipeline timeout (seconds) — outer timeout wrapping plugin.handle()
     pipeline_timeout: int = 3600
 
+    # Tracing — intentionally separate from standard OTEL_* environment names.
+    # The exporter is configured only from these explicit service settings.
+    tracing_enabled: bool = False
+    tracing_otlp_endpoint: str | None = None
+    tracing_otlp_headers: str | None = None
+    tracing_service_name: str | None = None
+    tracing_sample_ratio: float = 1.0
+    tracing_capture_content: bool = True
+    tracing_content_max_chars: int = 1000
+
     # ChromaDB / Vector DB
     vector_db_host: str | None = None
     vector_db_port: int = 8765
@@ -113,6 +123,16 @@ class BaseConfig(BaseSettings):
         if self.pipeline_timeout <= 0:
             raise ValueError(
                 f"PIPELINE_TIMEOUT must be greater than 0, got {self.pipeline_timeout}"
+            )
+        if not 0.0 <= self.tracing_sample_ratio <= 1.0:
+            raise ValueError(
+                "TRACING_SAMPLE_RATIO must be between 0.0 and 1.0, "
+                f"got {self.tracing_sample_ratio}"
+            )
+        if self.tracing_content_max_chars <= 0:
+            raise ValueError(
+                "TRACING_CONTENT_MAX_CHARS must be greater than 0, "
+                f"got {self.tracing_content_max_chars}"
             )
 
         # Vector DB distance function validation

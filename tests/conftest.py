@@ -263,3 +263,24 @@ def make_ingest_body_of_knowledge(**overrides) -> IngestBodyOfKnowledge:
     }
     defaults.update(overrides)
     return IngestBodyOfKnowledge.model_validate(defaults)
+
+
+@pytest.fixture
+def traced_exporter():
+    """An isolated in-memory exporter for tracing contract tests."""
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    from core.config import BaseConfig
+    from core.tracing import configure_tracing, reset_tracing_for_tests
+
+    exporter = InMemorySpanExporter()
+    config = BaseConfig(
+        llm_base_url="http://local-model",
+        tracing_enabled=True,
+        tracing_otlp_endpoint="http://collector.internal/v1/traces",
+    )
+    configure_tracing(config, span_exporter=exporter)
+    try:
+        yield exporter
+    finally:
+        reset_tracing_for_tests()
