@@ -67,14 +67,52 @@ class MockKnowledgeStorePort:
         collection: str,
         query_texts: list[str],
         n_results: int = 10,
+        where: dict | None = None,
     ) -> QueryResult:
-        self.query_calls.append((collection, query_texts, n_results))
+        self.query_calls.append((collection, query_texts, n_results, where))
+        items = self.collections.get(collection, [])
+        if items:
+            matched = [
+                item
+                for item in items
+                if where is None or self._matches_where(item["metadata"], where)
+            ][:n_results]
+            return QueryResult(
+                documents=[[item["document"] for item in matched]],
+                metadatas=[[item["metadata"] for item in matched]],
+                distances=[[0.1 + 0.1 * i for i in range(len(matched))]],
+                ids=[[item["id"] for item in matched]],
+            )
         return QueryResult(
             documents=[["doc1", "doc2"]],
             metadatas=[[{"source": "test"}, {"source": "test"}]],
             distances=[[0.1, 0.2]],
             ids=[["id1", "id2"]],
         )
+
+    @staticmethod
+    def _matches_where(metadata: dict, where: dict) -> bool:
+        """Evaluate the Chroma filter subset used by retrieval filter tests.
+
+        Chroma >=0.5.12 treats a missing metadata key as matching ``$ne``.
+        """
+        if "$and" in where:
+            return all(MockKnowledgeStorePort._matches_where(metadata, clause) for clause in where["$and"])
+        if "$or" in where:
+            return any(MockKnowledgeStorePort._matches_where(metadata, clause) for clause in where["$or"])
+
+        if len(where) != 1:
+            raise ValueError("Mock query filters must contain one metadata field")
+        key, condition = next(iter(where.items()))
+        if not isinstance(condition, dict) or len(condition) != 1:
+            raise ValueError("Mock query filter condition must contain one operator")
+        operator, expected = next(iter(condition.items()))
+        actual = metadata.get(key)
+        if operator == "$eq":
+            return key in metadata and actual == expected
+        if operator == "$ne":
+            return key not in metadata or actual != expected
+        raise ValueError(f"Unsupported mock query filter operator: {operator}")
 
     async def ingest(
         self,

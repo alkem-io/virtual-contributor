@@ -50,6 +50,7 @@ class ChromaDBAdapter:
         collection: str,
         query_texts: list[str],
         n_results: int = 10,
+        where: dict | None = None,
     ) -> QueryResult:
         if self._embeddings is None:
             raise ValueError(
@@ -64,9 +65,13 @@ class ChromaDBAdapter:
                 embedding_function=None,
                 metadata={"hnsw:space": self._distance_fn},
             )
-            results = col.query(
-                query_embeddings=query_embeddings, n_results=n_results
-            )
+            kwargs: dict[str, Any] = {
+                "query_embeddings": query_embeddings,
+                "n_results": n_results,
+            }
+            if where is not None:
+                kwargs["where"] = where
+            results = col.query(**kwargs)
             return QueryResult(
                 documents=results.get("documents", []),
                 metadatas=results.get("metadatas", []),

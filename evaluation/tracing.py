@@ -21,8 +21,11 @@ class TracingKnowledgeStore:
         collection: str,
         query_texts: list[str],
         n_results: int = 10,
+        where: dict | None = None,
     ) -> QueryResult:
-        result = await self._delegate.query(collection, query_texts, n_results)
+        result = await self._delegate.query(
+            collection, query_texts, n_results, where=where
+        )
         self._captured.append(result)
         return result
 

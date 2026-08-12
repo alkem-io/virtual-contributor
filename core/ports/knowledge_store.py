@@ -33,8 +33,13 @@ class KnowledgeStorePort(Protocol):
         collection: str,
         query_texts: list[str],
         n_results: int = 10,
+        where: dict | None = None,
     ) -> QueryResult:
-        """Query a collection for similar documents."""
+        """Query similar documents, optionally filtered store-side by metadata.
+
+        ``where=None`` leaves the query unfiltered.  A supplied Chroma ``where``
+        predicate is applied before ranking and is used verbatim.
+        """
         ...
 
     async def ingest(
