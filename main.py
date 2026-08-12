@@ -8,6 +8,7 @@ import logging
 import os
 import signal
 from contextlib import nullcontext
+from urllib.parse import urlsplit, urlunsplit
 
 from core.config import BaseConfig
 from core.container import Container
@@ -22,13 +23,20 @@ from core.router import Router
 logger = logging.getLogger(__name__)
 
 
-def _mask_sensitive(name: str, value) -> str:
+def _mask_sensitive(name: str, value: object) -> str:
     """Mask API key values for logging."""
     if value is None:
         return "None"
     s = str(value)
     if "api_key" in name or "headers" in name:
         return s[:3] + "****" if len(s) > 3 else "****"
+    if name.endswith(("_endpoint", "_url")):
+        parsed = urlsplit(s)
+        if parsed.username is not None or parsed.password is not None:
+            host = parsed.hostname or ""
+            if parsed.port is not None:
+                host = f"{host}:{parsed.port}"
+            return urlunsplit(parsed._replace(netloc=f"***@{host}"))
     return s
 
 
@@ -52,6 +60,8 @@ def _log_config(config: BaseConfig) -> None:
         "max_context_chars",
         "summary_chunk_threshold",
         "pipeline_timeout",
+        "llm_base_url",
+        "vector_db_host",
         "tracing_enabled",
         "tracing_otlp_endpoint",
         "tracing_otlp_headers",
@@ -159,6 +169,16 @@ def _create_adapters(config: BaseConfig, container: Container) -> None:
     from core.adapters.openai_assistant import OpenAIAssistantAdapter
 
     container.register(OpenAIAssistantAdapter, OpenAIAssistantAdapter())
+
+
+async def _shutdown_tracing_bounded() -> None:
+    """Flush tracing without allowing an unreachable collector to delay exit."""
+    from core.tracing import shutdown_tracing
+
+    try:
+        await asyncio.wait_for(asyncio.to_thread(shutdown_tracing), timeout=5)
+    except asyncio.TimeoutError:
+        logger.warning("Tracing shutdown exceeded 5s; closing transport anyway")
 
 
 async def _run(config: BaseConfig) -> None:
@@ -360,7 +380,7 @@ async def _run(config: BaseConfig) -> None:
                     type(event).__name__,
                 )
                 if root is not None:
-                    record_failure(root, exc, FailureMode.timeout)
+                    record_failure(root, exc, FailureMode.timeout, config=config)
                 from core.events.response import Response
                 error_response = Response(result=f"Error: pipeline timed out after {config.pipeline_timeout}s")
                 envelope = router.build_response_envelope(error_response, event)
@@ -368,7 +388,7 @@ async def _run(config: BaseConfig) -> None:
             except Exception as exc:
                 logger.exception("Pipeline failed for event type %s: %s", type(event).__name__, exc)
                 if root is not None:
-                    record_failure(root, exc, classify_failure(exc))
+                    record_failure(root, exc, classify_failure(exc), config=config)
                 from core.events.response import Response
                 error_response = Response(result=f"Error: {exc}")
                 envelope = router.build_response_envelope(error_response, event)
@@ -428,7 +448,7 @@ async def _run(config: BaseConfig) -> None:
                             type(event).__name__,
                         )
                         if root is not None:
-                            record_failure(root, exc, FailureMode.timeout)
+                            record_failure(root, exc, FailureMode.timeout, config=config)
                         await _retry_or_reject(
                             message, body,
                             event=event,
@@ -440,7 +460,7 @@ async def _run(config: BaseConfig) -> None:
                     except Exception as exc:
                         logger.exception("Error handling engine query: %s", exc)
                         if root is not None:
-                            record_failure(root, exc, classify_failure(exc))
+                            record_failure(root, exc, classify_failure(exc), config=config)
                         await _retry_or_reject(
                             message, body,
                             event=event,
@@ -563,9 +583,7 @@ async def _run(config: BaseConfig) -> None:
 
     await health.stop()
     await plugin.shutdown()
-    from core.tracing import shutdown_tracing
-
-    shutdown_tracing()
+    await _shutdown_tracing_bounded()
     await transport.close()
     logger.info("Shutdown complete")
 

@@ -8,11 +8,15 @@ from opentelemetry import trace
 from opentelemetry.trace import SpanKind
 
 from core.ports.knowledge_store import GetResult, KnowledgeStorePort, QueryResult
-from core.tracing import get_tracer
+from core.tracing import FailureMode, get_tracer, record_failure
 
 
 class TracedKnowledgeStore:
-    """Delegate every KnowledgeStorePort operation while recording its outcome."""
+    """Runtime OTel decorator for a KnowledgeStorePort.
+
+    This is distinct from ``evaluation.tracing.TracingKnowledgeStore``, which
+    remains the evaluation harness's capture-only wrapper.
+    """
 
     def __init__(self, delegate: KnowledgeStorePort) -> None:
         self._delegate = delegate
@@ -42,8 +46,7 @@ class TracedKnowledgeStore:
                 self._query_attributes(span, collection, n_results, result)
                 return result
             except Exception as exc:
-                span.record_exception(exc)
-                span.set_status(trace.Status(trace.StatusCode.ERROR, str(exc)))
+                record_failure(span, exc, FailureMode.unknown)
                 raise
 
     async def ingest(self, collection: str, documents: list[str], metadatas: list[dict], ids: list[str], embeddings: list[list[float]] | None = None) -> None:
@@ -66,6 +69,5 @@ class TracedKnowledgeStore:
             try:
                 return await awaitable
             except Exception as exc:
-                span.record_exception(exc)
-                span.set_status(trace.Status(trace.StatusCode.ERROR, str(exc)))
+                record_failure(span, exc, FailureMode.unknown)
                 raise

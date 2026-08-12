@@ -6,7 +6,6 @@ import asyncio
 import json
 import logging
 import re
-from contextlib import nullcontext
 
 from core.events.input import Input
 from core.events.response import Response, Source
@@ -64,14 +63,9 @@ class GuidancePlugin:
             history_text = "\n".join(
                 f"{h.role}: {h.content}" for h in event.history
             )
-            from core.tracing import get_tracer, tracing_is_configured
+            from core.tracing import optional_span
 
-            context = (
-                get_tracer().start_as_current_span("vc.stage query_processing")
-                if tracing_is_configured()
-                else nullcontext(None)
-            )
-            with context as span:
+            with optional_span("vc.stage query_processing") as span:
                 if span is not None:
                     span.set_attribute("vc.history_turns", len(event.history))
                 condensed = await self._llm.invoke([{
@@ -87,45 +81,35 @@ class GuidancePlugin:
 
         async def _query_collection(collection: str):
             docs, sources = [], []
-            from opentelemetry import trace
             from opentelemetry.trace import SpanKind
-            from core.tracing import get_tracer, tracing_is_configured
+            from core.tracing import optional_span
 
-            context = (
-                get_tracer().start_as_current_span("vc.retrieval", kind=SpanKind.CLIENT)
-                if tracing_is_configured()
-                else nullcontext(None)
-            )
             try:
-                with context as span:
-                    result = await self._knowledge_store.query(
-                        collection=collection, query_texts=[question], n_results=n_results,
-                    )
-                    if result.documents:
-                        for i, doc in enumerate(result.documents[0]):
-                            distance = result.distances[0][i] if result.distances else 1.0
-                            score = 1.0 - distance
-                            docs.append(doc)
-                            meta = result.metadatas[0][i] if result.metadatas else {}
-                            source_url = meta.get("source", collection)
-                            sources.append(Source(
-                                source=source_url,
-                                title=meta.get("title"),
-                                uri=source_url,
-                                score=score,
-                            ))
-                    if span is not None:
-                        passed = sum(1 for source in sources if (source.score or 0) >= self._score_threshold)
-                        span.set_attribute("vc.retrieval.chunks_passed", passed)
-                        span.set_attribute("vc.retrieval.chunks_dropped_budget", 0)
-                        if not docs or passed == 0:
-                            from core.tracing import mark_empty_retrieval
+                with optional_span("vc.retrieval", kind=SpanKind.CLIENT) as span:
+                    try:
+                        result = await self._knowledge_store.query(
+                            collection=collection, query_texts=[question], n_results=n_results,
+                        )
+                        if result.documents:
+                            for i, doc in enumerate(result.documents[0]):
+                                distance = result.distances[0][i] if result.distances else 1.0
+                                score = 1.0 - distance
+                                docs.append(doc)
+                                meta = result.metadatas[0][i] if result.metadatas else {}
+                                source_url = meta.get("source", collection)
+                                sources.append(Source(
+                                    source=source_url,
+                                    title=meta.get("title"),
+                                    uri=source_url,
+                                    score=score,
+                                ))
+                    except Exception as exc:
+                        if span is not None:
+                            from core.tracing import FailureMode, record_failure
 
-                            mark_empty_retrieval()
-            except Exception as exc:
-                if 'span' in locals() and span is not None:
-                    span.record_exception(exc)
-                    span.set_status(trace.Status(trace.StatusCode.ERROR, str(exc)))
+                            record_failure(span, exc, FailureMode.unknown)
+                        raise
+            except Exception:
                 logger.warning("Failed to query collection %s", collection)
             return docs, sources
 
@@ -178,6 +162,16 @@ class GuidancePlugin:
         all_docs = [doc for doc, _ in deduped]
         all_sources = [src for _, src in deduped]
 
+        # These are cross-collection signals, so they belong on the root
+        # rather than incorrectly attributing merged filtering to one query.
+        from core.tracing import current_root_span, mark_empty_retrieval
+
+        root = current_root_span()
+        root.set_attribute("vc.retrieval.chunks_passed", len(deduped))
+        root.set_attribute("vc.retrieval.chunks_dropped_budget", dropped)
+        if not deduped:
+            mark_empty_retrieval()
+
         # Prefix each chunk with [source:N] for LLM source attribution
         if all_docs:
             context = "\n\n".join(
@@ -205,8 +199,6 @@ class GuidancePlugin:
             )
 
         logger.warning("Structured JSON parsing failed, returning raw LLM text")
-        from core.tracing import current_root_span
-
         current_root_span().add_event("vc.parse_fallback")
         return Response(
             result=answer,

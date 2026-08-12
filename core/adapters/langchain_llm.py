@@ -12,6 +12,11 @@ from langchain_core.messages import (
     HumanMessage,
     SystemMessage,
 )
+from core.tracing import (
+    LLMInvocationError,
+    LLMInvocationTimeoutError,
+    mark_llm_failure,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -75,11 +80,11 @@ class LangChainLLMAdapter:
                 # the await but the thread keeps running (zombie thread). Retrying
                 # submits another thread, and with concurrent summarizations this
                 # can exhaust the thread pool and deadlock the pipeline.
-                raise TimeoutError(
+                raise LLMInvocationTimeoutError(
                     f"LLM call timed out after {self._timeout}s"
                 ) from None
             except (ConnectionError, OSError) as exc:
-                raise ConnectionError(
+                raise LLMInvocationError(
                     f"Failed to connect to LLM endpoint: {exc}. "
                     "If using a local model, ensure the server is running."
                 ) from exc
@@ -94,7 +99,10 @@ class LangChainLLMAdapter:
                         exc,
                     )
                     await asyncio.sleep(delay)
-        raise last_exc  # type: ignore[misc]
+        # Preserve the original exception type for callers; tag it for the
+        # tracing failure taxonomy (llm_error) without changing behavior.
+        assert last_exc is not None
+        raise mark_llm_failure(last_exc)
 
     async def stream(self, messages: list[dict]) -> AsyncIterator[str]:
         lc_messages = _to_langchain_messages(messages)

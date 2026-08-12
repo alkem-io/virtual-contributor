@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from contextlib import nullcontext
 
 from core.events.input import Input
 from core.events.response import Response, Source
@@ -147,19 +146,14 @@ class ExpertPlugin:
 
         async def retrieve_node(state: dict) -> dict:
             from opentelemetry.trace import SpanKind
-            from core.tracing import get_tracer, mark_empty_retrieval, tracing_is_configured
+            from core.tracing import mark_empty_retrieval, optional_span
 
             query = (
                 state.get("rephrased_question")
                 or state.get("current_question")
                 or event.message
             )
-            context = (
-                get_tracer().start_as_current_span("vc.retrieval", kind=SpanKind.CLIENT)
-                if tracing_is_configured()
-                else nullcontext(None)
-            )
-            with context as span:
+            with optional_span("vc.retrieval", kind=SpanKind.CLIENT) as span:
                 result = await self._knowledge_store.query(
                     collection=collection, query_texts=[query], n_results=n_results,
                 )
@@ -224,14 +218,9 @@ class ExpertPlugin:
     async def _handle_simple(self, event: Input, collection: str) -> Response:
         """Simple RAG without graph execution."""
         from opentelemetry.trace import SpanKind
-        from core.tracing import get_tracer, mark_empty_retrieval, tracing_is_configured
+        from core.tracing import mark_empty_retrieval, optional_span
 
-        context = (
-            get_tracer().start_as_current_span("vc.retrieval", kind=SpanKind.CLIENT)
-            if tracing_is_configured()
-            else nullcontext(None)
-        )
-        with context as span:
+        with optional_span("vc.retrieval", kind=SpanKind.CLIENT) as span:
             result = await self._knowledge_store.query(
                 collection=collection, query_texts=[event.message], n_results=self._n_results,
             )

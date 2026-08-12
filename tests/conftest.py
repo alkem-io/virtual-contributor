@@ -284,3 +284,16 @@ def traced_exporter():
         yield exporter
     finally:
         reset_tracing_for_tests()
+
+
+@pytest.fixture
+def traced_config():
+    """A real tracing config for root-span tests."""
+    from core.config import BaseConfig
+
+    return BaseConfig(
+        llm_base_url="http://local-model",
+        tracing_enabled=True,
+        tracing_otlp_endpoint="http://collector.internal/v1/traces",
+        tracing_content_max_chars=100,
+    )

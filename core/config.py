@@ -134,6 +134,16 @@ class BaseConfig(BaseSettings):
                 "TRACING_CONTENT_MAX_CHARS must be greater than 0, "
                 f"got {self.tracing_content_max_chars}"
             )
+        if self.tracing_otlp_headers:
+            valid_headers = 0
+            for item in self.tracing_otlp_headers.split(","):
+                key, separator, _ = item.partition("=")
+                if separator and key.strip():
+                    valid_headers += 1
+            if valid_headers == 0:
+                raise ValueError(
+                    "TRACING_OTLP_HEADERS must contain at least one key=value pair"
+                )
 
         # Vector DB distance function validation
         valid_distance_fns = {"cosine", "l2", "ip"}

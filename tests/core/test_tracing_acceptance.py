@@ -11,6 +11,7 @@ from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
 from langchain_core.messages import AIMessage
 
 from core.adapters.langchain_llm import LangChainLLMAdapter
+from core.config import BaseConfig
 from core.tracing import handle_span, shutdown_tracing
 from core.tracing_callbacks import VCTracingCallbackHandler
 from plugins.expert.plugin import ExpertPlugin
@@ -50,7 +51,12 @@ GRAPH_DEFINITION = {
 
 
 def _tracing_config():
-    return type("C", (), {"tracing_capture_content": True, "tracing_content_max_chars": 100})()
+    return BaseConfig(
+        llm_base_url="http://local-model",
+        tracing_enabled=True,
+        tracing_otlp_endpoint="http://collector.internal/v1/traces",
+        tracing_content_max_chars=100,
+    )
 
 
 def _fake_chat_model(**message_kwargs) -> GenericFakeChatModel:

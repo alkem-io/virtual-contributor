@@ -3,6 +3,8 @@
 import asyncio
 import time
 
+import pytest
+
 import core.tracing as tracing
 from core.config import BaseConfig
 from core.tracing import (
@@ -10,6 +12,8 @@ from core.tracing import (
     classify_failure,
     configure_tracing,
     get_tracer,
+    handle_span,
+    record_failure,
     reset_tracing_for_tests,
     set_content_attribute,
     shutdown_tracing,
@@ -56,11 +60,43 @@ def test_failure_classification() -> None:
     assert classify_failure(ValueError()) == FailureMode.parse_error
 
 
+def test_failure_classification_covers_source_aware_modes(traced_exporter) -> None:
+    class RouterError(Exception):
+        pass
+
+    assert classify_failure(tracing.LLMInvocationTimeoutError("LLM call timed out")) == FailureMode.llm_error
+    assert classify_failure(RouterError()) == FailureMode.parse_error
+    assert classify_failure(RuntimeError()) == FailureMode.unknown
+    event = object()
+    with handle_span(_config(), event, "test") as span:
+        span.set_attribute("vc.retrieval.empty", True)
+        assert classify_failure(RuntimeError()) == FailureMode.empty_retrieval
+
+
+def test_failure_content_is_gated(traced_exporter) -> None:
+    config = _config(tracing_capture_content=False)
+    secret = "do-not-export-this-error"
+    with handle_span(config, object(), "test") as span:
+        record_failure(span, RuntimeError(secret), FailureMode.unknown, config=config)
+    shutdown_tracing()
+    finished = traced_exporter.get_finished_spans()[0]
+    assert finished.attributes["vc.failure_mode"] == "unknown"
+    assert all(secret not in str(item) for item in finished.attributes.items())
+    assert all(secret not in str(event.attributes) for event in finished.events)
+
+
 def test_ambient_otel_env_cannot_redirect_export(monkeypatch) -> None:
     """Zero egress by construction: decoy OTEL_* env must be ignored (US2-AS3)."""
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "https://collector.evil.example")
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "https://collector.evil.example/v1/traces")
     monkeypatch.setenv("OTEL_TRACES_SAMPLER", "always_off")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_CERTIFICATE", "/tmp/evil-ca.pem")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_HEADERS", "evil=header")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_CLIENT_KEY", "/tmp/evil.key")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE", "/tmp/evil.crt")
+    monkeypatch.setenv("HTTP_PROXY", "http://evil-proxy.invalid:8080")
+    monkeypatch.setenv("HTTPS_PROXY", "http://evil-proxy.invalid:8080")
+    monkeypatch.setenv("REQUESTS_CA_BUNDLE", "/tmp/evil-requests-ca.pem")
     reset_tracing_for_tests()
     config = _config(
         tracing_enabled=True,
@@ -75,11 +111,72 @@ def test_ambient_otel_env_cannot_redirect_export(monkeypatch) -> None:
         exporter = processor.span_exporter
         assert exporter._endpoint == "http://collector.internal:4318/v1/traces"
         assert exporter._headers == {"authorization": "Bearer secret-token"}
+        assert exporter._certificate_file is True
+        assert exporter._client_cert is None
+        assert exporter._session.trust_env is False
+        assert exporter._session.proxies == {}
         # Ambient OTEL_TRACES_SAMPLER=always_off must not win over the explicit sampler:
         with get_tracer().start_as_current_span("sampled") as span:
             assert span.is_recording()
     finally:
         reset_tracing_for_tests()
+
+
+def test_unset_headers_are_an_explicit_empty_mapping(monkeypatch) -> None:
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_HEADERS", "evil=header")
+    reset_tracing_for_tests()
+    assert configure_tracing(
+        _config(tracing_enabled=True, tracing_otlp_endpoint="http://collector.internal/v1/traces")
+    )
+    try:
+        provider = tracing._provider
+        assert provider is not None
+        exporter = provider._active_span_processor._span_processors[0].span_exporter
+        assert exporter._headers == {}
+        assert bool(exporter._headers) is True
+    finally:
+        reset_tracing_for_tests()
+
+
+def test_invalid_headers_fail_config_validation() -> None:
+    with pytest.raises(ValueError, match="TRACING_OTLP_HEADERS"):
+        _config(tracing_otlp_headers="not-a-header,still-not-a-header")
+
+
+def test_ambient_resource_and_sdk_disable_are_not_silent(monkeypatch) -> None:
+    monkeypatch.setenv("OTEL_RESOURCE_ATTRIBUTES", "evil.resource=present")
+    reset_tracing_for_tests()
+    assert configure_tracing(
+        _config(tracing_enabled=True, tracing_otlp_endpoint="http://collector.internal/v1/traces")
+    )
+    try:
+        assert "evil.resource" not in tracing._provider.resource.attributes
+    finally:
+        reset_tracing_for_tests()
+
+    monkeypatch.setenv("OTEL_SDK_DISABLED", "true")
+    assert not configure_tracing(
+        _config(tracing_enabled=True, tracing_otlp_endpoint="http://collector.internal/v1/traces")
+    )
+    assert not tracing.tracing_is_configured()
+
+
+async def test_disabled_engine_never_consults_global_provider(monkeypatch) -> None:
+    from core.domain.pipeline.engine import IngestEngine, PipelineContext
+
+    class Step:
+        name = "safe"
+
+        async def execute(self, context: PipelineContext) -> None:
+            context.chunks.append(object())
+
+    def ambient_provider_used(*args, **kwargs):
+        raise AssertionError("ambient tracer provider was consulted")
+
+    reset_tracing_for_tests()
+    monkeypatch.setattr(tracing.trace, "get_tracer", ambient_provider_used)
+    result = await IngestEngine(steps=[Step()]).run([], "knowledge")
+    assert result.errors == []
 
 
 def test_backend_absent_never_blocks_or_raises() -> None:

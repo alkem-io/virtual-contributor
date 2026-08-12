@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from contextlib import nullcontext
 
 from core.events.input import Input
 from core.events.response import Response
@@ -52,14 +51,9 @@ class GenericPlugin:
                 {"role": "system", "content": condenser_system_prompt},
                 {"role": "human", "content": f"History:\n{history_text}\n\nLatest question: {question}"},
             ]
-            from core.tracing import get_tracer, tracing_is_configured
+            from core.tracing import optional_span
 
-            context = (
-                get_tracer().start_as_current_span("vc.stage query_processing")
-                if tracing_is_configured()
-                else nullcontext(None)
-            )
-            with context as span:
+            with optional_span("vc.stage query_processing") as span:
                 if span is not None:
                     span.set_attribute("vc.history_turns", len(event.history))
                 question = await self._llm.invoke(condenser_messages)

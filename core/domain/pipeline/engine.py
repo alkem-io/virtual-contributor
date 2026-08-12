@@ -7,8 +7,10 @@ import time
 from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
+from opentelemetry.trace import SpanKind
+
 from core.domain.ingest_pipeline import Chunk, Document, IngestResult
-from core.tracing import get_tracer
+from core.tracing import optional_span
 
 logger = logging.getLogger(__name__)
 
@@ -242,48 +244,34 @@ class IngestEngine:
                     items_out=len(context.chunks),
                     error_count=1,
                 )
-                try:
-                    with get_tracer().start_as_current_span(
-                        f"vc.ingest.step {step.name}"
-                    ) as span:
+                with optional_span(
+                    f"vc.ingest.step {step.name}", kind=SpanKind.INTERNAL
+                ) as span:
+                    if span is not None:
                         span.set_attribute("vc.step.items_in", items_before)
                         span.set_attribute("vc.step.items_out", len(context.chunks))
                         span.set_attribute("vc.step.error_count", 1)
                         span.set_attribute("vc.step.skipped", True)
                         span.set_attribute("vc.step.skip_reason", "prior_errors")
-                except Exception:
-                    logger.warning("Unable to trace skipped pipeline step", exc_info=True)
                 continue
 
             start = time.monotonic()
 
-            ran_step = False
-            try:
-                with get_tracer().start_as_current_span(
-                    f"vc.ingest.step {step.name}"
-                ) as span:
-                    try:
-                        ran_step = True
-                        await step.execute(context)
-                    except Exception as exc:
-                        context.errors.append(f"{step.name}: {exc}")
-                        logger.exception("Step '%s' failed", step.name)
-                    finally:
+            with optional_span(
+                f"vc.ingest.step {step.name}", kind=SpanKind.INTERNAL
+            ) as span:
+                try:
+                    await step.execute(context)
+                except Exception as exc:
+                    context.errors.append(f"{step.name}: {exc}")
+                    logger.exception("Step '%s' failed", step.name)
+                finally:
+                    if span is not None:
                         span.set_attribute("vc.step.items_in", items_before)
                         span.set_attribute("vc.step.items_out", len(context.chunks))
                         span.set_attribute(
                             "vc.step.error_count", len(context.errors) - errors_before
                         )
-            except Exception:
-                # Telemetry remains strictly observational; preserve existing
-                # ingest semantics if a tracing implementation is faulty.
-                logger.warning("Unable to trace pipeline step", exc_info=True)
-                if not ran_step:
-                    try:
-                        await step.execute(context)
-                    except Exception as exc:
-                        context.errors.append(f"{step.name}: {exc}")
-                        logger.exception("Step '%s' failed", step.name)
 
             elapsed = time.monotonic() - start
             context.metrics[f"{step.name}{metrics_suffix}"] = StepMetrics(

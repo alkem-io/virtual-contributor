@@ -1,5 +1,7 @@
 # ADR 0012: OpenTelemetry pipeline tracing
 
+## Status: Accepted
+
 ## Context
 
 Story #28 needs correlated query and ingest visibility without sending prompts,
@@ -27,3 +29,14 @@ PromptGraph invocation paths.
 - Self-hosted Langfuse (via OTLP), Grafana Tempo, and Elastic APM can consume
   the same wire format. Backend operation and dashboards remain infrastructure
   concerns rather than application dependencies.
+- A retrieval decorator merges its attributes into an already-open
+  `vc.retrieval` span, so a plugin's post-filter signals and the store's raw
+  result signals remain on exactly one span. Guidance's cross-collection
+  filtering is attributed to the root span because it has no single collection
+  owner.
+- A timed-out synchronous LLM call can finish in its worker thread after its
+  root span closes. Dashboards should exclude those late child spans from
+  root-duration rollups.
+- Retrieval score statistics use `1 - distance` and are meaningful as bounded
+  similarity only for cosine distance; l2 and inner-product deployments must
+  interpret them according to their configured distance function.
