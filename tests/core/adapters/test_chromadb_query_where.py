@@ -71,7 +71,8 @@ async def test_filtered_query_uses_the_existing_retry_path(adapter: ChromaDBAdap
 
 async def test_retry_fast_fails_validation_errors_but_retries_decode_errors() -> None:
     """CQ-5 contract: deterministic ValueError → one attempt; transient
-    JSONDecodeError (a ValueError subclass — proxy 502 bodies) → full retries."""
+    JSONDecodeError (a ValueError subclass — truncated/non-JSON response
+    bodies at the client's orjson parse step) → full retries."""
     import json as _json
 
     attempts = {"validation": 0, "decode": 0}

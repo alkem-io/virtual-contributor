@@ -191,8 +191,11 @@ class ChromaDBAdapter:
                 # filter) are deterministic — retrying burns backoff sleeps
                 # for the same rejection. Surface them immediately. But
                 # JSONDecodeError (a ValueError subclass) means a transient
-                # non-JSON upstream response (proxy 502 during a rolling
-                # restart) — that one stays retryable.
+                # truncated/non-JSON body on an otherwise-successful response
+                # (the client's orjson.loads response-parse step — e.g. a
+                # connection cut mid-body) — that one stays retryable.
+                # NOTE: proxy 502s raise a bare Exception in the chromadb
+                # client and are retried by the generic branch below.
                 if not isinstance(exc, json.JSONDecodeError):
                     raise
                 last_exc = exc
