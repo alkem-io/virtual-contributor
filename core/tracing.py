@@ -144,6 +144,11 @@ def configure_tracing(
     provider = TracerProvider(
         resource=resource,
         sampler=ParentBased(TraceIdRatioBased(config.tracing_sample_ratio)),
+        # This module owns the provider lifecycle (shutdown_tracing on a
+        # bounded daemon thread). The SDK's atexit hook would re-run the
+        # blocking flush after main() returns, unbounding process exit
+        # against a dead collector (measured 35s > k8s 30s grace period).
+        shutdown_on_exit=False,
     )
     if provider._disabled:  # type: ignore[attr-defined]
         logger.warning("Tracing is disabled by OTEL_SDK_DISABLED; tracing stays off")
@@ -278,7 +283,13 @@ def record_failure(
 def optional_span(
     name: str, *, kind: trace.SpanKind = trace.SpanKind.INTERNAL
 ) -> Iterator[trace.Span | None]:
-    """Open an instrumentation span only for this module's configured provider."""
+    """Open an instrumentation span only for this module's configured provider.
+
+    SDK auto-recording is disabled so exception content stays gated behind
+    ``tracing_capture_content`` — ``record_failure`` is the single writer of
+    error context, invoked here so a raising body still exports status ERROR
+    (span-schema contract) without leaking the exception message.
+    """
     if not tracing_is_configured():
         with nullcontext(None) as span:
             yield span
@@ -286,7 +297,11 @@ def optional_span(
     with get_tracer().start_as_current_span(
         name, kind=kind, record_exception=False, set_status_on_exception=False
     ) as span:
-        yield span
+        try:
+            yield span
+        except BaseException as exc:
+            record_failure(span, exc, classify_failure(exc))
+            raise
 
 
 @contextmanager

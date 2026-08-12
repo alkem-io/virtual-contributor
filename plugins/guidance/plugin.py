@@ -85,30 +85,25 @@ class GuidancePlugin:
             from core.tracing import optional_span
 
             try:
-                with optional_span("vc.retrieval", kind=SpanKind.CLIENT) as span:
-                    try:
-                        result = await self._knowledge_store.query(
-                            collection=collection, query_texts=[question], n_results=n_results,
-                        )
-                        if result.documents:
-                            for i, doc in enumerate(result.documents[0]):
-                                distance = result.distances[0][i] if result.distances else 1.0
-                                score = 1.0 - distance
-                                docs.append(doc)
-                                meta = result.metadatas[0][i] if result.metadatas else {}
-                                source_url = meta.get("source", collection)
-                                sources.append(Source(
-                                    source=source_url,
-                                    title=meta.get("title"),
-                                    uri=source_url,
-                                    score=score,
-                                ))
-                    except Exception as exc:
-                        if span is not None:
-                            from core.tracing import FailureMode, record_failure
-
-                            record_failure(span, exc, FailureMode.unknown)
-                        raise
+                # optional_span records any failure (content-gated) and
+                # re-raises; the outer handler isolates this collection.
+                with optional_span("vc.retrieval", kind=SpanKind.CLIENT):
+                    result = await self._knowledge_store.query(
+                        collection=collection, query_texts=[question], n_results=n_results,
+                    )
+                    if result.documents:
+                        for i, doc in enumerate(result.documents[0]):
+                            distance = result.distances[0][i] if result.distances else 1.0
+                            score = 1.0 - distance
+                            docs.append(doc)
+                            meta = result.metadatas[0][i] if result.metadatas else {}
+                            source_url = meta.get("source", collection)
+                            sources.append(Source(
+                                source=source_url,
+                                title=meta.get("title"),
+                                uri=source_url,
+                                score=score,
+                            ))
             except Exception:
                 logger.warning("Failed to query collection %s", collection)
             return docs, sources

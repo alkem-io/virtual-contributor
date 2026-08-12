@@ -193,6 +193,245 @@ async def _shutdown_tracing_bounded() -> None:
         logger.warning("Tracing shutdown exceeded 5s; closing transport anyway")
 
 
+def build_message_handler(
+    *,
+    config: BaseConfig,
+    plugin: object,
+    router: Router,
+    transport: object,
+    active_tasks: set,
+):
+    """Build the production on_message handler (module-level so tests can
+    drive the REAL wiring — root spans, failure taxonomy, both ACK paths —
+    instead of re-implementing it)."""
+
+    def _is_ingest_event(event: object) -> bool:
+        """Return True for ingest event types that should use early ACK."""
+        from core.events.ingest_space import IngestBodyOfKnowledge
+        from core.events.ingest_website import IngestWebsite
+        return isinstance(event, (IngestWebsite, IngestBodyOfKnowledge))
+
+    async def _publish_result(envelope: dict) -> None:
+        """Publish a result envelope to the result queue."""
+        await transport.publish(
+            config.rabbitmq_exchange,
+            config.rabbitmq_result_routing_key,
+            json.dumps(envelope).encode("utf-8"),
+        )
+
+    async def _run_pipeline(event: object) -> None:
+        """Run plugin.handle() with timeout and publish result."""
+        from core.tracing import (
+            FailureMode,
+            LLMInvocationTimeoutError,
+            classify_failure,
+            handle_span,
+            record_failure,
+            tracing_is_configured,
+        )
+
+        context = handle_span(config, event, plugin.name) if tracing_is_configured() else nullcontext(None)
+        with context as root:
+            try:
+                response = await asyncio.wait_for(
+                    plugin.handle(event),
+                    timeout=config.pipeline_timeout,
+                )
+                envelope = router.build_response_envelope(response, event)
+                await _publish_result(envelope)
+                if root is not None:
+                    from opentelemetry import trace
+
+                    root.set_status(trace.Status(trace.StatusCode.OK))
+            except LLMInvocationTimeoutError as exc:
+                logger.error(
+                    "LLM provider timed out for event type %s", type(event).__name__
+                )
+                if root is not None:
+                    record_failure(root, exc, FailureMode.llm_error, config=config)
+                from core.events.response import Response
+                error_response = Response(result=f"Error: {exc}")
+                envelope = router.build_response_envelope(error_response, event)
+                await _publish_result(envelope)
+            except asyncio.TimeoutError as exc:
+                logger.error(
+                    "Pipeline timed out after %ds for event type %s",
+                    config.pipeline_timeout,
+                    type(event).__name__,
+                )
+                if root is not None:
+                    record_failure(root, exc, FailureMode.timeout, config=config)
+                from core.events.response import Response
+                error_response = Response(result=f"Error: pipeline timed out after {config.pipeline_timeout}s")
+                envelope = router.build_response_envelope(error_response, event)
+                await _publish_result(envelope)
+            except Exception as exc:
+                logger.exception("Pipeline failed for event type %s: %s", type(event).__name__, exc)
+                if root is not None:
+                    record_failure(root, exc, classify_failure(exc), config=config)
+                from core.events.response import Response
+                error_response = Response(result=f"Error: {exc}")
+                envelope = router.build_response_envelope(error_response, event)
+                await _publish_result(envelope)
+
+    def _task_done(task: asyncio.Task) -> None:
+        """Remove completed task from the active set."""
+        active_tasks.discard(task)
+
+    # Message handler — receives both body and raw message for ACK control
+    async def on_message(
+        body: dict,
+        message: object,
+    ) -> None:
+        event = None
+        try:
+            event = router.parse_event(body)
+
+            if _is_ingest_event(event):
+                # Early ACK: acknowledge before processing starts
+                await message.ack()  # type: ignore[union-attr]
+                logger.info(
+                    "Early-ACKed ingest message, scheduling async pipeline for %s",
+                    type(event).__name__,
+                )
+                task = asyncio.create_task(_run_pipeline(event))
+                active_tasks.add(task)
+                task.add_done_callback(_task_done)
+            else:
+                # Engine query: late ACK — process synchronously, then ACK
+                from core.tracing import (
+                    FailureMode,
+                    LLMInvocationTimeoutError,
+                    classify_failure,
+                    handle_span,
+                    record_failure,
+                    tracing_is_configured,
+                )
+
+                context = handle_span(config, event, plugin.name) if tracing_is_configured() else nullcontext(None)
+                with context as root:
+                    try:
+                        response = await asyncio.wait_for(
+                            plugin.handle(event),
+                            timeout=config.pipeline_timeout,
+                        )
+                        envelope = router.build_response_envelope(response, event)
+                        await _publish_result(envelope)
+                        await message.ack()  # type: ignore[union-attr]
+                        if root is not None:
+                            from opentelemetry import trace
+
+                            root.set_status(trace.Status(trace.StatusCode.OK))
+                    except LLMInvocationTimeoutError as exc:
+                        logger.error(
+                            "LLM provider timed out for %s", type(event).__name__
+                        )
+                        if root is not None:
+                            record_failure(root, exc, FailureMode.llm_error, config=config)
+                        await _retry_or_reject(
+                            message, body,
+                            event=event,
+                            error_text=f"Error: {exc}",
+                        )
+                    except asyncio.TimeoutError as exc:
+                        logger.error(
+                            "Handler timed out after %ds for %s",
+                            config.pipeline_timeout,
+                            type(event).__name__,
+                        )
+                        if root is not None:
+                            record_failure(root, exc, FailureMode.timeout, config=config)
+                        await _retry_or_reject(
+                            message, body,
+                            event=event,
+                            error_text=(
+                                f"Error: handler timed out after "
+                                f"{config.pipeline_timeout}s"
+                            ),
+                        )
+                    except Exception as exc:
+                        logger.exception("Error handling engine query: %s", exc)
+                        if root is not None:
+                            record_failure(root, exc, classify_failure(exc), config=config)
+                        await _retry_or_reject(
+                            message, body,
+                            event=event,
+                            error_text=f"Error: {exc}",
+                        )
+        except Exception as exc:
+            # parse_event failed — reject the message
+            logger.exception("Failed to parse message: %s", exc)
+            await _retry_or_reject(message, body)
+
+    async def _retry_or_reject(
+        message: object,
+        body: dict,
+        *,
+        event: object | None = None,
+        error_text: str | None = None,
+    ) -> None:
+        """Requeue for another attempt or publish a final error.
+
+        Intermediate retries stay silent — publishing on every attempt
+        would spam the room with failure messages.  Only on the last
+        attempt do we emit ``error_text`` as the response so the user
+        gets closure.
+        """
+        headers = getattr(message, "headers", None) or {}
+        retry_count = int(headers.get("x-retry-count", 0))
+        max_retries = config.rabbitmq_max_retries
+
+        if retry_count < max_retries - 1:
+            logger.warning(
+                "Message failed (attempt %d/%d), requeuing",
+                retry_count + 1, max_retries,
+            )
+            new_headers = dict(headers)
+            new_headers["x-retry-count"] = retry_count + 1
+            try:
+                await transport.republish_with_headers(
+                    config.rabbitmq_input_queue,
+                    json.dumps(body).encode("utf-8"),
+                    new_headers,
+                )
+            except Exception as pub_exc:
+                logger.error("Failed to republish retry message: %s", pub_exc)
+                # Republish failed — the message will be lost after reject.
+                # Publish the error response now so the user isn't left hanging.
+                if event is not None and error_text:
+                    try:
+                        from core.events.response import Response
+                        error_response = Response(result=error_text)
+                        envelope = router.build_response_envelope(
+                            error_response, event,
+                        )
+                        await _publish_result(envelope)
+                    except Exception:
+                        logger.error("Failed to publish fallback error response")
+            await message.reject(requeue=False)  # type: ignore[union-attr]
+        else:
+            logger.error(
+                "Message failed after %d attempts, discarding",
+                max_retries,
+            )
+            if event is not None and error_text:
+                try:
+                    from core.events.response import Response
+                    error_response = Response(result=error_text)
+                    envelope = router.build_response_envelope(
+                        error_response, event,
+                    )
+                    await _publish_result(envelope)
+                except Exception as pub_exc:
+                    logger.error(
+                        "Failed to publish terminal error response: %s",
+                        pub_exc,
+                    )
+            await message.reject(requeue=False)  # type: ignore[union-attr]
+
+    return on_message
+
+
 async def _run(config: BaseConfig) -> None:
     """Main async entrypoint."""
     from core.adapters.rabbitmq import RabbitMQAdapter
@@ -348,228 +587,13 @@ async def _run(config: BaseConfig) -> None:
     # Track in-flight pipeline tasks for graceful shutdown
     active_tasks: set[asyncio.Task] = set()
 
-    def _is_ingest_event(event: object) -> bool:
-        """Return True for ingest event types that should use early ACK."""
-        from core.events.ingest_space import IngestBodyOfKnowledge
-        from core.events.ingest_website import IngestWebsite
-        return isinstance(event, (IngestWebsite, IngestBodyOfKnowledge))
-
-    async def _publish_result(envelope: dict) -> None:
-        """Publish a result envelope to the result queue."""
-        await transport.publish(
-            config.rabbitmq_exchange,
-            config.rabbitmq_result_routing_key,
-            json.dumps(envelope).encode("utf-8"),
-        )
-
-    async def _run_pipeline(event: object) -> None:
-        """Run plugin.handle() with timeout and publish result."""
-        from core.tracing import (
-            FailureMode,
-            LLMInvocationTimeoutError,
-            classify_failure,
-            handle_span,
-            record_failure,
-            tracing_is_configured,
-        )
-
-        context = handle_span(config, event, plugin.name) if tracing_is_configured() else nullcontext(None)
-        with context as root:
-            try:
-                response = await asyncio.wait_for(
-                    plugin.handle(event),
-                    timeout=config.pipeline_timeout,
-                )
-                envelope = router.build_response_envelope(response, event)
-                await _publish_result(envelope)
-                if root is not None:
-                    from opentelemetry import trace
-
-                    root.set_status(trace.Status(trace.StatusCode.OK))
-            except LLMInvocationTimeoutError as exc:
-                logger.error(
-                    "LLM provider timed out for event type %s", type(event).__name__
-                )
-                if root is not None:
-                    record_failure(root, exc, FailureMode.llm_error, config=config)
-                from core.events.response import Response
-                error_response = Response(result=f"Error: {exc}")
-                envelope = router.build_response_envelope(error_response, event)
-                await _publish_result(envelope)
-            except asyncio.TimeoutError as exc:
-                logger.error(
-                    "Pipeline timed out after %ds for event type %s",
-                    config.pipeline_timeout,
-                    type(event).__name__,
-                )
-                if root is not None:
-                    record_failure(root, exc, FailureMode.timeout, config=config)
-                from core.events.response import Response
-                error_response = Response(result=f"Error: pipeline timed out after {config.pipeline_timeout}s")
-                envelope = router.build_response_envelope(error_response, event)
-                await _publish_result(envelope)
-            except Exception as exc:
-                logger.exception("Pipeline failed for event type %s: %s", type(event).__name__, exc)
-                if root is not None:
-                    record_failure(root, exc, classify_failure(exc), config=config)
-                from core.events.response import Response
-                error_response = Response(result=f"Error: {exc}")
-                envelope = router.build_response_envelope(error_response, event)
-                await _publish_result(envelope)
-
-    def _task_done(task: asyncio.Task) -> None:
-        """Remove completed task from the active set."""
-        active_tasks.discard(task)
-
-    # Message handler — receives both body and raw message for ACK control
-    async def on_message(
-        body: dict,
-        message: object,
-    ) -> None:
-        event = None
-        try:
-            event = router.parse_event(body)
-
-            if _is_ingest_event(event):
-                # Early ACK: acknowledge before processing starts
-                await message.ack()  # type: ignore[union-attr]
-                logger.info(
-                    "Early-ACKed ingest message, scheduling async pipeline for %s",
-                    type(event).__name__,
-                )
-                task = asyncio.create_task(_run_pipeline(event))
-                active_tasks.add(task)
-                task.add_done_callback(_task_done)
-            else:
-                # Engine query: late ACK — process synchronously, then ACK
-                from core.tracing import (
-                    FailureMode,
-                    classify_failure,
-                    handle_span,
-                    record_failure,
-                    tracing_is_configured,
-                )
-
-                context = handle_span(config, event, plugin.name) if tracing_is_configured() else nullcontext(None)
-                with context as root:
-                    try:
-                        response = await asyncio.wait_for(
-                            plugin.handle(event),
-                            timeout=config.pipeline_timeout,
-                        )
-                        envelope = router.build_response_envelope(response, event)
-                        await _publish_result(envelope)
-                        await message.ack()  # type: ignore[union-attr]
-                        if root is not None:
-                            from opentelemetry import trace
-
-                            root.set_status(trace.Status(trace.StatusCode.OK))
-                    except LLMInvocationTimeoutError as exc:
-                        logger.error(
-                            "LLM provider timed out for %s", type(event).__name__
-                        )
-                        if root is not None:
-                            record_failure(root, exc, FailureMode.llm_error, config=config)
-                        await _retry_or_reject(
-                            message, body,
-                            event=event,
-                            error_text=f"Error: {exc}",
-                        )
-                    except asyncio.TimeoutError as exc:
-                        logger.error(
-                            "Handler timed out after %ds for %s",
-                            config.pipeline_timeout,
-                            type(event).__name__,
-                        )
-                        if root is not None:
-                            record_failure(root, exc, FailureMode.timeout, config=config)
-                        await _retry_or_reject(
-                            message, body,
-                            event=event,
-                            error_text=(
-                                f"Error: handler timed out after "
-                                f"{config.pipeline_timeout}s"
-                            ),
-                        )
-                    except Exception as exc:
-                        logger.exception("Error handling engine query: %s", exc)
-                        if root is not None:
-                            record_failure(root, exc, classify_failure(exc), config=config)
-                        await _retry_or_reject(
-                            message, body,
-                            event=event,
-                            error_text=f"Error: {exc}",
-                        )
-        except Exception as exc:
-            # parse_event failed — reject the message
-            logger.exception("Failed to parse message: %s", exc)
-            await _retry_or_reject(message, body)
-
-    async def _retry_or_reject(
-        message: object,
-        body: dict,
-        *,
-        event: object | None = None,
-        error_text: str | None = None,
-    ) -> None:
-        """Requeue for another attempt or publish a final error.
-
-        Intermediate retries stay silent — publishing on every attempt
-        would spam the room with failure messages.  Only on the last
-        attempt do we emit ``error_text`` as the response so the user
-        gets closure.
-        """
-        headers = getattr(message, "headers", None) or {}
-        retry_count = int(headers.get("x-retry-count", 0))
-        max_retries = config.rabbitmq_max_retries
-
-        if retry_count < max_retries - 1:
-            logger.warning(
-                "Message failed (attempt %d/%d), requeuing",
-                retry_count + 1, max_retries,
-            )
-            new_headers = dict(headers)
-            new_headers["x-retry-count"] = retry_count + 1
-            try:
-                await transport.republish_with_headers(
-                    config.rabbitmq_input_queue,
-                    json.dumps(body).encode("utf-8"),
-                    new_headers,
-                )
-            except Exception as pub_exc:
-                logger.error("Failed to republish retry message: %s", pub_exc)
-                # Republish failed — the message will be lost after reject.
-                # Publish the error response now so the user isn't left hanging.
-                if event is not None and error_text:
-                    try:
-                        from core.events.response import Response
-                        error_response = Response(result=error_text)
-                        envelope = router.build_response_envelope(
-                            error_response, event,
-                        )
-                        await _publish_result(envelope)
-                    except Exception:
-                        logger.error("Failed to publish fallback error response")
-            await message.reject(requeue=False)  # type: ignore[union-attr]
-        else:
-            logger.error(
-                "Message failed after %d attempts, discarding",
-                max_retries,
-            )
-            if event is not None and error_text:
-                try:
-                    from core.events.response import Response
-                    error_response = Response(result=error_text)
-                    envelope = router.build_response_envelope(
-                        error_response, event,
-                    )
-                    await _publish_result(envelope)
-                except Exception as pub_exc:
-                    logger.error(
-                        "Failed to publish terminal error response: %s",
-                        pub_exc,
-                    )
-            await message.reject(requeue=False)  # type: ignore[union-attr]
+    on_message = build_message_handler(
+        config=config,
+        plugin=plugin,
+        router=router,
+        transport=transport,
+        active_tasks=active_tasks,
+    )
 
     # Start consuming with message handle exposed for ACK control
     await transport.consume_with_message(config.rabbitmq_input_queue, on_message)
