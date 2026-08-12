@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import json
 from typing import Any, Protocol
 
 import chromadb
@@ -185,11 +186,20 @@ class ChromaDBAdapter:
         for attempt in range(max_retries):
             try:
                 return await asyncio.to_thread(fn)
-            except ValueError:
+            except ValueError as exc:
                 # Client-side validation errors (e.g. a malformed `where`
                 # filter) are deterministic — retrying burns backoff sleeps
-                # for the same rejection. Surface them immediately.
-                raise
+                # for the same rejection. Surface them immediately. But
+                # JSONDecodeError (a ValueError subclass) means a transient
+                # non-JSON upstream response (proxy 502 during a rolling
+                # restart) — that one stays retryable.
+                if not isinstance(exc, json.JSONDecodeError):
+                    raise
+                last_exc = exc
+                if attempt < max_retries - 1:
+                    delay = BASE_DELAY * (2 ** attempt)
+                    logger.warning("ChromaDB attempt %d failed, retrying: %s", attempt + 1, exc)
+                    await asyncio.sleep(delay)
             except Exception as exc:
                 last_exc = exc
                 if attempt < max_retries - 1:

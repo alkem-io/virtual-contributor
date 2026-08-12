@@ -67,3 +67,28 @@ async def test_filtered_query_uses_the_existing_retry_path(adapter: ChromaDBAdap
 
     retry.assert_awaited_once()
     assert collection.query.call_args.kwargs["where"] is where
+
+
+async def test_retry_fast_fails_validation_errors_but_retries_decode_errors() -> None:
+    """CQ-5 contract: deterministic ValueError → one attempt; transient
+    JSONDecodeError (a ValueError subclass — proxy 502 bodies) → full retries."""
+    import json as _json
+
+    attempts = {"validation": 0, "decode": 0}
+
+    def raise_validation():
+        attempts["validation"] += 1
+        raise ValueError("Expected where to have exactly one operator")
+
+    def raise_decode():
+        attempts["decode"] += 1
+        _json.loads("<html>502 Bad Gateway</html>")
+
+    with patch("core.adapters.chromadb.asyncio.sleep", new_callable=AsyncMock):
+        with pytest.raises(ValueError, match="exactly one operator"):
+            await ChromaDBAdapter._retry(raise_validation)
+        with pytest.raises(_json.JSONDecodeError):
+            await ChromaDBAdapter._retry(raise_decode)
+
+    assert attempts["validation"] == 1  # fast-fail, no backoff burn
+    assert attempts["decode"] == 3  # transient — full retry ladder

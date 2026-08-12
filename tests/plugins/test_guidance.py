@@ -191,7 +191,7 @@ class TestGuidancePlugin:
             ]
         )
 
-    async def test_only_summaries_produce_no_relevant_context_for_guidance(self):
+    async def test_only_summaries_produce_no_relevant_context_for_guidance(self, caplog):
         store = MockKnowledgeStorePort()
         for collection in [
             "alkem.io-knowledge",
@@ -209,15 +209,20 @@ class TestGuidancePlugin:
             )
         plugin = GuidancePlugin(llm=MockLLMPort(), knowledge_store=store)
 
-        result = await plugin.handle(make_input())
+        import logging
+
+        with caplog.at_level(logging.WARNING):
+            result = await plugin.handle(make_input())
 
         assert result.result == "Mock LLM response"
         assert "No relevant context found." in plugin._llm.calls[-1][0]["content"]
         # Positive discriminators (CQ-1): the queries genuinely ran with the
-        # factual filter and succeeded — this test must fail if the store
-        # rejects the filter and guidance swallows the exception.
+        # factual filter AND none was swallowed as a failure — asserting on
+        # the failure log is what actually differs between "correctly
+        # filtered everything out" and "every query threw and was swallowed".
         assert len(store.query_calls) == 3
         assert all(call[3] == FACTUAL_WHERE for call in store.query_calls)
+        assert "Failed to query collection" not in caplog.text
         # ...and the summary/overview content never reached the prompt:
         prompt = plugin._llm.calls[-1][0]["content"]
         assert "document summary" not in prompt
