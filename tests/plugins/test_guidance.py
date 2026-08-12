@@ -213,3 +213,11 @@ class TestGuidancePlugin:
 
         assert result.result == "Mock LLM response"
         assert "No relevant context found." in plugin._llm.calls[-1][0]["content"]
+        # Positive discriminators (CQ-1): the queries genuinely ran with the
+        # factual filter and succeeded — this test must fail if the store
+        # rejects the filter and guidance swallows the exception.
+        assert len(store.query_calls) == 3
+        assert all(call[3] == FACTUAL_WHERE for call in store.query_calls)
+        # ...and the summary/overview content never reached the prompt:
+        prompt = plugin._llm.calls[-1][0]["content"]
+        assert "document summary" not in prompt

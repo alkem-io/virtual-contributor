@@ -187,7 +187,9 @@ class TestExpertPlugin:
             ]
         )
 
-    async def test_only_summaries_produce_no_relevant_context_for_expert(self):
+    async def test_only_summaries_yield_empty_context_without_error_for_expert(self):
+        """FR-010: a fully-filtered retrieval degrades gracefully — no exception,
+        the summaries never reach the prompt, and the query provably ran filtered."""
         store = MockKnowledgeStorePort()
         await store.ingest(
             "bok-123-knowledge",
@@ -203,7 +205,12 @@ class TestExpertPlugin:
         result = await plugin.handle(make_input(bodyOfKnowledgeID="bok-123"))
 
         assert result.result == "Mock LLM response"
-        assert "No relevant context found." in plugin._llm.calls[-1][0]["content"]
+        # The retrieval genuinely executed with the factual filter:
+        assert store.query_calls and store.query_calls[-1][3] == FACTUAL_WHERE
+        # ...and none of the summary content leaked into the LLM prompt:
+        prompt = plugin._llm.calls[-1][0]["content"]
+        assert "document summary" not in prompt
+        assert "overview" not in prompt
 
     async def test_startup_shutdown(self, plugin):
         await plugin.startup()

@@ -159,7 +159,7 @@ class ExpertPlugin:
             )
             docs, filtered_result = _filter_and_format(result, score_threshold)
             docs, filtered_result = enforce_budget(docs, filtered_result)
-            knowledge = "\n".join(docs) or "No relevant context found."
+            knowledge = "\n".join(docs)
             # The expert state schema expects ``combined_knowledge_docs``
             # — that's what the answer_question node reads via its
             # ``{combined_knowledge_docs}`` prompt variable.  ``sources``
@@ -219,7 +219,7 @@ class ExpertPlugin:
         )
         docs, result = _filter_and_format(result, self._score_threshold)
         docs, result = self._enforce_context_budget(docs, result)
-        knowledge = "\n".join(docs) or "No relevant context found."
+        knowledge = "\n".join(docs)
 
         from plugins.expert.prompts import combined_expert_prompt
         prompt = combined_expert_prompt.format(

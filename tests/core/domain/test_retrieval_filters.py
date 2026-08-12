@@ -31,19 +31,9 @@ ENTRIES = [
 ]
 
 
-def _matches(metadata: dict, where: dict) -> bool:
-    """Evaluate the canonical Chroma filter subset with missing-key semantics."""
-    if "$and" in where:
-        return all(_matches(metadata, clause) for clause in where["$and"])
-    if "$or" in where:
-        return any(_matches(metadata, clause) for clause in where["$or"])
-    key, condition = next(iter(where.items()))
-    operator, expected = next(iter(condition.items()))
-    if operator == "$eq":
-        return key in metadata and metadata[key] == expected
-    if operator == "$ne":
-        return key not in metadata or metadata[key] != expected
-    raise AssertionError(f"unexpected operator: {operator}")
+# The single shared evaluator: the truth table pins the SAME implementation
+# every plugin test depends on, so mock-vs-table drift is impossible (R-4).
+_matches = MockKnowledgeStorePort._matches_where
 
 
 @pytest.mark.parametrize("entry_id,metadata,factual,summaries", ENTRIES)

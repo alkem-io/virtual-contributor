@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from core.adapters.chromadb import ChromaDBAdapter
+from core.domain.retrieval_filters import FACTUAL_WHERE
 from core.ports.knowledge_store import QueryResult
 
 
@@ -35,7 +36,9 @@ def _configured_collection(adapter: ChromaDBAdapter) -> MagicMock:
 
 async def test_query_forwards_where_verbatim(adapter: ChromaDBAdapter) -> None:
     collection = _configured_collection(adapter)
-    where = {"$and": [{"embeddingType": {"$ne": "summary"}}]}
+    # Use the real production filter so the pinned example is a shape Chroma
+    # actually accepts ($and requires >= 2 operands on a live server).
+    where = FACTUAL_WHERE
 
     result = await adapter.query("knowledge", ["question"], 3, where=where)
 

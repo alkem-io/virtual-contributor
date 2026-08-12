@@ -185,6 +185,11 @@ class ChromaDBAdapter:
         for attempt in range(max_retries):
             try:
                 return await asyncio.to_thread(fn)
+            except ValueError:
+                # Client-side validation errors (e.g. a malformed `where`
+                # filter) are deterministic — retrying burns backoff sleeps
+                # for the same rejection. Surface them immediately.
+                raise
             except Exception as exc:
                 last_exc = exc
                 if attempt < max_retries - 1:

@@ -83,9 +83,17 @@ class MockKnowledgeStorePort:
                 distances=[[0.1 + 0.1 * i for i in range(len(matched))]],
                 ids=[[item["id"] for item in matched]],
             )
+        # Canned fallback for unseeded collections. The canned docs carry
+        # G1-legacy-shaped metadata (no embeddingType/type keys), and the
+        # filter IS evaluated against them — a query whose filter excludes
+        # them returns Chroma's real empty-inner-list shape instead of
+        # silently skipping filter evaluation.
+        canned_metadata = {"source": "test"}
+        if where is not None and not self._matches_where(canned_metadata, where):
+            return QueryResult(documents=[[]], metadatas=[[]], distances=[[]], ids=[[]])
         return QueryResult(
             documents=[["doc1", "doc2"]],
-            metadatas=[[{"source": "test"}, {"source": "test"}]],
+            metadatas=[[canned_metadata, dict(canned_metadata)]],
             distances=[[0.1, 0.2]],
             ids=[["id1", "id2"]],
         )

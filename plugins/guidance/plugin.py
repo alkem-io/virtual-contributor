@@ -98,7 +98,9 @@ class GuidancePlugin:
                             score=score,
                         ))
             except Exception:
-                logger.warning("Failed to query collection %s", collection)
+                logger.warning(
+                    "Failed to query collection %s", collection, exc_info=True
+                )
             return docs, sources
 
         query_results = await asyncio.gather(
