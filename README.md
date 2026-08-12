@@ -591,6 +591,36 @@ Detailed design rationale is documented in `docs/adr/`:
 | [0009](docs/adr/0009-configurable-summarization-llm.md) | Configurable summarization LLM with per-plugin retrieval parameters |
 | [0010](docs/adr/0010-pipeline-step-safety.md) | Pipeline destructive step safety via duck-typed gating |
 | [0011](docs/adr/0011-pipeline-reliability.md) | Pipeline reliability — thread pool sizing, partial failure resilience |
+| [0012](docs/adr/0012-opentelemetry-pipeline-tracing.md) | Module-local OpenTelemetry pipeline tracing |
+
+## Tracing & Observability
+
+Pipeline tracing ships dark. It emits OTLP/HTTP traces only when an explicit
+internal endpoint is configured; ambient `OTEL_*` exporter and sampler settings
+are never used.
+
+| Variable | Default | Purpose |
+|---|---:|---|
+| `TRACING_ENABLED` | `false` | Enable tracing only with an endpoint |
+| `TRACING_OTLP_ENDPOINT` | unset | Full internal OTLP/HTTP trace URL |
+| `TRACING_OTLP_HEADERS` | unset | Comma-separated `key=value` authentication headers |
+| `TRACING_SERVICE_NAME` | plugin-derived | Service resource name |
+| `TRACING_SAMPLE_RATIO` | `1.0` | Trace sampling ratio, from 0 through 1 |
+| `TRACING_CAPTURE_CONTENT` | `true` | Include bounded prompts, answers, and messages |
+| `TRACING_CONTENT_MAX_CHARS` | `1000` | Maximum characters per content attribute |
+
+For local self-hosted Langfuse, point the service at its OTLP endpoint:
+
+```bash
+export TRACING_ENABLED=true
+export TRACING_OTLP_ENDPOINT="http://localhost:3000/api/public/otel/v1/traces"
+export TRACING_OTLP_HEADERS="Authorization=Basic ${AUTH}"
+PLUGIN_TYPE=guidance poetry run python main.py
+```
+
+The same explicit endpoint/header configuration works with self-hosted Grafana
+Tempo or Elastic APM OTLP receivers. Never set an endpoint you do not control:
+trace content can include user messages and retrieved context.
 
 ## Feature Specifications
 
