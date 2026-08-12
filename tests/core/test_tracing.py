@@ -198,3 +198,27 @@ def test_backend_absent_never_blocks_or_raises() -> None:
     finally:
         # Flush toward the dead endpoint must fail quietly, never raise.
         shutdown_tracing(timeout_ms=500)
+
+
+async def test_cancelled_optional_span_stays_unset(traced_exporter) -> None:
+    """corr-vc-drift-1: a routine shutdown task.cancel() is not a failure —
+    cancelled spans must export status UNSET, not phantom ERROR/unknown."""
+    from core.tracing import optional_span
+
+    async def body() -> None:
+        with optional_span("vc.ingest.step Embed"):
+            await asyncio.sleep(30)
+
+    task = asyncio.ensure_future(body())
+    await asyncio.sleep(0.05)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    shutdown_tracing()
+    span = next(
+        s for s in traced_exporter.get_finished_spans() if s.name == "vc.ingest.step Embed"
+    )
+    assert span.status.status_code.name == "UNSET"
+    assert "vc.failure_mode" not in span.attributes

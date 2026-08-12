@@ -299,7 +299,10 @@ def optional_span(
     ) as span:
         try:
             yield span
-        except BaseException as exc:
+        except Exception as exc:
+            # Exception, not BaseException: a CancelledError from a routine
+            # shutdown task.cancel() is not a failure (FR-007) — recording it
+            # would flood the SC-006 error rate with phantom `unknown`s.
             record_failure(span, exc, classify_failure(exc))
             raise
 

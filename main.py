@@ -668,6 +668,15 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        # Crash-path flush: shutdown_on_exit=False removed the SDK atexit
+        # hook (it unbounded process exit against a dead collector), so an
+        # exception escaping _run would otherwise drop the last ~1s of
+        # buffered spans — the very spans describing the crash. Same 5s
+        # daemon-thread bound as the graceful path.
+        try:
+            loop.run_until_complete(_shutdown_tracing_bounded())
+        except Exception:
+            logger.warning("Crash-path tracing flush failed", exc_info=True)
         loop.close()
 
 
