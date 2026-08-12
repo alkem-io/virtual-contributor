@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import signal
+from contextlib import nullcontext
 
 from core.config import BaseConfig
 from core.container import Container
@@ -26,7 +27,7 @@ def _mask_sensitive(name: str, value) -> str:
     if value is None:
         return "None"
     s = str(value)
-    if "api_key" in name:
+    if "api_key" in name or "headers" in name:
         return s[:3] + "****" if len(s) > 3 else "****"
     return s
 
@@ -51,6 +52,13 @@ def _log_config(config: BaseConfig) -> None:
         "max_context_chars",
         "summary_chunk_threshold",
         "pipeline_timeout",
+        "tracing_enabled",
+        "tracing_otlp_endpoint",
+        "tracing_otlp_headers",
+        "tracing_service_name",
+        "tracing_sample_ratio",
+        "tracing_capture_content",
+        "tracing_content_max_chars",
     ]
     for name in fields:
         value = getattr(config, name, None)
@@ -131,16 +139,21 @@ def _create_adapters(config: BaseConfig, container: Container) -> None:
         from core.adapters.chromadb import ChromaDBAdapter
 
         embeddings_adapter = container._bindings.get(EmbeddingsPort)
-        container.register(
-            KnowledgeStorePort,
-            ChromaDBAdapter(
-                host=config.vector_db_host,
-                port=config.vector_db_port,
-                credentials=config.vector_db_credentials,
-                embeddings=embeddings_adapter,
-                distance_fn=config.vector_db_distance_fn,
-            ),
+        knowledge_store: KnowledgeStorePort = ChromaDBAdapter(
+            host=config.vector_db_host,
+            port=config.vector_db_port,
+            credentials=config.vector_db_credentials,
+            embeddings=embeddings_adapter,
+            distance_fn=config.vector_db_distance_fn,
         )
+        if config.tracing_enabled:
+            from core.tracing import tracing_is_configured
+
+            if tracing_is_configured():
+                from core.tracing_knowledge_store import TracedKnowledgeStore
+
+                knowledge_store = TracedKnowledgeStore(knowledge_store)
+        container.register(KnowledgeStorePort, knowledge_store)
 
     # OpenAI Assistants (always available — per-request API keys)
     from core.adapters.openai_assistant import OpenAIAssistantAdapter
@@ -319,29 +332,47 @@ async def _run(config: BaseConfig) -> None:
 
     async def _run_pipeline(event: object) -> None:
         """Run plugin.handle() with timeout and publish result."""
-        try:
-            response = await asyncio.wait_for(
-                plugin.handle(event),
-                timeout=config.pipeline_timeout,
-            )
-            envelope = router.build_response_envelope(response, event)
-            await _publish_result(envelope)
-        except asyncio.TimeoutError:
-            logger.error(
-                "Pipeline timed out after %ds for event type %s",
-                config.pipeline_timeout,
-                type(event).__name__,
-            )
-            from core.events.response import Response
-            error_response = Response(result=f"Error: pipeline timed out after {config.pipeline_timeout}s")
-            envelope = router.build_response_envelope(error_response, event)
-            await _publish_result(envelope)
-        except Exception as exc:
-            logger.exception("Pipeline failed for event type %s: %s", type(event).__name__, exc)
-            from core.events.response import Response
-            error_response = Response(result=f"Error: {exc}")
-            envelope = router.build_response_envelope(error_response, event)
-            await _publish_result(envelope)
+        from core.tracing import (
+            FailureMode,
+            classify_failure,
+            handle_span,
+            record_failure,
+            tracing_is_configured,
+        )
+
+        context = handle_span(config, event, plugin.name) if tracing_is_configured() else nullcontext(None)
+        with context as root:
+            try:
+                response = await asyncio.wait_for(
+                    plugin.handle(event),
+                    timeout=config.pipeline_timeout,
+                )
+                envelope = router.build_response_envelope(response, event)
+                await _publish_result(envelope)
+                if root is not None:
+                    from opentelemetry import trace
+
+                    root.set_status(trace.Status(trace.StatusCode.OK))
+            except asyncio.TimeoutError as exc:
+                logger.error(
+                    "Pipeline timed out after %ds for event type %s",
+                    config.pipeline_timeout,
+                    type(event).__name__,
+                )
+                if root is not None:
+                    record_failure(root, exc, FailureMode.timeout)
+                from core.events.response import Response
+                error_response = Response(result=f"Error: pipeline timed out after {config.pipeline_timeout}s")
+                envelope = router.build_response_envelope(error_response, event)
+                await _publish_result(envelope)
+            except Exception as exc:
+                logger.exception("Pipeline failed for event type %s: %s", type(event).__name__, exc)
+                if root is not None:
+                    record_failure(root, exc, classify_failure(exc))
+                from core.events.response import Response
+                error_response = Response(result=f"Error: {exc}")
+                envelope = router.build_response_envelope(error_response, event)
+                await _publish_result(envelope)
 
     def _task_done(task: asyncio.Task) -> None:
         """Remove completed task from the active set."""
@@ -368,35 +399,53 @@ async def _run(config: BaseConfig) -> None:
                 task.add_done_callback(_task_done)
             else:
                 # Engine query: late ACK — process synchronously, then ACK
-                try:
-                    response = await asyncio.wait_for(
-                        plugin.handle(event),
-                        timeout=config.pipeline_timeout,
-                    )
-                    envelope = router.build_response_envelope(response, event)
-                    await _publish_result(envelope)
-                    await message.ack()  # type: ignore[union-attr]
-                except asyncio.TimeoutError:
-                    logger.error(
-                        "Handler timed out after %ds for %s",
-                        config.pipeline_timeout,
-                        type(event).__name__,
-                    )
-                    await _retry_or_reject(
-                        message, body,
-                        event=event,
-                        error_text=(
-                            f"Error: handler timed out after "
-                            f"{config.pipeline_timeout}s"
-                        ),
-                    )
-                except Exception as exc:
-                    logger.exception("Error handling engine query: %s", exc)
-                    await _retry_or_reject(
-                        message, body,
-                        event=event,
-                        error_text=f"Error: {exc}",
-                    )
+                from core.tracing import (
+                    FailureMode,
+                    classify_failure,
+                    handle_span,
+                    record_failure,
+                    tracing_is_configured,
+                )
+
+                context = handle_span(config, event, plugin.name) if tracing_is_configured() else nullcontext(None)
+                with context as root:
+                    try:
+                        response = await asyncio.wait_for(
+                            plugin.handle(event),
+                            timeout=config.pipeline_timeout,
+                        )
+                        envelope = router.build_response_envelope(response, event)
+                        await _publish_result(envelope)
+                        await message.ack()  # type: ignore[union-attr]
+                        if root is not None:
+                            from opentelemetry import trace
+
+                            root.set_status(trace.Status(trace.StatusCode.OK))
+                    except asyncio.TimeoutError as exc:
+                        logger.error(
+                            "Handler timed out after %ds for %s",
+                            config.pipeline_timeout,
+                            type(event).__name__,
+                        )
+                        if root is not None:
+                            record_failure(root, exc, FailureMode.timeout)
+                        await _retry_or_reject(
+                            message, body,
+                            event=event,
+                            error_text=(
+                                f"Error: handler timed out after "
+                                f"{config.pipeline_timeout}s"
+                            ),
+                        )
+                    except Exception as exc:
+                        logger.exception("Error handling engine query: %s", exc)
+                        if root is not None:
+                            record_failure(root, exc, classify_failure(exc))
+                        await _retry_or_reject(
+                            message, body,
+                            event=event,
+                            error_text=f"Error: {exc}",
+                        )
         except Exception as exc:
             # parse_event failed — reject the message
             logger.exception("Failed to parse message: %s", exc)
@@ -514,6 +563,9 @@ async def _run(config: BaseConfig) -> None:
 
     await health.stop()
     await plugin.shutdown()
+    from core.tracing import shutdown_tracing
+
+    shutdown_tracing()
     await transport.close()
     logger.info("Shutdown complete")
 
@@ -523,6 +575,9 @@ def main() -> None:
 
     config = BaseConfig()
     setup_logging(level=config.log_level, plugin_type=config.plugin_type)
+    from core.tracing import configure_tracing
+
+    configure_tracing(config)
     logger.info("Starting virtual-contributor engine with plugin: %s", config.plugin_type)
     _log_config(config)
 

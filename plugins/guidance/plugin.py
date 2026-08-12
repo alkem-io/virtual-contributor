@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import re
+from contextlib import nullcontext
 
 from core.events.input import Input
 from core.events.response import Response, Source
@@ -63,12 +64,22 @@ class GuidancePlugin:
             history_text = "\n".join(
                 f"{h.role}: {h.content}" for h in event.history
             )
-            condensed = await self._llm.invoke([{
-                "role": "human",
-                "content": condense_prompt.format(
-                    chat_history=history_text, question=question
-                ),
-            }])
+            from core.tracing import get_tracer, tracing_is_configured
+
+            context = (
+                get_tracer().start_as_current_span("vc.stage query_processing")
+                if tracing_is_configured()
+                else nullcontext(None)
+            )
+            with context as span:
+                if span is not None:
+                    span.set_attribute("vc.history_turns", len(event.history))
+                condensed = await self._llm.invoke([{
+                    "role": "human",
+                    "content": condense_prompt.format(
+                        chat_history=history_text, question=question
+                    ),
+                }])
             question = condensed
 
         # Query multiple collections in parallel
@@ -76,24 +87,45 @@ class GuidancePlugin:
 
         async def _query_collection(collection: str):
             docs, sources = [], []
+            from opentelemetry import trace
+            from opentelemetry.trace import SpanKind
+            from core.tracing import get_tracer, tracing_is_configured
+
+            context = (
+                get_tracer().start_as_current_span("vc.retrieval", kind=SpanKind.CLIENT)
+                if tracing_is_configured()
+                else nullcontext(None)
+            )
             try:
-                result = await self._knowledge_store.query(
-                    collection=collection, query_texts=[question], n_results=n_results,
-                )
-                if result.documents:
-                    for i, doc in enumerate(result.documents[0]):
-                        distance = result.distances[0][i] if result.distances else 1.0
-                        score = 1.0 - distance
-                        docs.append(doc)
-                        meta = result.metadatas[0][i] if result.metadatas else {}
-                        source_url = meta.get("source", collection)
-                        sources.append(Source(
-                            source=source_url,
-                            title=meta.get("title"),
-                            uri=source_url,
-                            score=score,
-                        ))
-            except Exception:
+                with context as span:
+                    result = await self._knowledge_store.query(
+                        collection=collection, query_texts=[question], n_results=n_results,
+                    )
+                    if result.documents:
+                        for i, doc in enumerate(result.documents[0]):
+                            distance = result.distances[0][i] if result.distances else 1.0
+                            score = 1.0 - distance
+                            docs.append(doc)
+                            meta = result.metadatas[0][i] if result.metadatas else {}
+                            source_url = meta.get("source", collection)
+                            sources.append(Source(
+                                source=source_url,
+                                title=meta.get("title"),
+                                uri=source_url,
+                                score=score,
+                            ))
+                    if span is not None:
+                        passed = sum(1 for source in sources if (source.score or 0) >= self._score_threshold)
+                        span.set_attribute("vc.retrieval.chunks_passed", passed)
+                        span.set_attribute("vc.retrieval.chunks_dropped_budget", 0)
+                        if not docs or passed == 0:
+                            from core.tracing import mark_empty_retrieval
+
+                            mark_empty_retrieval()
+            except Exception as exc:
+                if 'span' in locals() and span is not None:
+                    span.record_exception(exc)
+                    span.set_status(trace.Status(trace.StatusCode.ERROR, str(exc)))
                 logger.warning("Failed to query collection %s", collection)
             return docs, sources
 
@@ -125,6 +157,7 @@ class GuidancePlugin:
         deduped = deduped[:self._n_results]
 
         # Context budget enforcement — drop lowest-scoring chunks if over budget
+        dropped = 0
         total_chars = sum(len(doc) for doc, _ in deduped)
         if total_chars > self._max_context_chars:
             kept: list[tuple[str, Source]] = []
@@ -172,6 +205,9 @@ class GuidancePlugin:
             )
 
         logger.warning("Structured JSON parsing failed, returning raw LLM text")
+        from core.tracing import current_root_span
+
+        current_root_span().add_event("vc.parse_fallback")
         return Response(
             result=answer,
             sources=all_sources,
