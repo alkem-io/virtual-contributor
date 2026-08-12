@@ -15,16 +15,24 @@ from typing import Mapping, Sequence
 # for both retrieval-backed paths.
 EMPTY_CONTEXT_SENTINEL = "No relevant context found."
 
+_LABEL_UNSAFE_CHARACTERS = str.maketrans("", "", "[]·")
+_METADATA_VALUE_LIMITS = {
+    "title": 200,
+    "type": 200,
+    "uri": 300,
+    "source": 300,
+}
+
 GROUNDING_INSTRUCTIONS = """Grounding requirements:
 - Answer only from the supplied context.
 - Do not use outside knowledge or fill gaps with plausible information.
 - State plainly which part of the question the supplied context does not cover.
 - Never present an unsupported statement as fact."""
 
-EMPTY_CONTEXT_DECLINE_INSTRUCTIONS = f"""When the context is exactly
-{EMPTY_CONTEXT_SENTINEL}
-state plainly that you do not have information on the topic. Do not answer
-from general knowledge and do not cite a document."""
+EMPTY_CONTEXT_DECLINE_INSTRUCTIONS = (
+    "State plainly that you do not have information on the topic. Do not answer "
+    "from general knowledge and do not cite a document."
+)
 
 CITATION_INSTRUCTIONS = """For every substantive claim, cite the supporting
 document inline using its [Document N] label. Cite only document numbers that
@@ -37,15 +45,19 @@ or chain-of-thought in the reply."""
 
 
 def _metadata_text(metadata: Mapping[str, object], key: str) -> str:
-    """Return a present metadata value without inventing a replacement."""
+    """Return a bounded, single-line metadata value without inventing one."""
 
     value = metadata.get(key)
     if value is None:
         return ""
     if isinstance(value, Enum):
         value = value.value
-    text = str(value).strip()
-    return "" if text.casefold() == "none" else text
+    text = " ".join(str(value).split())
+    text = " ".join(text.translate(_LABEL_UNSAFE_CHARACTERS).split())
+    if text.casefold() == "none":
+        return ""
+    limit = _METADATA_VALUE_LIMITS.get(key)
+    return text[:limit] if limit is not None else text
 
 
 def render_document_block(
@@ -74,6 +86,24 @@ def render_document_block(
     if origin:
         label_parts.append(f"origin: {origin}")
     return f"[{' · '.join(label_parts)}]\n{content}"
+
+
+def rendered_document_budget_size(rendered_block: str, content: str) -> int:
+    """Return raw content chars plus the rendered label's UTF-8 byte size.
+
+    ``MAX_CONTEXT_CHARS`` historically budgets passage content by character.
+    Label data is untrusted metadata, so its rendered UTF-8 bytes are charged
+    as well without altering the passage-content portion of that contract.
+    """
+
+    label_and_separator = rendered_block.removesuffix(content)
+    return len(content) + len(label_and_separator.encode("utf-8"))
+
+
+def empty_context_instruction(has_context: bool) -> str:
+    """Return decline guidance from the structural retrieval outcome."""
+
+    return "" if has_context else EMPTY_CONTEXT_DECLINE_INSTRUCTIONS
 
 
 def join_document_blocks(blocks: Sequence[str]) -> str:

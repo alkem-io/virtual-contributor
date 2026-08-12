@@ -4,12 +4,14 @@ The rule is intentionally small and deterministic: a question is complex when
 any one of these signals fires:
 
 * a comparative or analytical cue is present;
-* it contains multiple distinct asks (multiple ``?`` characters or two
+* it contains multiple distinct asks (multiple ``?`` / ``？`` characters or two
   interrogatives joined by ``and`` / ``or``); or
 * it contains more than :data:`LONG_QUESTION_WORD_THRESHOLD` words.
 
 These cues and the threshold are the operator-facing definition of the
-feature.  This module performs no I/O and never calls a model.
+feature. The lexical cue and interrogative lists are English-only; the
+multi-question signal also recognizes fullwidth ``？``. This module performs
+no I/O and never calls a model.
 """
 
 from __future__ import annotations
@@ -47,13 +49,41 @@ _CUE_PATTERNS = (
     r"\bwhich\s+(?:is|are)\s+(?:better|best)\b",
 )
 _CUE_RE = re.compile("|".join(_CUE_PATTERNS), re.IGNORECASE)
-_INTERROGATIVE_RE = re.compile(
-    r"\b(?:what|why|how|which|where|when|who|can|should|does|do|is|are)\b"
-    r"[^?]*\b(?:and|or)\b[^?]*"
-    r"\b(?:what|why|how|which|where|when|who|can|should|does|do|is|are)\b",
-    re.IGNORECASE,
+_INTERROGATIVE_TOKENS = frozenset(
+    {
+        "what",
+        "why",
+        "how",
+        "which",
+        "where",
+        "when",
+        "who",
+        "can",
+        "should",
+        "does",
+        "do",
+        "is",
+        "are",
+    }
 )
 _WORD_RE = re.compile(r"\b\w+\b", re.UNICODE)
+_CLASSIFICATION_TEXT_LIMIT = 2000
+
+
+def _has_conjoined_interrogatives(tokens: list[str]) -> bool:
+    """Return whether two interrogatives have ``and`` or ``or`` between them."""
+
+    seen_interrogative = False
+    seen_conjunction = False
+    for token in tokens:
+        normalized = token.casefold()
+        if normalized in _INTERROGATIVE_TOKENS:
+            if seen_conjunction:
+                return True
+            seen_interrogative = True
+        elif normalized in {"and", "or"} and seen_interrogative:
+            seen_conjunction = True
+    return False
 
 
 def classify_question(text: str) -> tuple[QueryComplexity, frozenset[str]]:
@@ -63,12 +93,18 @@ def classify_question(text: str) -> tuple[QueryComplexity, frozenset[str]]:
     signal names make the result inspectable in tests and diagnostics.
     """
 
+    bounded_text = text[:_CLASSIFICATION_TEXT_LIMIT]
+    tokens = _WORD_RE.findall(bounded_text)
+
     signals: set[str] = set()
-    if _CUE_RE.search(text):
+    if _CUE_RE.search(bounded_text):
         signals.add(COMPARATIVE_ANALYTICAL_SIGNAL)
-    if text.count("?") > 1 or _INTERROGATIVE_RE.search(text):
+    if (
+        bounded_text.count("?") + bounded_text.count("？") > 1
+        or _has_conjoined_interrogatives(tokens)
+    ):
         signals.add(MULTIPLE_ASKS_SIGNAL)
-    if len(_WORD_RE.findall(text)) > LONG_QUESTION_WORD_THRESHOLD:
+    if len(tokens) > LONG_QUESTION_WORD_THRESHOLD:
         signals.add(LENGTH_SIGNAL)
 
     complexity = (

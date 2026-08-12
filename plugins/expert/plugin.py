@@ -6,8 +6,10 @@ import logging
 
 from core.domain.prompts_shared import (
     STEP_BY_STEP_ANSWER_INSTRUCTIONS,
+    empty_context_instruction,
     join_document_blocks,
     render_document_block,
+    rendered_document_budget_size,
 )
 from core.domain.query_complexity import QueryComplexity, classify_question
 from core.events.input import Input
@@ -123,10 +125,13 @@ class ExpertPlugin:
     def _enforce_context_budget(
         self, docs: list[str], filtered_result: QueryResult,
     ) -> tuple[list[str], QueryResult]:
-        """Drop lowest-scoring chunks if total chars exceed max_context_chars."""
+        """Drop lowest-scoring chunks if rendered context exceeds its budget."""
         raw_docs_check = filtered_result.documents[0] if filtered_result.documents else []
-        total_raw_chars = sum(len(d) for d in raw_docs_check)
-        if total_raw_chars <= self._max_context_chars:
+        total_budget_size = sum(
+            rendered_document_budget_size(rendered, content)
+            for rendered, content in zip(docs, raw_docs_check)
+        )
+        if total_budget_size <= self._max_context_chars:
             return docs, filtered_result
 
         # docs are already in score order from _filter_and_format
@@ -140,7 +145,8 @@ class ExpertPlugin:
         kept_formatted = []
         for i, doc in enumerate(docs):
             raw_content = raw_docs[i] if i < len(raw_docs) else ""
-            if accumulated + len(raw_content) > self._max_context_chars:
+            document_budget_size = rendered_document_budget_size(doc, raw_content)
+            if accumulated + document_budget_size > self._max_context_chars:
                 break
             kept_formatted.append(doc)
             kept_docs.append(raw_content)
@@ -150,13 +156,13 @@ class ExpertPlugin:
                 kept_metadatas.append(raw_metadatas[i])
             if i < len(raw_ids):
                 kept_ids.append(raw_ids[i])
-            accumulated += len(raw_content)
+            accumulated += document_budget_size
 
         dropped = len(docs) - len(kept_formatted)
-        dropped_chars = total_raw_chars - accumulated
+        dropped_budget = total_budget_size - accumulated
         logger.warning(
-            "Context budget exceeded: dropped %d chunks (%d chars)",
-            dropped, dropped_chars,
+            "Context budget exceeded: dropped %d chunks (%d budget units)",
+            dropped, dropped_budget,
         )
 
         new_result = QueryResult(
@@ -252,6 +258,7 @@ class ExpertPlugin:
             vc_name=event.display_name or "Expert",
             knowledge=knowledge,
             question=event.message,
+            empty_context_instruction=empty_context_instruction(bool(docs)),
         )
         complexity_instruction = self._complexity_instruction(event.message)
         if complexity_instruction:

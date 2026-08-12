@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from core.domain.prompts_shared import (
     CITATION_INSTRUCTIONS,
-    EMPTY_CONTEXT_DECLINE_INSTRUCTIONS,
     GROUNDING_INSTRUCTIONS,
 )
 
@@ -21,7 +20,7 @@ retrieve_prompt = (
     "If you don't know the answer, just say that you don't know.\n\n"
     + GROUNDING_INSTRUCTIONS
     + "\n\n"
-    + EMPTY_CONTEXT_DECLINE_INSTRUCTIONS
+    "{empty_context_instruction}"
     + "\n\n"
     + CITATION_INSTRUCTIONS
     + "\n\n"

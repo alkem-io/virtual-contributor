@@ -5,6 +5,10 @@ from __future__ import annotations
 import pytest
 
 from core.events.response import Response
+from core.domain.prompts_shared import (
+    render_document_block,
+    rendered_document_budget_size,
+)
 from core.ports.knowledge_store import QueryResult
 from plugins.expert.plugin import ExpertPlugin
 from tests.conftest import MockLLMPort, MockKnowledgeStorePort, make_input
@@ -115,8 +119,8 @@ class TestExpertPlugin:
         assert len(result.sources) == 1
         assert result.sources[0].source == "a"
 
-    async def test_context_budget_uses_raw_content_not_document_labels(self):
-        """Labels may exceed the budget without changing the surviving chunks."""
+    async def test_context_budget_counts_rendered_document_labels(self):
+        """Rendered labels are charged before deciding which chunks survive."""
         class NearBudgetStore(MockKnowledgeStorePort):
             async def query(self, collection, query_texts, n_results=10):
                 self.query_calls.append((collection, query_texts, n_results))
@@ -127,18 +131,21 @@ class TestExpertPlugin:
                     ids=[["a", "b"]],
                 )
 
+        first_content = "A" * 20
+        first_block = render_document_block(1, first_content, {"source": "a"})
+        context_budget = rendered_document_budget_size(first_block, first_content)
         plugin = ExpertPlugin(
             llm=MockLLMPort(),
             knowledge_store=NearBudgetStore(),
-            max_context_chars=41,
+            max_context_chars=context_budget,
         )
 
         response = await plugin.handle(make_input(bodyOfKnowledgeID="bok-123"))
         prompt = plugin._llm.calls[-1][0]["content"]
 
         assert "A" * 20 in prompt
-        assert "B" * 20 in prompt
-        assert [source.source for source in response.sources] == ["a", "b"]
+        assert "B" * 20 not in prompt
+        assert [source.source for source in response.sources] == ["a"]
 
     async def test_startup_shutdown(self, plugin):
         await plugin.startup()
@@ -209,4 +216,3 @@ class TestExpertPlugin:
 
         # Verify the final response used the graph answer
         assert result.result == "Graph answer"
-

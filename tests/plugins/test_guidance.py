@@ -5,6 +5,10 @@ from __future__ import annotations
 import pytest
 
 from core.events.response import Response
+from core.domain.prompts_shared import (
+    render_document_block,
+    rendered_document_budget_size,
+)
 from core.ports.knowledge_store import QueryResult
 from plugins.guidance.plugin import GuidancePlugin
 from tests.conftest import MockLLMPort, MockKnowledgeStorePort, make_input
@@ -53,8 +57,8 @@ class TestGuidancePlugin:
         # Only the high-score chunk should survive filtering
         assert all(s.source == "a" for s in result.sources)
 
-    async def test_context_budget_uses_raw_content_not_document_labels(self):
-        """Labels may exceed the budget without changing the surviving chunks."""
+    async def test_context_budget_counts_rendered_document_labels(self):
+        """Rendered labels are charged before deciding which chunks survive."""
         store = MockKnowledgeStorePort()
         for index, collection in enumerate(
             [
@@ -76,18 +80,31 @@ class TestGuidancePlugin:
                 [f"id-{index}"],
             )
 
+        first_content = "A" * 20
+        first_block = render_document_block(
+            1,
+            first_content,
+            {
+                "source": "https://example.test/0",
+                "embeddingType": "chunk",
+                "type": "knowledge",
+            },
+        )
+        context_budget = rendered_document_budget_size(first_block, first_content)
         plugin = GuidancePlugin(
             llm=MockLLMPort(response='{"answer": "ok"}'),
             knowledge_store=store,
             n_results=3,
-            max_context_chars=61,
+            max_context_chars=context_budget,
         )
 
         response = await plugin.handle(make_input())
         prompt = plugin._llm.calls[-1][0]["content"]
 
-        assert all(chr(ord("A") + index) * 20 in prompt for index in range(3))
-        assert len(response.sources) == 3
+        assert "A" * 20 in prompt
+        assert "B" * 20 not in prompt
+        assert "C" * 20 not in prompt
+        assert len(response.sources) == 1
 
     async def test_source_prefix_formatting(self, plugin):
         """Context passed to LLM should have 1-based labelled document blocks."""
@@ -144,4 +161,3 @@ class TestGuidancePlugin:
     async def test_startup_shutdown(self, plugin):
         await plugin.startup()
         await plugin.shutdown()
-

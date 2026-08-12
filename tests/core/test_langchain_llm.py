@@ -2,13 +2,48 @@
 
 from __future__ import annotations
 
+from typing import Any, ClassVar
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
 
 from core.adapters.langchain_llm import LangChainLLMAdapter, _to_langchain_messages
+
+
+class TemperatureCapturingChatModel(BaseChatModel):
+    """Minimal real BaseChatModel that records per-call generation kwargs."""
+
+    generation_kwargs: ClassVar[list[dict[str, Any]]] = []
+
+    @property
+    def _llm_type(self) -> str:
+        return "temperature-capturing"
+
+    def invoke(
+        self,
+        input: list[BaseMessage],
+        config: Any = None,
+        *,
+        stop: list[str] | None = None,
+        **kwargs: Any,
+    ) -> AIMessage:
+        type(self).generation_kwargs.append(kwargs)
+        return AIMessage(content="response")
+
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: Any = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        return ChatResult(
+            generations=[ChatGeneration(message=AIMessage(content="response"))]
+        )
 
 
 class TestMessageConversion:
@@ -62,6 +97,71 @@ class TestInvoke:
         result = await adapter.invoke([{"role": "human", "content": "Hi"}])
         assert result == "Hello world"
         mock_llm.invoke.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_invoke_forwards_temperature_to_a_base_chat_model_per_call(
+        self, monkeypatch
+    ) -> None:
+        model = TemperatureCapturingChatModel()
+        adapter = LangChainLLMAdapter(model)
+        TemperatureCapturingChatModel.generation_kwargs = []
+
+        async def invoke_in_current_thread(function, *args):
+            return function(*args)
+
+        monkeypatch.setattr(
+            "core.adapters.langchain_llm.asyncio.to_thread", invoke_in_current_thread
+        )
+
+        configured = await adapter.invoke(
+            [{"role": "human", "content": "Hi"}], temperature=0.2
+        )
+        unconfigured = await adapter.invoke(
+            [{"role": "human", "content": "Hi"}]
+        )
+
+        assert configured == "response"
+        assert unconfigured == "response"
+        assert TemperatureCapturingChatModel.generation_kwargs == [
+            {"temperature": 0.2},
+            {},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_invoke_binds_temperature_when_model_does_not_accept_it(
+        self, monkeypatch
+    ) -> None:
+        class BoundModel:
+            def __init__(self) -> None:
+                self.bound_temperature: float | None = None
+                self.bound_temperatures: list[float] = []
+
+            def invoke(self, messages: list[BaseMessage]) -> MagicMock:
+                return MagicMock(content="unconfigured")
+
+            def bind(self, *, temperature: float) -> BoundModel:
+                self.bound_temperatures.append(temperature)
+                bound = BoundModel()
+                bound.bound_temperature = temperature
+                return bound
+
+        model = BoundModel()
+        adapter = LangChainLLMAdapter(model)
+
+        async def invoke_in_current_thread(function, *args):
+            return function(*args)
+
+        monkeypatch.setattr(
+            "core.adapters.langchain_llm.asyncio.to_thread", invoke_in_current_thread
+        )
+
+        result = await adapter.invoke(
+            [{"role": "human", "content": "Hi"}], temperature=0.2
+        )
+
+        assert result == "unconfigured"
+        assert model.bound_temperature is None
+        assert model.bound_temperatures == [0.2]
 
     @pytest.mark.asyncio
     async def test_invoke_retries_on_failure(self) -> None:

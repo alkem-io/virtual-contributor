@@ -32,6 +32,8 @@ Use a pure lexical/structural complexity classifier. Any comparative/analytical
 cue, multiple-ask signal, or question longer than 24 words triggers a private
 step-by-step instruction. `ANSWERING_CHAIN_OF_THOUGHT_ENABLED` defaults to true
 and bypasses the classifier entirely when false.
+The cue and interrogative token lists are intentionally English-only; fullwidth
+`？` still contributes to the language-independent multiple-question signal.
 
 Use an opt-in `ANSWERING_LLM_TEMPERATURE` setting, defaulting to unset and
 validated from 0.0 to 2.0. Pass it only as a per-call override at the guidance
@@ -51,10 +53,12 @@ faithfulness/citation/reasoning instructions remain platform-owned.
   platform contract change.
 - No fabricated hierarchy is emitted: labels use title, type, URI, and source
   only when the indexed metadata supplies them.
-- Context budgets remain based on raw passage content, so label bytes do not
-  change which passages survive retrieval.
+- Context budgets charge rendered label UTF-8 bytes alongside passage content,
+  so labels can affect which passages survive but cannot bypass the limit.
 - The guidance JSON answer contract remains additive and parse-compatible.
 - The complexity heuristic may over-classify some questions, trading at most a
   longer internal answer path for fewer missed multi-part answers.
+- Non-English lexical cues remain outside this heuristic's scope; only repeated
+  ASCII or fullwidth question marks are recognized independently of English.
 - Operators can opt into a low factual-answering temperature (recommended
   0.0–0.3) without changing summarization or ingest behavior.

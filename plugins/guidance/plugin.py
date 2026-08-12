@@ -9,8 +9,10 @@ import re
 
 from core.domain.prompts_shared import (
     STEP_BY_STEP_ANSWER_INSTRUCTIONS,
+    empty_context_instruction,
     join_document_blocks,
     render_document_block,
+    rendered_document_budget_size,
 )
 from core.domain.query_complexity import QueryComplexity, classify_question
 from core.events.input import Input
@@ -135,9 +137,7 @@ class GuidancePlugin:
                         )
                         pairs.append((doc, source, metadata))
             except Exception:
-                logger.warning(
-                    "Failed to query collection %s", collection, exc_info=True
-                )
+                logger.warning("Failed to query collection %s", collection)
             return pairs
 
         query_results = await asyncio.gather(
@@ -168,35 +168,45 @@ class GuidancePlugin:
         deduped = deduped[:self._n_results]
 
         # Context budget enforcement — drop lowest-scoring chunks if over budget
-        dropped = 0
-        total_chars = sum(len(doc) for doc, _, _ in deduped)
-        if total_chars > self._max_context_chars:
+        formatted_blocks = [
+            render_document_block(number, doc, metadata)
+            for number, (doc, _, metadata) in enumerate(deduped, start=1)
+        ]
+        total_budget_size = sum(
+            rendered_document_budget_size(block, doc)
+            for block, (doc, _, _) in zip(formatted_blocks, deduped)
+        )
+        if total_budget_size > self._max_context_chars:
             kept: list[tuple[str, Source, dict]] = []
+            kept_blocks: list[str] = []
             accumulated = 0
-            for doc, src, metadata in deduped:
-                if accumulated + len(doc) > self._max_context_chars:
+            for block, (doc, src, metadata) in zip(formatted_blocks, deduped):
+                document_budget_size = rendered_document_budget_size(block, doc)
+                if accumulated + document_budget_size > self._max_context_chars:
                     break
                 kept.append((doc, src, metadata))
-                accumulated += len(doc)
+                kept_blocks.append(block)
+                accumulated += document_budget_size
             dropped = len(deduped) - len(kept)
-            dropped_chars = total_chars - accumulated
+            dropped_budget = total_budget_size - accumulated
             logger.warning(
-                "Context budget exceeded: dropped %d chunks (%d chars)",
-                dropped, dropped_chars,
+                "Context budget exceeded: dropped %d chunks (%d budget units)",
+                dropped, dropped_budget,
             )
             deduped = kept
+            formatted_blocks = kept_blocks
 
         all_sources = [src for _, src, _ in deduped]
 
-        context = join_document_blocks([
-            render_document_block(number, doc, metadata)
-            for number, (doc, _, metadata) in enumerate(deduped, start=1)
-        ])
+        context = join_document_blocks(formatted_blocks)
 
         # Generate response
         from plugins.guidance.prompts import retrieve_prompt
         prompt = retrieve_prompt.format(
-            context=context, question=question, language=language
+            context=context,
+            question=question,
+            language=language,
+            empty_context_instruction=empty_context_instruction(bool(deduped)),
         )
         complexity_instruction = self._complexity_instruction(question)
         if complexity_instruction:

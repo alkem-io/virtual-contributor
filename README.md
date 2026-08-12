@@ -161,7 +161,7 @@ virtual-contributor/
 │   └── plugins/                       # Plugin unit tests
 │
 ├── specs/                             # Feature specifications (001-025)
-├── docs/adr/                          # Architecture Decision Records (0001-0011)
+├── docs/adr/                          # Architecture Decision Records (0001–0013)
 ├── main.py                            # Single entry point
 ├── Dockerfile                         # Distroless build: 3.13-slim-trixie builder -> distroless/python3-debian13
 ├── docker/
@@ -591,6 +591,7 @@ Detailed design rationale is documented in `docs/adr/`:
 | [0009](docs/adr/0009-configurable-summarization-llm.md) | Configurable summarization LLM with per-plugin retrieval parameters |
 | [0010](docs/adr/0010-pipeline-step-safety.md) | Pipeline destructive step safety via duck-typed gating |
 | [0011](docs/adr/0011-pipeline-reliability.md) | Pipeline reliability — thread pool sizing, partial failure resilience |
+| [0013](docs/adr/0013-grounded-citable-generation-prompts.md) | Grounded, citable generation prompts |
 
 ## Feature Specifications
 

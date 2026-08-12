@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -49,12 +50,25 @@ def _log_config(config: BaseConfig) -> None:
         "guidance_n_results",
         "guidance_min_score",
         "max_context_chars",
+        "answering_llm_temperature",
+        "answering_chain_of_thought_enabled",
         "summary_chunk_threshold",
         "pipeline_timeout",
     ]
     for name in fields:
         value = getattr(config, name, None)
         logger.info("Config: %s=%s", name.upper(), _mask_sensitive(name, value))
+
+
+def _inject_answering_config(
+    config: BaseConfig, deps: dict[str, object], signature: inspect.Signature
+) -> None:
+    """Inject answering-only settings only into plugins that declare them."""
+
+    if "answering_temperature" in signature.parameters:
+        deps["answering_temperature"] = config.answering_llm_temperature
+    if "chain_of_thought_enabled" in signature.parameters:
+        deps["chain_of_thought_enabled"] = config.answering_chain_of_thought_enabled
 
 
 def _resolve_plugin_llm_config(config: BaseConfig) -> BaseConfig:
@@ -227,7 +241,6 @@ async def _run(config: BaseConfig) -> None:
     # Construct plugin with dependencies
     deps = container.resolve_for_plugin(plugin_class)
     # Inject per-plugin retrieval config
-    import inspect
     sig = inspect.signature(plugin_class.__init__)
     plugin_name = config.plugin_type.lower().replace("-", "_") if config.plugin_type else ""
     if "n_results" in sig.parameters:
@@ -246,6 +259,7 @@ async def _run(config: BaseConfig) -> None:
             deps["score_threshold"] = config.retrieval_score_threshold
     if "max_context_chars" in sig.parameters:
         deps["max_context_chars"] = config.max_context_chars
+    _inject_answering_config(config, deps, sig)
     # Inject summarization LLM for ingest plugins
     if "summarize_llm" in sig.parameters:
         deps["summarize_llm"] = summarize_llm

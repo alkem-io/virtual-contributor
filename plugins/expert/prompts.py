@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from core.domain.prompts_shared import (
     CITATION_INSTRUCTIONS,
-    EMPTY_CONTEXT_DECLINE_INSTRUCTIONS,
     GROUNDING_INSTRUCTIONS,
 )
 
@@ -13,7 +12,7 @@ combined_expert_prompt = (
     "Use the following knowledge to answer the user's question.\n\n"
     + GROUNDING_INSTRUCTIONS
     + "\n\n"
-    + EMPTY_CONTEXT_DECLINE_INSTRUCTIONS
+    "{empty_context_instruction}"
     + "\n\n"
     + CITATION_INSTRUCTIONS
     + "\n\n"

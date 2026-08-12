@@ -70,11 +70,13 @@ when **any** of these inspectable signals applies:
   `differ`/`difference`, `trade-off`, `pros and cons`, `analyse`/`analyze`,
   `evaluate`, `why`, or `which is better`;
 - it has multiple asks (more than one `?`, or two interrogatives joined by
-  `and` or `or`); or
+  `and` or `or`; fullwidth `？` is also counted); or
 - it has more than 24 words.
 
 Set `ANSWERING_CHAIN_OF_THOUGHT_ENABLED=false` to bypass the classifier and
 use the straightforward path for every question.
+The cue and interrogative-token lists are English-only; broader multilingual
+cue routing is outside this plugin's scope.
 
 ## Configuration
 

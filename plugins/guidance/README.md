@@ -66,12 +66,14 @@ step-by-step instruction only when **any** inspectable complexity signal fires:
   `difference`, `trade-off`, `pros and cons`, `analyse`/`analyze`, `evaluate`,
   `why`, or `which is better`);
 - multiple asks (more than one `?`, or two interrogatives joined by `and` or
-  `or`); or
+  `or`; fullwidth `？` is also counted); or
 - more than 24 words.
 
 The finished answer never exposes intermediate reasoning. Set
 `ANSWERING_CHAIN_OF_THOUGHT_ENABLED=false` to bypass classification and keep
 all questions on the direct path.
+The cue and interrogative-token lists are English-only; broader multilingual
+cue routing is outside this plugin's scope.
 
 ## Configuration
 
