@@ -37,3 +37,4 @@ evaluations/*
 .specify/specs/
 .claude/triage-logs/
 .claude/*.scheduled
+worktrees/

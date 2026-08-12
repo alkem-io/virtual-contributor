@@ -40,7 +40,14 @@ class TracedKnowledgeStore:
             result = await self._delegate.query(collection, query_texts, n_results)
             self._query_attributes(current, collection, n_results, result)
             return result
-        with get_tracer().start_as_current_span("vc.retrieval", kind=SpanKind.CLIENT) as span:
+        # record_exception/set_status_on_exception disabled: record_failure()
+        # is the single content-gated writer of error context (SEC-4).
+        with get_tracer().start_as_current_span(
+            "vc.retrieval",
+            kind=SpanKind.CLIENT,
+            record_exception=False,
+            set_status_on_exception=False,
+        ) as span:
             try:
                 result = await self._delegate.query(collection, query_texts, n_results)
                 self._query_attributes(span, collection, n_results, result)
@@ -62,7 +69,12 @@ class TracedKnowledgeStore:
         await self._operation("delete", collection, len(ids) if ids else None, self._delegate.delete(collection, ids, where))
 
     async def _operation(self, operation: str, collection: str, count: int | None, awaitable: Any) -> Any:
-        with get_tracer().start_as_current_span(f"vc.store.{operation}", kind=SpanKind.CLIENT) as span:
+        with get_tracer().start_as_current_span(
+            f"vc.store.{operation}",
+            kind=SpanKind.CLIENT,
+            record_exception=False,
+            set_status_on_exception=False,
+        ) as span:
             span.set_attribute("vc.retrieval.collection", collection)
             if count is not None:
                 span.set_attribute("vc.store.n_items", count)

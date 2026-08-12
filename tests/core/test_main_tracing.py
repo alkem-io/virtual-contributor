@@ -39,18 +39,29 @@ def test_factory_adds_callbacks_only_after_local_tracing_is_configured() -> None
 
 
 async def test_bounded_shutdown_does_not_block_following_cleanup(monkeypatch) -> None:
-    import main
+    """A blackholed exporter flush must bound BOTH the event loop and process
+    exit (sec-vc-r2-1): the flush runs on a daemon thread, so a hung
+    shutdown_tracing neither blocks this coroutine past ~5s nor pins the
+    interpreter alive."""
+    import threading
+    import time
 
-    seen: dict[str, float] = {}
+    import core.tracing as tracing
 
-    async def bounded(coro, *, timeout: float):
-        seen["timeout"] = timeout
-        coro.close()
-        raise TimeoutError
+    release = threading.Event()
 
-    monkeypatch.setattr(main.asyncio, "wait_for", bounded)
+    def hung_shutdown(timeout_ms: int = 5000) -> None:
+        release.wait(timeout=30)
+
+    monkeypatch.setattr(tracing, "shutdown_tracing", hung_shutdown)
+    started = time.monotonic()
     await _shutdown_tracing_bounded()
-    assert seen["timeout"] == 5
-    # The coroutine returned, so callers can immediately continue to close the
-    # transport even when the exporter worker is blackholed.
-    assert main._shutdown_tracing_bounded is _shutdown_tracing_bounded
+    elapsed = time.monotonic() - started
+    try:
+        # Returned promptly despite the hung flush; transport.close() can run.
+        assert elapsed < 8
+        flushers = [t for t in threading.enumerate() if t.name == "tracing-flush"]
+        # The flusher is a daemon thread — it cannot pin interpreter exit.
+        assert all(t.daemon for t in flushers)
+    finally:
+        release.set()

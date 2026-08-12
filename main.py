@@ -172,12 +172,24 @@ def _create_adapters(config: BaseConfig, container: Container) -> None:
 
 
 async def _shutdown_tracing_bounded() -> None:
-    """Flush tracing without allowing an unreachable collector to delay exit."""
+    """Flush tracing without allowing an unreachable collector to delay exit.
+
+    A daemon thread (not asyncio.to_thread) bounds PROCESS exit, not just the
+    event loop: to_thread uses a non-daemon executor worker, which keeps the
+    interpreter alive until the SDK's unbounded flush finishes — measured
+    10-40s against a dead collector, overshooting k8s' 30s grace period.
+    """
+    import threading
+
     from core.tracing import shutdown_tracing
 
-    try:
-        await asyncio.wait_for(asyncio.to_thread(shutdown_tracing), timeout=5)
-    except asyncio.TimeoutError:
+    flusher = threading.Thread(target=shutdown_tracing, daemon=True, name="tracing-flush")
+    flusher.start()
+    deadline = 5.0
+    while flusher.is_alive() and deadline > 0:
+        await asyncio.sleep(0.1)
+        deadline -= 0.1
+    if flusher.is_alive():
         logger.warning("Tracing shutdown exceeded 5s; closing transport anyway")
 
 
@@ -354,6 +366,7 @@ async def _run(config: BaseConfig) -> None:
         """Run plugin.handle() with timeout and publish result."""
         from core.tracing import (
             FailureMode,
+            LLMInvocationTimeoutError,
             classify_failure,
             handle_span,
             record_failure,
@@ -373,6 +386,16 @@ async def _run(config: BaseConfig) -> None:
                     from opentelemetry import trace
 
                     root.set_status(trace.Status(trace.StatusCode.OK))
+            except LLMInvocationTimeoutError as exc:
+                logger.error(
+                    "LLM provider timed out for event type %s", type(event).__name__
+                )
+                if root is not None:
+                    record_failure(root, exc, FailureMode.llm_error, config=config)
+                from core.events.response import Response
+                error_response = Response(result=f"Error: {exc}")
+                envelope = router.build_response_envelope(error_response, event)
+                await _publish_result(envelope)
             except asyncio.TimeoutError as exc:
                 logger.error(
                     "Pipeline timed out after %ds for event type %s",
@@ -441,6 +464,17 @@ async def _run(config: BaseConfig) -> None:
                             from opentelemetry import trace
 
                             root.set_status(trace.Status(trace.StatusCode.OK))
+                    except LLMInvocationTimeoutError as exc:
+                        logger.error(
+                            "LLM provider timed out for %s", type(event).__name__
+                        )
+                        if root is not None:
+                            record_failure(root, exc, FailureMode.llm_error, config=config)
+                        await _retry_or_reject(
+                            message, body,
+                            event=event,
+                            error_text=f"Error: {exc}",
+                        )
                     except asyncio.TimeoutError as exc:
                         logger.error(
                             "Handler timed out after %ds for %s",
