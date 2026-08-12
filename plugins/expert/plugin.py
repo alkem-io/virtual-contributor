@@ -4,6 +4,12 @@ from __future__ import annotations
 
 import logging
 
+from core.domain.prompts_shared import (
+    STEP_BY_STEP_ANSWER_INSTRUCTIONS,
+    join_document_blocks,
+    render_document_block,
+)
+from core.domain.query_complexity import QueryComplexity, classify_question
 from core.events.input import Input
 from core.events.response import Response, Source
 from core.ports.llm import LLMPort
@@ -15,7 +21,7 @@ logger = logging.getLogger(__name__)
 def _filter_and_format(
     result: QueryResult, score_threshold: float
 ) -> tuple[list[str], QueryResult]:
-    """Filter results by score threshold and prefix with [source:N].
+    """Filter results by score threshold and render labelled document blocks.
 
     Returns the formatted doc list and a new QueryResult containing only
     the entries that passed the threshold.
@@ -34,7 +40,10 @@ def _filter_and_format(
             kept_metadatas.append(metadatas[i] if i < len(metadatas) else {})
             kept_ids.append(ids[i] if i < len(ids) else "")
 
-    formatted = [f"[source:{i}] {doc}" for i, doc in enumerate(kept_docs)]
+    formatted = [
+        render_document_block(number, doc, kept_metadatas[number - 1])
+        for number, doc in enumerate(kept_docs, start=1)
+    ]
     filtered_result = QueryResult(
         documents=[kept_docs],
         metadatas=[kept_metadatas],
@@ -63,18 +72,42 @@ class ExpertPlugin:
         n_results: int = 5,
         score_threshold: float = 0.3,
         max_context_chars: int = 20000,
+        answering_temperature: float | None = None,
+        chain_of_thought_enabled: bool = True,
     ) -> None:
         self._llm = llm
         self._knowledge_store = knowledge_store
         self._n_results = n_results
         self._score_threshold = score_threshold
         self._max_context_chars = max_context_chars
+        self._answering_temperature = answering_temperature
+        self._chain_of_thought_enabled = chain_of_thought_enabled
 
     async def startup(self) -> None:
         logger.info("ExpertPlugin started")
 
     async def shutdown(self) -> None:
         logger.info("ExpertPlugin stopped")
+
+    def _complexity_instruction(self, question: str) -> str:
+        """Return the private-reasoning instruction only for complex questions."""
+
+        if not self._chain_of_thought_enabled:
+            return ""
+        complexity, _ = classify_question(question)
+        if complexity is QueryComplexity.COMPLEX:
+            return STEP_BY_STEP_ANSWER_INSTRUCTIONS
+        return ""
+
+    async def _invoke_answering(self, prompt: str) -> str:
+        """Invoke the shared adapter without changing non-answering calls."""
+
+        messages = [{"role": "human", "content": prompt}]
+        if self._answering_temperature is None:
+            return await self._llm.invoke(messages)
+        return await self._llm.invoke(
+            messages, temperature=self._answering_temperature
+        )
 
     async def handle(self, event: Input, **ports) -> Response:
         bok_id = event.body_of_knowledge_id or ""
@@ -155,7 +188,7 @@ class ExpertPlugin:
             )
             docs, filtered_result = _filter_and_format(result, score_threshold)
             docs, filtered_result = enforce_budget(docs, filtered_result)
-            knowledge = "\n".join(docs)
+            knowledge = join_document_blocks(docs)
             # The expert state schema expects ``combined_knowledge_docs``
             # — that's what the answer_question node reads via its
             # ``{combined_knowledge_docs}`` prompt variable.  ``sources``
@@ -212,7 +245,7 @@ class ExpertPlugin:
         )
         docs, result = _filter_and_format(result, self._score_threshold)
         docs, result = self._enforce_context_budget(docs, result)
-        knowledge = "\n".join(docs)
+        knowledge = join_document_blocks(docs)
 
         from plugins.expert.prompts import combined_expert_prompt
         prompt = combined_expert_prompt.format(
@@ -220,8 +253,11 @@ class ExpertPlugin:
             knowledge=knowledge,
             question=event.message,
         )
+        complexity_instruction = self._complexity_instruction(event.message)
+        if complexity_instruction:
+            prompt = f"{prompt}\n\n{complexity_instruction}"
 
-        answer = await self._llm.invoke([{"role": "human", "content": prompt}])
+        answer = await self._invoke_answering(prompt)
         sources = self._build_sources(result)
 
         return Response(

@@ -2,9 +2,21 @@
 
 from __future__ import annotations
 
+from core.domain.prompts_shared import (
+    CITATION_INSTRUCTIONS,
+    EMPTY_CONTEXT_DECLINE_INSTRUCTIONS,
+    GROUNDING_INSTRUCTIONS,
+)
+
 combined_expert_prompt = (
     "You are {vc_name}, an AI expert assistant. "
     "Use the following knowledge to answer the user's question.\n\n"
+    + GROUNDING_INSTRUCTIONS
+    + "\n\n"
+    + EMPTY_CONTEXT_DECLINE_INSTRUCTIONS
+    + "\n\n"
+    + CITATION_INSTRUCTIONS
+    + "\n\n"
     "Knowledge:\n{knowledge}\n\n"
     "Question: {question}\n\n"
     "Provide a comprehensive and accurate answer based on the knowledge provided. "

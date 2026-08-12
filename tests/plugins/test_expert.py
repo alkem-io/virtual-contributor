@@ -86,12 +86,12 @@ class TestExpertPlugin:
         assert sources[0].score is None
 
     async def test_source_prefix_formatting(self, plugin):
-        """Knowledge string should have [source:N] prefixes."""
+        """Knowledge string should have 1-based labelled document blocks."""
         event = make_input(bodyOfKnowledgeID="bok-123")
         await plugin.handle(event)
         llm_prompt = plugin._llm.calls[-1][0]["content"]
-        assert "[source:0]" in llm_prompt
-        assert "[source:1]" in llm_prompt
+        assert "[Document 1 · test · origin: test]" in llm_prompt
+        assert "[Document 2 · test · origin: test]" in llm_prompt
 
     async def test_low_score_chunks_filtered_out(self):
         """Chunks below the score threshold should be excluded."""
@@ -114,6 +114,31 @@ class TestExpertPlugin:
         # Only the high-score source should survive
         assert len(result.sources) == 1
         assert result.sources[0].source == "a"
+
+    async def test_context_budget_uses_raw_content_not_document_labels(self):
+        """Labels may exceed the budget without changing the surviving chunks."""
+        class NearBudgetStore(MockKnowledgeStorePort):
+            async def query(self, collection, query_texts, n_results=10):
+                self.query_calls.append((collection, query_texts, n_results))
+                return QueryResult(
+                    documents=[["A" * 20, "B" * 20]],
+                    metadatas=[[{"source": "a"}, {"source": "b"}]],
+                    distances=[[0.1, 0.2]],
+                    ids=[["a", "b"]],
+                )
+
+        plugin = ExpertPlugin(
+            llm=MockLLMPort(),
+            knowledge_store=NearBudgetStore(),
+            max_context_chars=41,
+        )
+
+        response = await plugin.handle(make_input(bodyOfKnowledgeID="bok-123"))
+        prompt = plugin._llm.calls[-1][0]["content"]
+
+        assert "A" * 20 in prompt
+        assert "B" * 20 in prompt
+        assert [source.source for source in response.sources] == ["a", "b"]
 
     async def test_startup_shutdown(self, plugin):
         await plugin.startup()
@@ -184,3 +209,4 @@ class TestExpertPlugin:
 
         # Verify the final response used the graph answer
         assert result.result == "Graph answer"
+

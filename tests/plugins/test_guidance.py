@@ -53,13 +53,48 @@ class TestGuidancePlugin:
         # Only the high-score chunk should survive filtering
         assert all(s.source == "a" for s in result.sources)
 
+    async def test_context_budget_uses_raw_content_not_document_labels(self):
+        """Labels may exceed the budget without changing the surviving chunks."""
+        store = MockKnowledgeStorePort()
+        for index, collection in enumerate(
+            [
+                "alkem.io-knowledge",
+                "welcome.alkem.io-knowledge",
+                "www.alkemio.org-knowledge",
+            ]
+        ):
+            await store.ingest(
+                collection,
+                [chr(ord("A") + index) * 20],
+                [
+                    {
+                        "source": f"https://example.test/{index}",
+                        "embeddingType": "chunk",
+                        "type": "knowledge",
+                    }
+                ],
+                [f"id-{index}"],
+            )
+
+        plugin = GuidancePlugin(
+            llm=MockLLMPort(response='{"answer": "ok"}'),
+            knowledge_store=store,
+            n_results=3,
+            max_context_chars=61,
+        )
+
+        response = await plugin.handle(make_input())
+        prompt = plugin._llm.calls[-1][0]["content"]
+
+        assert all(chr(ord("A") + index) * 20 in prompt for index in range(3))
+        assert len(response.sources) == 3
+
     async def test_source_prefix_formatting(self, plugin):
-        """Context passed to LLM should have [source:N] prefixes."""
+        """Context passed to LLM should have 1-based labelled document blocks."""
         event = make_input()
         await plugin.handle(event)
-        # The LLM call should contain [source:0] in the prompt
         llm_prompt = plugin._llm.calls[-1][0]["content"]
-        assert "[source:0]" in llm_prompt
+        assert "[Document 1 · test · origin: test]" in llm_prompt
 
     async def test_history_condensation(self, plugin):
         event = make_input(
@@ -109,3 +144,4 @@ class TestGuidancePlugin:
     async def test_startup_shutdown(self, plugin):
         await plugin.startup()
         await plugin.shutdown()
+

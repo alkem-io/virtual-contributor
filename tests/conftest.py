@@ -26,9 +26,11 @@ class MockLLMPort:
     def __init__(self, response: str = "Mock LLM response") -> None:
         self.response = response
         self.calls: list[list[dict]] = []
+        self.call_kwargs: list[dict] = []
 
-    async def invoke(self, messages: list[dict]) -> str:
+    async def invoke(self, messages: list[dict], **kwargs) -> str:
         self.calls.append(messages)
+        self.call_kwargs.append(kwargs)
         return self.response
 
     async def stream(self, messages: list[dict]) -> AsyncIterator[str]:
@@ -69,6 +71,15 @@ class MockKnowledgeStorePort:
         n_results: int = 10,
     ) -> QueryResult:
         self.query_calls.append((collection, query_texts, n_results))
+        items = self.collections.get(collection, [])
+        if items:
+            matched = items[:n_results]
+            return QueryResult(
+                documents=[[item["document"] for item in matched]],
+                metadatas=[[item["metadata"] for item in matched]],
+                distances=[[0.1 + 0.1 * i for i in range(len(matched))]],
+                ids=[[item["id"] for item in matched]],
+            )
         return QueryResult(
             documents=[["doc1", "doc2"]],
             metadatas=[[{"source": "test"}, {"source": "test"}]],

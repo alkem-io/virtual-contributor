@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+from core.domain.prompts_shared import (
+    CITATION_INSTRUCTIONS,
+    EMPTY_CONTEXT_DECLINE_INSTRUCTIONS,
+    GROUNDING_INSTRUCTIONS,
+)
+
 condense_prompt = (
     "Given the following conversation and a follow-up question, rephrase the "
     "follow-up question to be a standalone question.\n\n"
@@ -13,6 +19,12 @@ condense_prompt = (
 retrieve_prompt = (
     "Use the following pieces of context to answer the question. "
     "If you don't know the answer, just say that you don't know.\n\n"
+    + GROUNDING_INSTRUCTIONS
+    + "\n\n"
+    + EMPTY_CONTEXT_DECLINE_INSTRUCTIONS
+    + "\n\n"
+    + CITATION_INSTRUCTIONS
+    + "\n\n"
     "Context:\n{context}\n\n"
     "Question: {question}\n\n"
     "Answer in {language}. Respond in JSON format with keys: "
