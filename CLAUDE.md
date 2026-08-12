@@ -110,3 +110,4 @@ Scopes are optional: `feat(ingest): add retry logic`. All commits merged to `mai
 - LLM retries: 3 attempts with exponential backoff (1s base).
 - RAG context budget: `max_context_chars` (default 20000) drops lowest-scoring chunks first.
 - Content deduplication: SHA-256 hashes on chunks, with change detection and orphan cleanup during ingest.
+- Factual retrieval policy: expert and guidance pass the legacy-safe `FACTUAL_WHERE` from `core/domain/retrieval_filters.py`; the neutral knowledge-store port remains unfiltered when `where=None`, while `SUMMARIES_WHERE` supports explicit summary retrieval.

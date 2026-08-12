@@ -6,6 +6,7 @@ import logging
 
 from core.events.input import Input
 from core.events.response import Response, Source
+from core.domain.retrieval_filters import FACTUAL_WHERE
 from core.ports.llm import LLMPort
 from core.ports.knowledge_store import KnowledgeStorePort, QueryResult
 
@@ -151,11 +152,14 @@ class ExpertPlugin:
                 or event.message
             )
             result = await self._knowledge_store.query(
-                collection=collection, query_texts=[query], n_results=n_results,
+                collection=collection,
+                query_texts=[query],
+                n_results=n_results,
+                where=FACTUAL_WHERE,
             )
             docs, filtered_result = _filter_and_format(result, score_threshold)
             docs, filtered_result = enforce_budget(docs, filtered_result)
-            knowledge = "\n".join(docs)
+            knowledge = "\n".join(docs) or "No relevant context found."
             # The expert state schema expects ``combined_knowledge_docs``
             # — that's what the answer_question node reads via its
             # ``{combined_knowledge_docs}`` prompt variable.  ``sources``
@@ -208,11 +212,14 @@ class ExpertPlugin:
     async def _handle_simple(self, event: Input, collection: str) -> Response:
         """Simple RAG without graph execution."""
         result = await self._knowledge_store.query(
-            collection=collection, query_texts=[event.message], n_results=self._n_results,
+            collection=collection,
+            query_texts=[event.message],
+            n_results=self._n_results,
+            where=FACTUAL_WHERE,
         )
         docs, result = _filter_and_format(result, self._score_threshold)
         docs, result = self._enforce_context_budget(docs, result)
-        knowledge = "\n".join(docs)
+        knowledge = "\n".join(docs) or "No relevant context found."
 
         from plugins.expert.prompts import combined_expert_prompt
         prompt = combined_expert_prompt.format(

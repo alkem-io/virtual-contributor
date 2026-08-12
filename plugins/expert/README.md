@@ -24,7 +24,7 @@ When no graph is defined, falls back to direct knowledge retrieval + LLM invocat
 ## Retrieval Pipeline
 
 ```
-Query → KnowledgeStore.query(collection, message, n_results)
+Query → KnowledgeStore.query(collection, message, n_results, where=FACTUAL_WHERE)
   → Filter by score threshold (default 0.3)
   → Sort by score descending
   → Enforce context budget (default 20,000 chars, drop lowest-scoring first)
@@ -32,6 +32,10 @@ Query → KnowledgeStore.query(collection, message, n_results)
   → LLM invocation with context
   → Extract sources from metadata → Response
 ```
+
+Factual retrieval uses the shared legacy-safe `FACTUAL_WHERE` predicate from
+`core.domain.retrieval_filters`, excluding summaries while retaining unmarked
+legacy content. `SUMMARIES_WHERE` remains available for explicit overview retrieval.
 
 ## Configuration
 

@@ -32,6 +32,10 @@ Query
 
 The LLM is prompted to respond in structured JSON format. The plugin parses JSON from the response, handling fenced code blocks, bare objects, and preamble/trailing text.
 
+Each factual collection query uses `FACTUAL_WHERE` from
+`core.domain.retrieval_filters`, so summaries do not consume retrieval slots
+while unmarked legacy content remains eligible.
+
 ## Configuration
 
 | Variable | Default | Description |

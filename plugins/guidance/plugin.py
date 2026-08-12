@@ -9,6 +9,7 @@ import re
 
 from core.events.input import Input
 from core.events.response import Response, Source
+from core.domain.retrieval_filters import FACTUAL_WHERE
 from core.ports.llm import LLMPort
 from core.ports.knowledge_store import KnowledgeStorePort
 
@@ -78,7 +79,10 @@ class GuidancePlugin:
             docs, sources = [], []
             try:
                 result = await self._knowledge_store.query(
-                    collection=collection, query_texts=[question], n_results=n_results,
+                    collection=collection,
+                    query_texts=[question],
+                    n_results=n_results,
+                    where=FACTUAL_WHERE,
                 )
                 if result.documents:
                     for i, doc in enumerate(result.documents[0]):

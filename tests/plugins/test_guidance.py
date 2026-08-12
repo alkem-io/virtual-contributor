@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from core.domain.retrieval_filters import FACTUAL_WHERE
 from core.events.response import Response
 from core.ports.knowledge_store import QueryResult
 from plugins.guidance.plugin import GuidancePlugin
@@ -23,6 +24,7 @@ class TestGuidancePlugin:
         await plugin.handle(event)
         # Should query 3 default collections
         assert len(plugin._knowledge_store.query_calls) == 3
+        assert all(call[3] == FACTUAL_WHERE for call in plugin._knowledge_store.query_calls)
 
     async def test_relevance_score_filtering(self, plugin):
         """Documents with score >= 0.3 should be included."""
@@ -35,8 +37,8 @@ class TestGuidancePlugin:
     async def test_low_score_chunks_filtered_out(self):
         """Chunks below the score threshold should be excluded."""
         class LowScoreKS(MockKnowledgeStorePort):
-            async def query(self, collection, query_texts, n_results=10):
-                self.query_calls.append((collection, query_texts, n_results))
+            async def query(self, collection, query_texts, n_results=10, where=None):
+                self.query_calls.append((collection, query_texts, n_results, where))
                 return QueryResult(
                     documents=[["relevant doc", "irrelevant doc"]],
                     metadatas=[[{"source": "a"}, {"source": "b"}]],
@@ -92,7 +94,7 @@ class TestGuidancePlugin:
         """Plugin should handle failed collection queries gracefully."""
         class FailingKS:
             query_calls = []
-            async def query(self, collection, query_texts, n_results=10):
+            async def query(self, collection, query_texts, n_results=10, where=None):
                 raise ConnectionError("Collection unavailable")
             async def ingest(self, *a, **k): pass
             async def delete_collection(self, *a): pass
@@ -109,3 +111,105 @@ class TestGuidancePlugin:
     async def test_startup_shutdown(self, plugin):
         await plugin.startup()
         await plugin.shutdown()
+
+    async def test_factual_filter_returns_only_chunks_from_each_collection(self):
+        store = MockKnowledgeStorePort()
+        for collection in [
+            "alkem.io-knowledge",
+            "welcome.alkem.io-knowledge",
+            "www.alkemio.org-knowledge",
+        ]:
+            await store.ingest(
+                collection,
+                ["chunk content", "summary content", "legacy chunk"],
+                [
+                    {"embeddingType": "chunk", "type": "knowledge", "source": f"{collection}/chunk"},
+                    {"embeddingType": "summary", "type": "knowledge", "source": f"{collection}/summary"},
+                    {"type": "knowledge", "source": f"{collection}/legacy"},
+                ],
+                [f"{collection}-chunk", f"{collection}-summary", f"{collection}-legacy"],
+            )
+        plugin = GuidancePlugin(
+            llm=MockLLMPort(response='{"answer": "ok"}'), knowledge_store=store, n_results=2
+        )
+
+        await plugin.handle(make_input())
+
+        assert all(call[3] == FACTUAL_WHERE for call in store.query_calls)
+        prompt = plugin._llm.calls[-1][0]["content"]
+        assert "summary content" not in prompt
+        assert "chunk content" in prompt
+
+    async def test_legacy_and_overview_entries_partition_for_guidance_retrieval(self):
+        store = MockKnowledgeStorePort()
+        for collection in [
+            "alkem.io-knowledge",
+            "welcome.alkem.io-knowledge",
+            "www.alkemio.org-knowledge",
+        ]:
+            await store.ingest(
+                collection,
+                [
+                    "E1 chunk",
+                    "E2 summary",
+                    "E3 overview",
+                    "E4 chunk",
+                    "E5 summary",
+                    "E6 overview",
+                    "E7 overview",
+                    "E8 legacy",
+                    "E9 old overview",
+                ],
+                [
+                    {"embeddingType": "chunk", "type": "knowledge", "source": f"{collection}/e1"},
+                    {"embeddingType": "summary", "type": "knowledge", "source": f"{collection}/e2"},
+                    {"embeddingType": "summary", "type": "bodyOfKnowledgeSummary", "source": f"{collection}/e3"},
+                    {"embeddingType": "chunk", "type": "knowledge", "source": f"{collection}/e4"},
+                    {"embeddingType": "summary", "type": "knowledge", "source": f"{collection}/e5"},
+                    {"type": "bodyOfKnowledgeSummary", "source": f"{collection}/e6"},
+                    {"embeddingType": "summary", "type": "bodyOfKnowledgeSummary", "source": f"{collection}/e7"},
+                    {"type": "knowledge", "source": f"{collection}/e8"},
+                    {"type": "bodyOfKnowledgeSummary", "source": f"{collection}/e9"},
+                ],
+                [f"{collection}-e{i}" for i in range(1, 10)],
+            )
+        plugin = GuidancePlugin(llm=MockLLMPort(), knowledge_store=store, n_results=9)
+
+        await plugin.handle(make_input())
+
+        prompt = plugin._llm.calls[-1][0]["content"]
+        assert all(entry in prompt for entry in ["E1 chunk", "E4 chunk", "E8 legacy"])
+        assert all(
+            entry not in prompt
+            for entry in [
+                "E2 summary",
+                "E3 overview",
+                "E5 summary",
+                "E6 overview",
+                "E7 overview",
+                "E9 old overview",
+            ]
+        )
+
+    async def test_only_summaries_produce_no_relevant_context_for_guidance(self):
+        store = MockKnowledgeStorePort()
+        for collection in [
+            "alkem.io-knowledge",
+            "welcome.alkem.io-knowledge",
+            "www.alkemio.org-knowledge",
+        ]:
+            await store.ingest(
+                collection,
+                ["document summary", "overview"],
+                [
+                    {"embeddingType": "summary", "type": "knowledge"},
+                    {"embeddingType": "summary", "type": "bodyOfKnowledgeSummary"},
+                ],
+                [f"{collection}-summary", f"{collection}-overview"],
+            )
+        plugin = GuidancePlugin(llm=MockLLMPort(), knowledge_store=store)
+
+        result = await plugin.handle(make_input())
+
+        assert result.result == "Mock LLM response"
+        assert "No relevant context found." in plugin._llm.calls[-1][0]["content"]
