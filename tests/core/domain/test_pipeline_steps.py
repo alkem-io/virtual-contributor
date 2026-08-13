@@ -3164,3 +3164,47 @@ class TestOverviewParticipatesInTheContentLifecycle:
         assert "sp-1" in ctx.removed_document_ids
         remaining = {e["metadata"]["documentId"] for e in store.collections["c"]}
         assert "sp-1" not in remaining
+
+
+class TestOverviewCeilingBoundary:
+    """The ceiling is a deliberate bound, and it is narrower than one live default.
+
+    `ingest_space` currently constructs ChunkStep at 9,000, so a description
+    between 8,001 and 9,000 characters is one passage today and becomes two
+    under the ceiling. That is accepted: such a description is far outside the
+    500-3,000 range descriptions actually occupy, and past the length where a
+    single embedding still represents the text usefully. Pinning the ceiling to
+    "whatever the default happens to be" was rejected — that is exactly the
+    coupling an explicit table exists to break, and it inverts as soon as the
+    default drops to 2,500.
+
+    Pinned so the boundary is a recorded decision rather than a surprise.
+    """
+
+    @staticmethod
+    async def _passages(char_count: int, configured_size: int) -> int:
+        doc = Document(
+            content="x" * char_count,
+            metadata=DocumentMetadata(
+                document_id="d", source="s", type="space", title="T",
+            ),
+        )
+        ctx = PipelineContext(collection_name="c", documents=[doc])
+        await ChunkStep(chunk_size=configured_size, chunk_overlap=500).execute(ctx)
+        return len(ctx.chunks)
+
+    async def test_within_the_stated_range_stays_whole(self):
+        for size in (500, 1500, 3000):
+            assert await self._passages(size, 9000) == 1, size
+
+    async def test_at_the_ceiling_stays_whole(self):
+        assert await self._passages(8000, 9000) == 1
+
+    async def test_above_the_ceiling_splits_even_under_a_larger_default(self):
+        """The documented narrowing against the current 9,000 space default."""
+        assert await self._passages(8500, 9000) > 1
+
+    async def test_the_ceiling_is_more_permissive_once_the_default_drops(self):
+        """At 2,500 the ceiling only ever keeps MORE text whole, never less."""
+        for size in (3000, 5000, 8000):
+            assert await self._passages(size, 2500) == 1, size
