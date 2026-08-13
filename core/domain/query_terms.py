@@ -17,6 +17,12 @@ import re
 #: numbers and identifiers survive.
 _WORD_SPLIT_RE = re.compile(r"\W+", re.UNICODE)
 
+#: Longest term passed through. Capping the *number* of terms does not bound
+#: the payload sent to the store — one unbroken 100,000-character "word" is a
+#: single term and a 100,000-character pattern. Nothing a person types as a
+#: name or identifier approaches this, so anything longer is not a search term.
+MAX_TERM_LEN = 128
+
 #: Words too common to discriminate between passages. Deliberately a fixed,
 #: inspectable list rather than a frequency model: it must be obvious why a
 #: term was dropped, and it must not change under us as a corpus changes.
@@ -59,7 +65,7 @@ def extract_terms(text: str, *, min_len: int, max_terms: int) -> list[str]:
         if not raw:
             continue
         term = raw.casefold()
-        if len(term) < min_len:
+        if len(term) < min_len or len(term) > MAX_TERM_LEN:
             continue
         if term in STOP_WORDS:
             continue
