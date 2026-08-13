@@ -358,3 +358,10 @@ class TestPluginTypeResolution:
         # shared 2000/400 defaults instead of the space-tuned 2500/300.
         assert type(config).__name__ == "IngestSpaceConfig"
         assert config.chunk_size == 2500
+
+    def test_probe_shares_base_config_env_binding(self):
+        """sec-vc-5: the probe must not drift from BaseConfig's binding."""
+        from core.config import BaseConfig
+        from main import _PluginTypeProbe
+
+        assert _PluginTypeProbe.model_config == BaseConfig.model_config

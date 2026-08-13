@@ -86,7 +86,10 @@ class _PluginTypeProbe(BaseSettings):
     *shared* sizing defaults and abort startup on a legal configuration.
     """
 
-    model_config = {"env_file": ".env", "extra": "ignore", "populate_by_name": True}
+    # Derived, not duplicated: if BaseConfig's env binding ever changes
+    # (env_prefix, case_sensitive, secrets_dir), the probe must follow it or
+    # plugin-type resolution silently diverges from the config it selects.
+    model_config = BaseConfig.model_config
 
     plugin_type: str = ""
 
