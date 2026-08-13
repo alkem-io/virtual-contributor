@@ -11,6 +11,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from core.domain.ingest_pipeline import Chunk, DocumentMetadata
 from core.domain.pipeline.chunk_strategy import (
+    EMBEDDING_TYPE_CHUNK,
     ChunkStrategy,
     is_content,
     resolve_strategy,
@@ -31,6 +32,30 @@ from core.ports.knowledge_store import KnowledgeStorePort
 from core.ports.llm import LLMPort
 
 logger = logging.getLogger(__name__)
+
+
+#: Document id of the whole-corpus overview, written by
+#: ``BodyOfKnowledgeSummaryStep``.
+_BOK_SUMMARY_DOCUMENT_ID = "body-of-knowledge-summary"
+
+#: Suffix ``DocumentSummaryStep`` appends when deriving a per-document summary.
+_SUMMARY_DOCUMENT_ID_SUFFIX = "-summary"
+
+
+def _is_derived_document_id(document_id: str | None) -> bool:
+    """Whether an id belongs to a generated summary rather than real content.
+
+    Summaries are identified by their label, but a legacy entry written before
+    that label existed carries no label at all — only its synthetic id gives it
+    away. Both conventions are checked here so the two summarisation steps and
+    this classification cannot drift apart.
+    """
+    if not document_id:
+        return False
+    return (
+        document_id == _BOK_SUMMARY_DOCUMENT_ID
+        or document_id.endswith(_SUMMARY_DOCUMENT_ID_SUFFIX)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -303,13 +328,35 @@ class ContentHashStep:
         for chunk in context.chunks:
             if not is_content(chunk.metadata.embedding_type):
                 continue
-            canonical = "\0".join([
+            # The label participates in the fingerprint, and the fingerprint is
+            # the storage id. Without it a description already in the corpus
+            # keeps its old label forever: the text is unchanged, so the id is
+            # unchanged, so the write is skipped and the new label is computed
+            # and discarded. Re-ingestion is the only way the label can land.
+            #
+            # It also keeps two passages of identical text but different labels
+            # from colliding on one id and overwriting each other.
+            segments = [
                 chunk.content,
                 chunk.metadata.title,
                 chunk.metadata.source,
                 chunk.metadata.type,
                 chunk.metadata.document_id,
-            ])
+            ]
+            # A passage that is not a plain chunk appends its label, so a
+            # description already in the corpus re-fingerprints and is
+            # rewritten with the new label. Without that its text is unchanged,
+            # so the id is unchanged, so the write is skipped and the label is
+            # computed and then discarded.
+            #
+            # A plain chunk appends nothing, keeping the fingerprint it has
+            # today: only the passages whose label actually changes are
+            # rewritten, instead of the entire corpus. An absent label is the
+            # pre-label spelling of "chunk" and is treated the same way.
+            label = chunk.metadata.embedding_type or EMBEDDING_TYPE_CHUNK
+            if label != EMBEDDING_TYPE_CHUNK:
+                segments.append(label)
+            canonical = "\0".join(segments)
             chunk.content_hash = hashlib.sha256(
                 canonical.encode("utf-8")
             ).hexdigest()
@@ -368,12 +415,22 @@ class ChangeDetectionStep:
         existing_doc_ids: set[str] = set()
         if all_existing.metadatas:
             for meta in all_existing.metadatas:
-                # Absent key => legacy entry, counted as content;
-                # excluding it would make the whole pre-embeddingType
-                # corpus invisible here and so never sweepable.
+                doc_id_val = meta.get("documentId")
+                # Absent key => legacy entry, counted as content; excluding it
+                # would make the whole pre-embeddingType corpus invisible here
+                # and so never sweepable.
+                #
+                # But "absent" cannot distinguish a legacy passage from a
+                # legacy summary, and the ids below feed the removed-document
+                # set: a summary landing there is deleted outright. So an entry
+                # that is recognisably a derived artifact by its id is excluded
+                # regardless of its label. A per-document summary is only ever
+                # regenerated when its source document changes, so deleting one
+                # is permanent until an unrelated edit happens to restore it.
+                if _is_derived_document_id(doc_id_val):
+                    continue
                 if not is_content(meta.get("embeddingType")):
                     continue
-                doc_id_val = meta.get("documentId")
                 if doc_id_val:
                     existing_doc_ids.add(doc_id_val)
 
@@ -590,7 +647,7 @@ class DocumentSummaryStep:
                         )
                     source_meta = doc_chunks[0].metadata
                     summary_meta = DocumentMetadata(
-                        document_id=f"{doc_id}-summary",
+                        document_id=f"{doc_id}{_SUMMARY_DOCUMENT_ID_SUFFIX}",
                         source=source_meta.source,
                         type=source_meta.type,
                         title=source_meta.title,
@@ -820,7 +877,7 @@ class BodyOfKnowledgeSummaryStep:
                 reduce_fanin=10,
             )
             bok_meta = DocumentMetadata(
-                document_id="body-of-knowledge-summary",
+                document_id=_BOK_SUMMARY_DOCUMENT_ID,
                 source="generated",
                 type="bodyOfKnowledgeSummary",
                 title="Body of Knowledge Overview",
@@ -1047,7 +1104,7 @@ class OrphanCleanupStep:
                 # Also delete the document's summary chunks
                 await self._store.delete(
                     collection=context.collection_name,
-                    where={"documentId": f"{doc_id}-summary"},
+                    where={"documentId": f"{doc_id}{_SUMMARY_DOCUMENT_ID_SUFFIX}"},
                 )
                 deleted += 1
             except Exception as exc:

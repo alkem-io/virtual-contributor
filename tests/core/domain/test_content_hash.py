@@ -37,8 +37,15 @@ def _expected_hash(
     source: str = "src",
     doc_type: str = "knowledge",
     doc_id: str = "doc-1",
+    embedding_type: str | None = "chunk",
 ) -> str:
-    canonical = "\0".join([content, title, source, doc_type, doc_id])
+    segments = [content, title, source, doc_type, doc_id]
+    # Only a non-chunk label is appended, so plain passages keep the
+    # fingerprint they already have and are not rewritten.
+    label = embedding_type or "chunk"
+    if label != "chunk":
+        segments.append(label)
+    canonical = "\0".join(segments)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
@@ -200,3 +207,59 @@ class TestContentHashCoversAllContentTypes:
         await ContentHashStep().execute(ctx)
         assert a.content_hash == b.content_hash
         assert a.content_hash != c.content_hash
+
+
+class TestLabelParticipatesInTheFingerprint:
+    """The label is in the fingerprint, but only where it differs from before.
+
+    The fingerprint is the storage id. If the label were absent from it, a
+    description already in the corpus would keep its old label forever: the
+    text is unchanged, so the id is unchanged, so the write is skipped and the
+    new label is computed and discarded. If the label were *always* appended,
+    every passage in the corpus would re-fingerprint and be rewritten for a
+    label that did not change.
+    """
+
+    @staticmethod
+    def _develop_hash(
+        content="Hello world", title="Title", source="src",
+        doc_type="knowledge", doc_id="doc-1",
+    ) -> str:
+        canonical = "\0".join([content, title, source, doc_type, doc_id])
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    async def test_a_plain_chunk_keeps_its_existing_fingerprint(self):
+        """The blast radius must not extend to passages that did not change."""
+        chunk = _make_chunk(embedding_type="chunk")
+        ctx = PipelineContext(
+            collection_name="c", documents=[], chunks=[chunk]
+        )
+        await ContentHashStep().execute(ctx)
+        assert chunk.content_hash == self._develop_hash()
+
+    async def test_an_unlabelled_legacy_entry_keeps_its_fingerprint(self):
+        chunk = _make_chunk()
+        chunk.metadata.embedding_type = None  # type: ignore[assignment]
+        ctx = PipelineContext(
+            collection_name="c", documents=[], chunks=[chunk]
+        )
+        await ContentHashStep().execute(ctx)
+        assert chunk.content_hash == self._develop_hash()
+
+    async def test_an_overview_re_fingerprints_so_the_label_can_land(self):
+        chunk = _make_chunk(embedding_type="overview")
+        ctx = PipelineContext(
+            collection_name="c", documents=[], chunks=[chunk]
+        )
+        await ContentHashStep().execute(ctx)
+        assert chunk.content_hash != self._develop_hash()
+
+    async def test_two_labels_of_identical_text_do_not_collide(self):
+        """Otherwise one passage would silently overwrite the other."""
+        as_chunk = _make_chunk(embedding_type="chunk")
+        as_overview = _make_chunk(embedding_type="overview")
+        ctx = PipelineContext(
+            collection_name="c", documents=[], chunks=[as_chunk, as_overview]
+        )
+        await ContentHashStep().execute(ctx)
+        assert as_chunk.content_hash != as_overview.content_hash

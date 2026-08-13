@@ -3208,3 +3208,80 @@ class TestOverviewCeilingBoundary:
         """At 2,500 the ceiling only ever keeps MORE text whole, never less."""
         for size in (3000, 5000, 8000):
             assert await self._passages(size, 2500) == 1, size
+
+
+class TestLegacySummariesAreNotMistakenForContent:
+    """A legacy entry carries no label — only its id says what it is.
+
+    Treating an unlabelled entry as content is right for passages, and it is
+    what keeps the pre-label corpus sweepable. Applied to a summary it is the
+    opposite of right: the id lands in the removed-document set and the entry
+    is deleted outright. A per-document summary is regenerated only when its
+    source document changes, so that deletion is effectively permanent.
+    """
+
+    async def _cleanup_run(self, seeded_ids, present_id):
+        store = MockKnowledgeStorePort()
+        await store.ingest(
+            collection="c",
+            documents=["x"] * len(seeded_ids),
+            metadatas=[{"documentId": d} for d in seeded_ids],
+            ids=[f"legacy-{i}" for i in range(len(seeded_ids))],
+            embeddings=[[0.1]] * len(seeded_ids),
+        )
+        doc = Document(
+            content="live content",
+            metadata=DocumentMetadata(
+                document_id=present_id, source="s", type="post", title="T",
+            ),
+        )
+        ctx = PipelineContext(
+            collection_name="c", documents=[doc],
+            all_document_ids={present_id},
+        )
+        await ChunkStep(chunk_size=2500, chunk_overlap=300).execute(ctx)
+        await ContentHashStep().execute(ctx)
+        await ChangeDetectionStep(store).execute(ctx)
+        for c in ctx.chunks:
+            if c.embedding is None:
+                c.embedding = [0.4]
+        await StoreStep(knowledge_store_port=store).execute(ctx)
+        await OrphanCleanupStep(store).execute(ctx)
+        survivors = {
+            e["metadata"]["documentId"] for e in store.collections["c"]
+        }
+        return ctx, survivors
+
+    async def test_unlabelled_per_document_summary_survives(self):
+        ctx, survivors = await self._cleanup_run(
+            ["doc-1-summary", "doc-1"], "doc-1",
+        )
+        assert "doc-1-summary" not in ctx.removed_document_ids
+        assert "doc-1-summary" in survivors
+
+    async def test_unlabelled_corpus_overview_survives(self):
+        ctx, survivors = await self._cleanup_run(
+            ["body-of-knowledge-summary", "doc-1"], "doc-1",
+        )
+        assert "body-of-knowledge-summary" not in ctx.removed_document_ids
+        assert "body-of-knowledge-summary" in survivors
+
+    async def test_unlabelled_content_for_a_deleted_document_is_still_swept(self):
+        """The guard must not reopen what the widening was for."""
+        ctx, survivors = await self._cleanup_run(["gone-doc", "doc-1"], "doc-1")
+        assert "gone-doc" in ctx.removed_document_ids
+        assert "gone-doc" not in survivors
+
+
+class TestDerivedDocumentIdRecognition:
+    def test_recognises_both_summary_conventions(self):
+        from core.domain.pipeline.steps import _is_derived_document_id
+
+        assert _is_derived_document_id("doc-1-summary")
+        assert _is_derived_document_id("body-of-knowledge-summary")
+
+    def test_does_not_over_match_real_content(self):
+        from core.domain.pipeline.steps import _is_derived_document_id
+
+        for doc_id in ("doc-1", "summary", "my-summary-doc", "", None):
+            assert not _is_derived_document_id(doc_id), doc_id
