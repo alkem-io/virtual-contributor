@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
 from core.domain.ingest_pipeline import Chunk, Document, IngestResult
+from core.domain.pipeline.chunk_strategy import is_content
 
 logger = logging.getLogger(__name__)
 
@@ -163,7 +164,7 @@ class IngestEngine:
 
             # Accumulate raw chunk content for BoK (before discarding chunks)
             for chunk in batch_ctx.chunks:
-                if chunk.metadata.embedding_type == "chunk":
+                if is_content(chunk.metadata.embedding_type):
                     global_raw_chunks_by_doc.setdefault(
                         chunk.metadata.document_id, [],
                     ).append(chunk.content)

@@ -150,3 +150,53 @@ class TestContentHashStep:
         )
         await ContentHashStep().execute(ctx)
         assert c1.content_hash != c2.content_hash
+
+
+class TestContentHashCoversAllContentTypes:
+    """Fingerprinting keys off "is this content", not the literal "chunk".
+
+    An unfingerprinted entry is invisible to change detection: re-embedded on
+    every run and never swept when its source document is deleted.
+    """
+
+    async def test_overview_is_fingerprinted(self):
+        chunk = _make_chunk(embedding_type="overview")
+        ctx = PipelineContext(
+            collection_name="c", documents=[], chunks=[chunk]
+        )
+        await ContentHashStep().execute(ctx)
+        assert chunk.content_hash is not None
+
+    async def test_summary_is_still_not_fingerprinted(self):
+        """Negative path: the widening must not overshoot.
+
+        Summaries are derived artifacts regenerated per run, swept by their own
+        naming convention rather than by content identity.
+        """
+        chunk = _make_chunk(embedding_type="summary")
+        ctx = PipelineContext(
+            collection_name="c", documents=[], chunks=[chunk]
+        )
+        await ContentHashStep().execute(ctx)
+        assert chunk.content_hash is None
+
+    async def test_legacy_entry_without_an_embedding_type_is_fingerprinted(self):
+        """An absent value predates the key and must count as content."""
+        chunk = _make_chunk()
+        chunk.metadata.embedding_type = None  # type: ignore[assignment]
+        ctx = PipelineContext(
+            collection_name="c", documents=[], chunks=[chunk]
+        )
+        await ContentHashStep().execute(ctx)
+        assert chunk.content_hash is not None
+
+    async def test_overview_hashing_is_deterministic_and_sensitive(self):
+        a = _make_chunk(embedding_type="overview", content="same text")
+        b = _make_chunk(embedding_type="overview", content="same text")
+        c = _make_chunk(embedding_type="overview", content="different text")
+        ctx = PipelineContext(
+            collection_name="c", documents=[], chunks=[a, b, c]
+        )
+        await ContentHashStep().execute(ctx)
+        assert a.content_hash == b.content_hash
+        assert a.content_hash != c.content_hash

@@ -10,6 +10,11 @@ from dataclasses import dataclass, replace
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from core.domain.ingest_pipeline import Chunk, DocumentMetadata
+from core.domain.pipeline.chunk_strategy import (
+    ChunkStrategy,
+    is_content,
+    resolve_strategy,
+)
 from core.domain.pipeline.engine import PipelineContext
 from core.domain.pipeline.prompts import (
     BOK_MAP_TEMPLATE,
@@ -206,7 +211,17 @@ async def _refine_summarize(
 # ---------------------------------------------------------------------------
 
 class ChunkStep:
-    """Split documents into chunks with embeddingType='chunk'."""
+    """Split documents, sizing and labelling each by what kind of content it is.
+
+    A space description is a broad, self-contained statement of what a space is
+    for; cut in half, neither half answers anything. A long post is the
+    opposite — it holds many specifics that retrieve better separately. So the
+    splitter is chosen per document kind rather than once for the corpus.
+
+    The per-kind sizes are *overrides*: a kind with no size of its own uses
+    whatever this step was constructed with, so retuning the global default
+    still takes effect everywhere it should.
+    """
 
     def __init__(
         self,
@@ -220,19 +235,49 @@ class ChunkStep:
     def name(self) -> str:
         return "chunk"
 
-    async def execute(self, context: PipelineContext) -> None:
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=self._chunk_size,
-            chunk_overlap=self._chunk_overlap,
+    def _splitter_for(
+        self, strategy: ChunkStrategy,
+    ) -> RecursiveCharacterTextSplitter:
+        size = (
+            strategy.chunk_size
+            if strategy.chunk_size is not None
+            else self._chunk_size
         )
+        overlap = (
+            strategy.chunk_overlap
+            if strategy.chunk_overlap is not None
+            else self._chunk_overlap
+        )
+        # An overlap at or above the size makes the splitter loop; clamp rather
+        # than fail, since the sizes come from config that 042 also tunes.
+        if overlap >= size:
+            overlap = max(0, size // 2)
+        return RecursiveCharacterTextSplitter(
+            chunk_size=size, chunk_overlap=overlap,
+        )
+
+    async def execute(self, context: PipelineContext) -> None:
+        splitters: dict[tuple[int | None, int | None], RecursiveCharacterTextSplitter] = {}
 
         for doc in context.documents:
             try:
+                strategy = resolve_strategy(doc.metadata.type)
+                key = (strategy.chunk_size, strategy.chunk_overlap)
+                splitter = splitters.get(key)
+                if splitter is None:
+                    splitter = self._splitter_for(strategy)
+                    splitters[key] = splitter
+
                 text_chunks = splitter.split_text(doc.content)
                 if not text_chunks:
                     continue
                 for i, text in enumerate(text_chunks):
-                    meta = replace(doc.metadata, embedding_type="chunk")
+                    # A document above its ceiling is still split, and every
+                    # resulting passage keeps its kind's label — an overview
+                    # never silently downgrades to a detail passage.
+                    meta = replace(
+                        doc.metadata, embedding_type=strategy.embedding_type,
+                    )
                     context.chunks.append(
                         Chunk(content=text, metadata=meta, chunk_index=i)
                     )
@@ -256,7 +301,7 @@ class ContentHashStep:
 
     async def execute(self, context: PipelineContext) -> None:
         for chunk in context.chunks:
-            if chunk.metadata.embedding_type != "chunk":
+            if not is_content(chunk.metadata.embedding_type):
                 continue
             canonical = "\0".join([
                 chunk.content,
@@ -301,7 +346,7 @@ class ChangeDetectionStep:
             context.changed_document_ids.clear()
             context.chunks_skipped = 0
             for chunk in context.chunks:
-                if chunk.metadata.embedding_type == "chunk":
+                if is_content(chunk.metadata.embedding_type):
                     chunk.embedding = None
 
     async def _detect(self, context: PipelineContext) -> None:
@@ -309,7 +354,7 @@ class ChangeDetectionStep:
         current_doc_ids: set[str] = set()
         chunks_by_doc: dict[str, list] = {}
         for chunk in context.chunks:
-            if chunk.metadata.embedding_type != "chunk":
+            if not is_content(chunk.metadata.embedding_type):
                 continue
             doc_id = chunk.metadata.document_id
             current_doc_ids.add(doc_id)
@@ -323,7 +368,10 @@ class ChangeDetectionStep:
         existing_doc_ids: set[str] = set()
         if all_existing.metadatas:
             for meta in all_existing.metadatas:
-                if meta.get("embeddingType") != "chunk":
+                # Absent key => legacy entry, counted as content;
+                # excluding it would make the whole pre-embeddingType
+                # corpus invisible here and so never sweepable.
+                if not is_content(meta.get("embeddingType")):
                     continue
                 doc_id_val = meta.get("documentId")
                 if doc_id_val:
@@ -904,7 +952,7 @@ class StoreStep:
             metadatas = []
             ids = []
             for c in batch:
-                if c.metadata.embedding_type == "chunk" and c.content_hash:
+                if is_content(c.metadata.embedding_type) and c.content_hash:
                     # Content-addressable: use content hash as storage ID
                     storage_id = c.content_hash
                 elif c.metadata.embedding_type == "summary":
