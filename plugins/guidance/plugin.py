@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from typing import Any
 import re
 
+from core.domain import hybrid_retrieval
 from core.events.input import Input
 from core.events.response import Response, Source
 from core.ports.llm import LLMPort
@@ -40,12 +42,16 @@ class GuidancePlugin:
         n_results: int = 5,
         score_threshold: float = 0.3,
         max_context_chars: int = 20000,
+        hybrid_config: Any = None,
     ) -> None:
         self._llm = llm
         self._knowledge_store = knowledge_store
         self._n_results = n_results
         self._score_threshold = score_threshold
         self._max_context_chars = max_context_chars
+        # None keeps retrieval exactly as it was — the helper reads the flag
+        # off this and falls through to the dense path.
+        self._hybrid_config = hybrid_config
 
     async def startup(self) -> None:
         logger.info("GuidancePlugin started")
@@ -77,8 +83,9 @@ class GuidancePlugin:
         async def _query_collection(collection: str):
             docs, sources = [], []
             try:
-                result = await self._knowledge_store.query(
-                    collection=collection, query_texts=[question], n_results=n_results,
+                result = await hybrid_retrieval.retrieve(
+                    self._knowledge_store, collection, question,
+                    self._hybrid_config, n_results=n_results,
                 )
                 if result.documents:
                     for i, doc in enumerate(result.documents[0]):

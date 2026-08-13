@@ -49,6 +49,7 @@ def _log_config(config: BaseConfig) -> None:
         "guidance_n_results",
         "guidance_min_score",
         "max_context_chars",
+        "hybrid_retrieval_enabled",
         "summary_chunk_threshold",
         "pipeline_timeout",
     ]
@@ -246,6 +247,10 @@ async def _run(config: BaseConfig) -> None:
             deps["score_threshold"] = config.retrieval_score_threshold
     if "max_context_chars" in sig.parameters:
         deps["max_context_chars"] = config.max_context_chars
+    # The whole config object, so the retrieval helper reads the hybrid
+    # settings from one place rather than each plugin re-listing them.
+    if "hybrid_config" in sig.parameters:
+        deps["hybrid_config"] = config
     # Inject summarization LLM for ingest plugins
     if "summarize_llm" in sig.parameters:
         deps["summarize_llm"] = summarize_llm

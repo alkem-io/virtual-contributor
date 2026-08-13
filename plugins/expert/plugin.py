@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
+from typing import Any
 
+from core.domain import hybrid_retrieval
 from core.events.input import Input
 from core.events.response import Response, Source
 from core.ports.llm import LLMPort
@@ -71,12 +73,16 @@ class ExpertPlugin:
         n_results: int = 5,
         score_threshold: float = 0.3,
         max_context_chars: int = 20000,
+        hybrid_config: Any = None,
     ) -> None:
         self._llm = llm
         self._knowledge_store = knowledge_store
         self._n_results = n_results
         self._score_threshold = score_threshold
         self._max_context_chars = max_context_chars
+        # None keeps retrieval exactly as it was: hybrid_retrieval.retrieve
+        # reads the flag off this and falls through to the dense path.
+        self._hybrid_config = hybrid_config
 
     async def startup(self) -> None:
         logger.info("ExpertPlugin started")
@@ -158,8 +164,9 @@ class ExpertPlugin:
                 or state.get("current_question")
                 or event.message
             )
-            result = await self._knowledge_store.query(
-                collection=collection, query_texts=[query], n_results=n_results,
+            result = await hybrid_retrieval.retrieve(
+                self._knowledge_store, collection, query,
+                self._hybrid_config, n_results=n_results,
             )
             docs, filtered_result = _filter_and_format(result, score_threshold)
             docs, filtered_result = enforce_budget(docs, filtered_result)
@@ -215,8 +222,9 @@ class ExpertPlugin:
 
     async def _handle_simple(self, event: Input, collection: str) -> Response:
         """Simple RAG without graph execution."""
-        result = await self._knowledge_store.query(
-            collection=collection, query_texts=[event.message], n_results=self._n_results,
+        result = await hybrid_retrieval.retrieve(
+            self._knowledge_store, collection, event.message,
+            self._hybrid_config, n_results=self._n_results,
         )
         docs, result = _filter_and_format(result, self._score_threshold)
         docs, result = self._enforce_context_budget(docs, result)
