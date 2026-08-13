@@ -3319,3 +3319,29 @@ class TestRootPositionResolution:
     def test_empty_ingestion_gets_no_root(self):
         ctx = PipelineContext(collection_name="c", documents=[])
         assert _root_position(ctx) == (None, None)
+
+
+class TestHierarchyMetadataScalarContract:
+    """The single render chokepoint enforces the whole scalar contract."""
+
+    def test_non_scalar_value_is_dropped_not_stored(self, caplog):
+        """A nested value would be rejected and take its whole batch with it."""
+        from core.domain.pipeline.steps import hierarchy_metadata
+
+        meta = DocumentMetadata(document_id="d1", source="s", space_id="sp-1")
+        meta.subspace_id = {"nested": "object"}  # type: ignore[assignment]
+        rendered = hierarchy_metadata(meta)
+
+        assert "subspaceId" not in rendered
+        assert rendered["spaceId"] == "sp-1"
+        assert all(
+            isinstance(v, (str, int, float, bool)) for v in rendered.values()
+        )
+
+    def test_non_scalar_depth_is_dropped(self):
+        from core.domain.pipeline.steps import hierarchy_metadata
+
+        meta = DocumentMetadata(document_id="d1", source="s")
+        meta.depth = ["not", "an", "int"]  # type: ignore[assignment]
+        rendered = hierarchy_metadata(meta)
+        assert "depth" not in rendered

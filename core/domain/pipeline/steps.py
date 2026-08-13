@@ -62,11 +62,26 @@ def hierarchy_metadata(metadata: DocumentMetadata) -> dict:
     rendered: dict = {}
     for attr, key in _HIERARCHY_STRING_KEYS:
         value = getattr(metadata, attr, None)
-        if value:
-            rendered[key] = value
+        if not value:
+            continue
+        # Enforce the whole scalar contract, not just the None half: a nested
+        # value would be rejected by the store and take its entire batch with
+        # it, so drop it here and say so rather than lose up to 50 chunks.
+        if not isinstance(value, (str, int, float, bool)):
+            logger.warning(
+                "Dropping non-scalar %s on document %s: %r",
+                key, getattr(metadata, "document_id", "?"), type(value).__name__,
+            )
+            continue
+        rendered[key] = value
     depth = getattr(metadata, "depth", None)
-    if depth is not None:
+    if isinstance(depth, (int, float, bool)):
         rendered["depth"] = depth
+    elif depth is not None:
+        logger.warning(
+            "Dropping non-scalar depth on document %s: %r",
+            getattr(metadata, "document_id", "?"), type(depth).__name__,
+        )
     return rendered
 
 
@@ -334,17 +349,26 @@ class ContentHashStep:
             # Display names are deliberately excluded — a rename would
             # otherwise re-embed an entire space for a label change. Names are
             # display-only; scoped retrieval filters on identities.
-            canonical = "\0".join([
+            #
+            # Content with no tree position at all — website ingestion — keeps
+            # the fingerprint it had before this feature, so those collections
+            # are not rewritten and re-embedded to gain nothing.
+            meta = chunk.metadata
+            segments = [
                 chunk.content,
-                chunk.metadata.title,
-                chunk.metadata.source,
-                chunk.metadata.type,
-                chunk.metadata.document_id,
-                chunk.metadata.space_id or "",
-                chunk.metadata.subspace_id or "",
-                chunk.metadata.callout_id or "",
-                str(chunk.metadata.depth),
-            ])
+                meta.title,
+                meta.source,
+                meta.type,
+                meta.document_id,
+            ]
+            if meta.space_id or meta.subspace_id or meta.callout_id or meta.depth:
+                segments += [
+                    meta.space_id or "",
+                    meta.subspace_id or "",
+                    meta.callout_id or "",
+                    str(meta.depth),
+                ]
+            canonical = "\0".join(segments)
             chunk.content_hash = hashlib.sha256(
                 canonical.encode("utf-8")
             ).hexdigest()

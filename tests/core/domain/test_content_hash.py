@@ -54,10 +54,12 @@ def _expected_hash(
     callout_id: str = "",
     depth: int = 0,
 ) -> str:
-    canonical = "\0".join([
-        content, title, source, doc_type, doc_id,
-        space_id, subspace_id, callout_id, str(depth),
-    ])
+    segments = [content, title, source, doc_type, doc_id]
+    # Content with no tree position keeps its pre-043 fingerprint, so website
+    # collections are not rewritten to gain nothing.
+    if space_id or subspace_id or callout_id or depth:
+        segments += [space_id, subspace_id, callout_id, str(depth)]
+    canonical = "\0".join(segments)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
@@ -238,3 +240,48 @@ class TestContentHashPosition:
         )
         await ContentHashStep().execute(ctx)
         assert ctx.chunks[0].content_hash == _expected_hash()
+
+
+class TestPositionlessContentKeepsItsFingerprint:
+    """Content with no tree position must not be re-fingerprinted.
+
+    The fingerprint is the storage id, so changing it rewrites and re-embeds
+    every entry and sweeps the old ids as orphans. Website ingestion gains no
+    position at all, so it must not pay that cost.
+    """
+
+    async def test_website_shaped_chunk_hashes_as_before_this_feature(self):
+        """Pinned against the pre-043 canonical form, computed independently."""
+        chunk = _make_chunk()  # no position: every hierarchy field at default
+        ctx = PipelineContext(
+            collection_name="c", documents=[], chunks=[chunk]
+        )
+        await ContentHashStep().execute(ctx)
+
+        legacy_canonical = "\0".join([
+            "Hello world", "Title", "src", "knowledge", "doc-1",
+        ])
+        legacy_hash = hashlib.sha256(
+            legacy_canonical.encode("utf-8")
+        ).hexdigest()
+        assert chunk.content_hash == legacy_hash
+
+    async def test_positioned_content_does_get_a_new_fingerprint(self):
+        """The exemption applies only where there is genuinely no position."""
+        bare = _make_chunk()
+        placed = _make_chunk(space_id="sp-1", depth=0)
+        ctx = PipelineContext(
+            collection_name="c", documents=[], chunks=[bare, placed]
+        )
+        await ContentHashStep().execute(ctx)
+        assert bare.content_hash != placed.content_hash
+
+    async def test_depth_alone_is_enough_to_engage_position(self):
+        """A contribution at depth 3 with no ids still fingerprints distinctly."""
+        bare = _make_chunk()
+        deep = _make_chunk(depth=3)
+        ctx = PipelineContext(
+            collection_name="c", documents=[], chunks=[bare, deep]
+        )
+        await ContentHashStep().execute(ctx)
+        assert bare.content_hash != deep.content_hash

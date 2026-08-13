@@ -190,11 +190,17 @@ _CONTRIBUTION_DEPTH = 3
 
 
 def _clean_name(raw: str | None) -> str | None:
-    """HTML-strip and cap a display name; blank becomes unknown (``None``)."""
+    """HTML-strip and cap a display name; blank becomes unknown (``None``).
+
+    Display names are user-controlled and are stored under a new metadata key
+    that later work will filter on and may render, so a name that is nothing
+    but markup is treated as unknown rather than stored verbatim — there is no
+    fallback to the raw value. Stripping runs twice because entity decoding can
+    turn ``&lt;b&gt;`` back into live markup.
+    """
     if not raw:
         return None
-    cleaned = _strip_html(raw) or raw
-    cleaned = cleaned.strip()
+    cleaned = _strip_html(_strip_html(raw)).strip()
     if not cleaned:
         return None
     return cleaned[:_NAME_MAX_CHARS]
@@ -217,20 +223,26 @@ class _Position:
     callout_id: str | None = None
     depth: int = 0
 
-    def for_node(self, node_id: str, node_name: str | None, depth: int) -> _Position:
-        """Descend to a tree node: the root sets space, deeper sets subspace."""
+    def for_node(
+        self, node_id: str | None, node_name: str | None, depth: int,
+    ) -> _Position:
+        """Descend to a tree node: the root sets space, deeper sets subspace.
+
+        A missing identity is carried as unknown rather than raising, so one
+        malformed node costs only its own position, not the whole ingestion.
+        """
         name = _clean_name(node_name)
         if depth == 0:
             return replace(
-                self, space_id=node_id, space_name=name, depth=0,
+                self, space_id=node_id or None, space_name=name, depth=0,
             )
         return replace(
-            self, subspace_id=node_id, subspace_name=name, depth=depth,
+            self, subspace_id=node_id or None, subspace_name=name, depth=depth,
         )
 
-    def for_callout(self, callout_id: str) -> _Position:
+    def for_callout(self, callout_id: str | None) -> _Position:
         """A callout keeps its owner's tier and names itself (FR-005)."""
-        return replace(self, callout_id=callout_id)
+        return replace(self, callout_id=callout_id or None)
 
     def for_contribution(self) -> _Position:
         """A contribution keeps its callout and drops to the leaf tier."""
@@ -302,7 +314,7 @@ async def _process_space(
     space_url = profile.get("url", "") or None
 
     node_position = (position or _Position()).for_node(
-        space["id"], space_name, depth,
+        space.get("id"), space_name, depth,
     )
 
     if description:
@@ -362,7 +374,7 @@ async def _process_callout(
     callout_desc = framing.get("description", "") or ""
     callout_url = framing.get("url", "") or None
 
-    callout_position = (position or _Position()).for_callout(callout["id"])
+    callout_position = (position or _Position()).for_callout(callout.get("id"))
     contribution_position = callout_position.for_contribution()
 
     if callout_desc:

@@ -1126,3 +1126,62 @@ class TestMixedCorpusRetrieval:
             collection="c", where={"spaceId": "sp-1"}, include=["metadatas"],
         )
         assert result.ids == ["new-1-0"]
+
+
+class TestNameSanitisationAndTolerantIds:
+    """Names are user-controlled and land in a new, filterable metadata key."""
+
+    async def test_pure_markup_name_is_treated_as_unknown(self):
+        """No fallback to the raw value — markup must not be stored verbatim."""
+        space = {
+            "id": "sp-1",
+            "profile": {"displayName": "<script>alert(1)</script>",
+                        "description": "d"},
+            "collaboration": {"calloutsSet": {"callouts": []}},
+            "subspaces": [],
+        }
+        by_id = await _walk(space)
+        assert by_id["sp-1"].space_id == "sp-1"
+        assert by_id["sp-1"].space_name is None
+
+    async def test_entity_encoded_markup_does_not_round_trip(self):
+        """Decoding must not turn &lt;script&gt; back into live markup."""
+        space = {
+            "id": "sp-2",
+            "profile": {"displayName": "&lt;script&gt;alert(1)&lt;/script&gt;Safe",
+                        "description": "d"},
+            "collaboration": {"calloutsSet": {"callouts": []}},
+            "subspaces": [],
+        }
+        by_id = await _walk(space)
+        name = by_id["sp-2"].space_name or ""
+        assert "<script>" not in name
+        assert "</script>" not in name
+
+    async def test_partial_markup_name_keeps_its_text(self):
+        space = {
+            "id": "sp-3",
+            "profile": {"displayName": "<b>Real Name</b>", "description": "d"},
+            "collaboration": {"calloutsSet": {"callouts": []}},
+            "subspaces": [],
+        }
+        by_id = await _walk(space)
+        assert by_id["sp-3"].space_name == "Real Name"
+
+    async def test_missing_callout_id_costs_only_its_own_position(self):
+        """One malformed node must not abort the whole ingestion."""
+        space = {
+            "id": "sp-4",
+            "profile": {"displayName": "Root", "description": "root text"},
+            "collaboration": {"calloutsSet": {"callouts": [
+                {"id": None,
+                 "framing": {"profile": {"displayName": "c",
+                                         "description": "callout text"}},
+                 "contributions": []},
+            ]}},
+            "subspaces": [],
+        }
+        # Does not raise; the root document is still emitted with its position.
+        by_id = await _walk(space)
+        assert by_id["sp-4"].space_id == "sp-4"
+        assert by_id["sp-4"].depth == 0
