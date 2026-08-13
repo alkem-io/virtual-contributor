@@ -1,0 +1,123 @@
+"""Run the embedding and lexical arms together and fuse what they return.
+
+This is the single place where two rankings become one. Everything downstream —
+the relevance threshold, the context budget, source attribution — sees one
+ranked set and does not know it was assembled from two.
+
+Disabled, this is a passthrough: the embedding query is made exactly as before
+and returned untouched, with no lexical call at all. That is what makes the
+switch a real rollback rather than a different code path that merely resembles
+the old one.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from typing import Any, Protocol
+
+from core.domain.query_terms import extract_terms
+from core.domain.rank_fusion import reciprocal_rank_fusion
+from core.ports.knowledge_store import KnowledgeStorePort, QueryResult
+
+logger = logging.getLogger(__name__)
+
+
+class HybridSettings(Protocol):
+    """The configuration this module reads.
+
+    Declared structurally so the fusion path does not depend on the whole
+    application config object — anything carrying these values will do, which
+    keeps the tests honest.
+    """
+
+    hybrid_retrieval_enabled: bool
+    hybrid_dense_weight: float
+    hybrid_lexical_weight: float
+    hybrid_rrf_k: int
+    hybrid_max_terms: int
+    hybrid_min_term_len: int
+
+
+def _empty() -> QueryResult:
+    return QueryResult(documents=[[]], metadatas=[[]], distances=[[]], ids=[[]])
+
+
+def _count(result: QueryResult) -> int:
+    return len(result.ids[0]) if result.ids else 0
+
+
+async def retrieve(
+    store: KnowledgeStorePort,
+    collection: str,
+    query: str,
+    config: Any,
+    *,
+    n_results: int = 10,
+) -> QueryResult:
+    """Retrieve passages for ``query``, by meaning and by wording.
+
+    The embedding arm's failure propagates: it is the primary arm, and an
+    answer built without it would be quietly worse than no answer. The lexical
+    arm's failure does not — it is an enhancement, and losing it should degrade
+    retrieval to what it was before this feature, not fail the request.
+    """
+    if not getattr(config, "hybrid_retrieval_enabled", False):
+        return await store.query(
+            collection=collection, query_texts=[query], n_results=n_results,
+        )
+
+    terms = extract_terms(
+        query,
+        min_len=config.hybrid_min_term_len,
+        max_terms=config.hybrid_max_terms,
+    )
+    if not terms:
+        # Nothing in the question is worth matching literally — a question made
+        # entirely of common words would match everything, which discriminates
+        # between nothing.
+        logger.debug("Hybrid retrieval: no lexical terms in query, dense only")
+        return await store.query(
+            collection=collection, query_texts=[query], n_results=n_results,
+        )
+
+    # One gather, so the lexical arm's latency overlaps the embedding arm's
+    # rather than being added to it. Every answer pays the wall-clock cost of
+    # the slower arm, not the sum.
+    dense_result, lexical_result = await asyncio.gather(
+        store.query(
+            collection=collection, query_texts=[query], n_results=n_results,
+        ),
+        store.query_lexical(
+            collection=collection, terms=terms, n_results=n_results,
+        ),
+        return_exceptions=True,
+    )
+
+    if isinstance(dense_result, BaseException):
+        raise dense_result
+
+    if isinstance(lexical_result, BaseException):
+        logger.warning(
+            "Lexical retrieval failed for collection %s, continuing with "
+            "semantic results only: %s",
+            collection, lexical_result,
+        )
+        lexical_result = _empty()
+
+    fused = reciprocal_rank_fusion(
+        [dense_result, lexical_result],
+        k=config.hybrid_rrf_k,
+        weights=[config.hybrid_dense_weight, config.hybrid_lexical_weight],
+        limit=n_results,
+    )
+
+    dense_ids = set(dense_result.ids[0]) if dense_result.ids else set()
+    lexical_ids = set(lexical_result.ids[0]) if lexical_result.ids else set()
+    logger.info(
+        "Hybrid retrieval on %s: %d semantic, %d lexical, %d in both, "
+        "%d after fusion",
+        collection, _count(dense_result), _count(lexical_result),
+        len(dense_ids & lexical_ids), _count(fused),
+    )
+    return fused

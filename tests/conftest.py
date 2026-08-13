@@ -60,6 +60,7 @@ class MockKnowledgeStorePort:
     def __init__(self) -> None:
         self.collections: dict[str, list[dict]] = {}
         self.query_calls: list[tuple] = []
+        self.lexical_calls: list[tuple] = []
         self.deleted: list[str] = []
 
     async def query(
@@ -74,6 +75,36 @@ class MockKnowledgeStorePort:
             metadatas=[[{"source": "test"}, {"source": "test"}]],
             distances=[[0.1, 0.2]],
             ids=[["id1", "id2"]],
+        )
+
+    async def query_lexical(
+        self,
+        collection: str,
+        terms: list[str],
+        n_results: int = 10,
+    ) -> QueryResult:
+        """In-memory stand-in: case-insensitive substring match, no scoring.
+
+        Mirrors the real adapter's shape — a match is a yes/no, so every
+        distance is None.
+        """
+        self.lexical_calls.append((collection, terms, n_results))
+        if not terms:
+            return QueryResult(
+                documents=[[]], metadatas=[[]], distances=[[]], ids=[[]],
+            )
+
+        lowered = [t.casefold() for t in terms]
+        matched = [
+            entry for entry in self.collections.get(collection, [])
+            if any(t in entry.get("document", "").casefold() for t in lowered)
+        ][:n_results]
+
+        return QueryResult(
+            documents=[[e.get("document", "") for e in matched]],
+            metadatas=[[e.get("metadata", {}) for e in matched]],
+            distances=[[None] * len(matched)],
+            ids=[[e["id"] for e in matched]],
         )
 
     async def ingest(
