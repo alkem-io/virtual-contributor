@@ -18,6 +18,12 @@ class LLMProvider(str, Enum):
     anthropic = "anthropic"
 
 
+# Ceiling for ingest chunk sizing. Well above any benchmarked optimum
+# (512-1024 tokens ~= 2000-4000 chars) but low enough that a mistyped value
+# fails at startup rather than during a multi-hour ingest run.
+MAX_CHUNK_SIZE = 100_000
+
+
 class BaseConfig(BaseSettings):
     """Shared configuration consumed by every plugin.
 
@@ -189,10 +195,20 @@ class BaseConfig(BaseSettings):
                 f"CHUNK_OVERLAP must be greater than or equal to 0, "
                 f"got {self.chunk_overlap}"
             )
-        if self.chunk_overlap >= self.chunk_size:
+        if self.chunk_overlap > self.chunk_size // 2:
+            # Not just `>= chunk_size`: overlap approaching the chunk size
+            # amplifies embedding volume super-linearly (overlap 2499 against
+            # size 2500 embeds ~238x the corpus), and startup is the only
+            # place that can catch it — the ingest run itself has a 3h budget.
             raise ValueError(
-                f"CHUNK_OVERLAP must be less than CHUNK_SIZE, got "
-                f"{self.chunk_overlap} >= {self.chunk_size}"
+                f"CHUNK_OVERLAP must not exceed half of CHUNK_SIZE, got "
+                f"{self.chunk_overlap} > {self.chunk_size // 2} "
+                f"(CHUNK_SIZE={self.chunk_size})"
+            )
+        if self.chunk_size > MAX_CHUNK_SIZE:
+            raise ValueError(
+                f"CHUNK_SIZE must not exceed {MAX_CHUNK_SIZE}, "
+                f"got {self.chunk_size}"
             )
         if self.summary_length <= 0:
             raise ValueError(

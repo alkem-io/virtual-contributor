@@ -10,6 +10,8 @@ import os
 import signal
 from typing import Any
 
+from pydantic_settings import BaseSettings
+
 from core.config import BaseConfig, IngestSpaceConfig
 from core.container import Container
 from core.health import HealthServer
@@ -76,6 +78,19 @@ def _log_config(config: BaseConfig, plugin_class: type | None = None) -> None:
         logger.info("Config: %s=%s", name.upper(), _mask_sensitive(name, value))
 
 
+class _PluginTypeProbe(BaseSettings):
+    """Reads only PLUGIN_TYPE, with the same env/.env binding as BaseConfig.
+
+    Deliberately field-minimal: constructing a full BaseConfig to learn the
+    plugin type would validate the ingest-space environment against the
+    *shared* sizing defaults and abort startup on a legal configuration.
+    """
+
+    model_config = {"env_file": ".env", "extra": "ignore", "populate_by_name": True}
+
+    plugin_type: str = ""
+
+
 def _load_config() -> BaseConfig:
     """Load plugin-specific configuration when it has intentional overrides.
 
@@ -85,7 +100,10 @@ def _load_config() -> BaseConfig:
     ``CHUNK_OVERLAP`` between BaseConfig's chunk_size and IngestSpaceConfig's
     would abort startup with an error naming a size the operator never set.
     """
-    plugin_type = os.environ.get("PLUGIN_TYPE", "")
+    # Resolve plugin_type through a minimal model that shares BaseConfig's
+    # env_file binding: a raw os.environ read would miss a PLUGIN_TYPE set in
+    # .env (a documented local-dev path) and silently load the wrong sizing.
+    plugin_type = _PluginTypeProbe().plugin_type
     if plugin_type.lower() == "ingest-space":
         return IngestSpaceConfig()
     return BaseConfig()
