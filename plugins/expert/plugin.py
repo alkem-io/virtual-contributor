@@ -29,15 +29,22 @@ def _filter_and_format(
 
     kept_docs, kept_distances, kept_metadatas, kept_ids = [], [], [], []
     for i, doc in enumerate(docs):
-        distance = distances[i] if i < len(distances) else None
-        # A passage found by literal matching has no semantic distance. The
-        # threshold is defined on that distance, so it has nothing to say about
-        # such a passage — dropping it would discard exactly the exact-name
-        # match the lexical arm was added to find.
-        if distance is None:
-            keep = True
+        # Two different things look like "no distance" and must not be
+        # conflated. A distance explicitly recorded as None means the passage
+        # was matched literally: the threshold is defined on semantic distance,
+        # so it has nothing to say, and dropping the passage would discard
+        # exactly the exact-name match the lexical arm exists to find.
+        #
+        # A distance simply missing from a short list is a malformed result,
+        # not a literal match. It scored zero before this feature and is
+        # dropped exactly as it was, so turning the feature off restores what
+        # the code did before it.
+        if i < len(distances):
+            distance = distances[i]
+            keep = True if distance is None else (1.0 - distance) >= score_threshold
         else:
-            keep = (1.0 - distance) >= score_threshold
+            distance = None
+            keep = 0.0 >= score_threshold
         if keep:
             kept_docs.append(doc)
             kept_distances.append(distance)

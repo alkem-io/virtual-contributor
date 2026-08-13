@@ -166,3 +166,47 @@ class TestPurity:
             reciprocal_rank_fusion(
                 [_arm(["a"])], k=60, weights=[1.0, 1.0], limit=10,
             )
+
+
+class TestDistanceIsArmIndexed:
+    """Semantic distance comes from the dense arm and nowhere else.
+
+    The rule cannot be "prefer whichever arm supplied a number": a future
+    lexical arm that reports its own score would then inject a fabricated
+    *semantic* distance into the relevance threshold and into what the answer
+    cites — the exact confusion widening the type was meant to prevent.
+    """
+
+    def test_a_scoring_lexical_arm_does_not_leak_a_distance(self):
+        dense = _arm(["a", "b"])
+        # A lexical arm that reports numbers, as a BM25 implementation would.
+        scoring_lexical = _arm(["d"], distances=[0.1])
+        result = reciprocal_rank_fusion(
+            [dense, scoring_lexical], k=60, weights=[1.0, 1.0], limit=10,
+        )
+        assert result.distances[0][result.ids[0].index("d")] is None
+
+    def test_the_dense_arm_still_supplies_its_own_distance(self):
+        dense = _arm(["a"], distances=[0.33])
+        result = reciprocal_rank_fusion(
+            [dense, _arm(["d"], distances=[0.1])],
+            k=60, weights=[1.0, 1.0], limit=10,
+        )
+        assert result.distances[0][result.ids[0].index("a")] == 0.33
+
+    def test_payload_is_recovered_from_another_arm_when_dense_lacks_it(self):
+        """An arm can return an id whose text it did not fetch."""
+        dense = QueryResult(
+            documents=[[""]], metadatas=[[{}]], distances=[[0.2]], ids=[["x"]],
+        )
+        lexical = QueryResult(
+            documents=[["the real text"]], metadatas=[[{"source": "sx"}]],
+            distances=[[None]], ids=[["x"]],
+        )
+        result = reciprocal_rank_fusion(
+            [dense, lexical], k=60, weights=[1.0, 1.0], limit=10,
+        )
+        assert result.documents[0][0] == "the real text"
+        assert result.metadatas[0][0] == {"source": "sx"}
+        # Payload was recovered, but the distance still came from the dense arm.
+        assert result.distances[0][0] == 0.2

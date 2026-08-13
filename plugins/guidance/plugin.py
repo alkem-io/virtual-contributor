@@ -81,7 +81,11 @@ class GuidancePlugin:
         n_results = self._n_results
 
         async def _query_collection(collection: str):
-            docs, sources = [], []
+            # Rank within the collection is carried out of here: it is the
+            # fused order, and it is the only ordering that means anything
+            # across arms. A score cannot stand in for it — a passage matched
+            # literally has none.
+            docs, sources, ranks = [], [], []
             try:
                 result = await hybrid_retrieval.retrieve(
                     self._knowledge_store, collection, question,
@@ -95,6 +99,7 @@ class GuidancePlugin:
                         # inventing one would misrepresent it as a semantic hit.
                         score = None if distance is None else 1.0 - distance
                         docs.append(doc)
+                        ranks.append(i)
                         meta = result.metadatas[0][i] if result.metadatas else {}
                         source_url = meta.get("source", collection)
                         sources.append(Source(
@@ -105,22 +110,36 @@ class GuidancePlugin:
                         ))
             except Exception:
                 logger.warning("Failed to query collection %s", collection)
-            return docs, sources
+            return docs, sources, ranks
 
         query_results = await asyncio.gather(
             *[_query_collection(c) for c in DEFAULT_COLLECTIONS]
         )
-        all_pairs: list[tuple[str, Source]] = []
-        for docs, sources in query_results:
-            all_pairs.extend(zip(docs, sources))
+        ranked: list[tuple[int, str, Source]] = []
+        for docs, sources, ranks in query_results:
+            ranked.extend(zip(ranks, docs, sources))
 
-        # Sort by relevance (highest score first). A literal match has no score
-        # to sort by; it is ordered after the scored passages rather than being
-        # treated as the least relevant possible result.
-        all_pairs.sort(
-            key=lambda p: (p[1].score is not None, p[1].score or 0.0),
-            reverse=True,
+        # Merge the collections by each passage's rank within its own
+        # collection, so the best of each competes with the best of the others.
+        # Ordering by score instead would sink every literally-matched passage
+        # below every scored one and then slice it away — discarding exactly
+        # what the lexical arm contributes.
+        #
+        # Within one rank, a passage with no score comes first. It was matched
+        # literally — a different kind of evidence, not weaker evidence — and
+        # it already earned its rank against the semantic hits inside its own
+        # collection. Ordering it behind its scored peers puts it just past
+        # wherever the list is truncated, which is how it was being discarded
+        # despite ranking well: three collections each contribute a rank-1, and
+        # the cut lands mid-tier.
+        ranked.sort(
+            key=lambda r: (
+                r[0],
+                r[2].score is not None,
+                -(r[2].score if r[2].score is not None else 0.0),
+            )
         )
+        all_pairs: list[tuple[str, Source]] = [(d, s) for _, d, s in ranked]
 
         # Filter by score threshold — discard low-relevance chunks. A passage
         # with no score was matched literally rather than by similarity, so the

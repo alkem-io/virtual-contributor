@@ -138,3 +138,36 @@ class TestConceptualQueriesAreUnharmed:
         )
         cited = {s.source for s in response.sources}
         assert {"d1", "d2"} <= cited
+
+
+class TestRaggedDistancesKeepDevelopBehaviour:
+    """A missing distance is not the same as an absent one.
+
+    An explicit None means "matched literally" and is exempt from the semantic
+    threshold. A distance simply missing from a short list is a malformed
+    result, which scored zero and was dropped before this feature — and must
+    still be, or turning the flag off would not restore prior behaviour.
+    """
+
+    @staticmethod
+    def _kept(distances: list, threshold: float = 0.3) -> list[str]:
+        from plugins.expert.plugin import _filter_and_format
+
+        result = QueryResult(
+            documents=[["a", "b"]], metadatas=[[{}, {}]],
+            distances=[distances], ids=[["i1", "i2"]],
+        )
+        _, filtered = _filter_and_format(result, threshold)
+        return filtered.documents[0]
+
+    def test_no_distances_drops_everything_as_before(self):
+        assert self._kept([]) == []
+
+    def test_a_short_distance_list_drops_the_unmeasured_tail(self):
+        assert self._kept([0.1]) == ["a"]
+
+    def test_an_explicit_none_is_still_exempt(self):
+        assert self._kept([0.1, None]) == ["a", "b"]
+
+    def test_a_high_distance_is_still_filtered(self):
+        assert self._kept([0.1, 0.95]) == ["a"]

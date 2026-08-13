@@ -90,15 +90,23 @@ def reciprocal_rank_fusion(
             metadata = metadatas[rank] if rank < len(metadatas) else {}
             distance = distances[rank] if rank < len(distances) else None
 
-            existing = payload.get(doc_id)
-            if existing is None:
-                payload[doc_id] = (document, metadata, distance)
-            elif existing[2] is None and distance is not None:
-                # A later arm supplied the semantic distance an earlier one
-                # could not. Prefer the real number over the absence.
-                payload[doc_id] = (document or existing[0],
-                                   metadata or existing[1],
-                                   distance)
+            # Text and metadata: first arm to supply something non-empty wins.
+            # An arm can return an id whose payload it did not fetch, and
+            # another arm may have it.
+            existing = payload.get(doc_id, ("", {}, None))
+            merged_document = existing[0] or document
+            merged_metadata = existing[1] or metadata
+
+            # Distance is NOT merged that way. It means "semantic distance",
+            # which only the dense arm measures — so it is taken from that arm
+            # and nowhere else. A document the dense arm did not return has no
+            # semantic distance, whatever another arm chose to report: adopting
+            # a lexical arm's number would inject a fabricated similarity into
+            # the relevance threshold and into what the answer cites.
+            merged_distance = (
+                distance if arm_index == _DENSE_ARM else existing[2]
+            )
+            payload[doc_id] = (merged_document, merged_metadata, merged_distance)
 
     candidates = []
     for doc_id, score in scores.items():
