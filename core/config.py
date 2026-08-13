@@ -179,6 +179,26 @@ class BaseConfig(BaseSettings):
                 f"got {self.summary_chunk_threshold}"
             )
 
+        # Ingest sizing validation
+        if self.chunk_size <= 0:
+            raise ValueError(
+                f"CHUNK_SIZE must be greater than 0, got {self.chunk_size}"
+            )
+        if self.chunk_overlap < 0:
+            raise ValueError(
+                f"CHUNK_OVERLAP must be greater than or equal to 0, "
+                f"got {self.chunk_overlap}"
+            )
+        if self.chunk_overlap >= self.chunk_size:
+            raise ValueError(
+                f"CHUNK_OVERLAP must be less than CHUNK_SIZE, got "
+                f"{self.chunk_overlap} >= {self.chunk_size}"
+            )
+        if self.summary_length <= 0:
+            raise ValueError(
+                f"SUMMARY_LENGTH must be greater than 0, got {self.summary_length}"
+            )
+
         # Partial summarize config warning
         summarize_fields = [
             self.summarize_llm_provider,
@@ -283,7 +303,7 @@ class BaseConfig(BaseSettings):
     chunk_size: int = 2000
     chunk_overlap: int = 400
     ingest_batch_size: int = 5
-    summary_length: int = 10000
+    summary_length: int = 2500
     summarize_concurrency: int = 8
     summarize_enabled: bool = True
 
@@ -300,8 +320,8 @@ class IngestSpaceConfig(BaseConfig):
     )
     auth_admin_email: str = ""
     auth_admin_password: str = ""
-    chunk_size: int = 9000
-    chunk_overlap: int = 500
+    chunk_size: int = 2500
+    chunk_overlap: int = 300
 
 
 class IngestWebsiteConfig(BaseConfig):

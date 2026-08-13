@@ -184,3 +184,38 @@ class TestExpertPlugin:
 
         # Verify the final response used the graph answer
         assert result.result == "Graph answer"
+
+
+class TestContextBudgetSizing:
+    """Pin the retrieval benefit of the tuned space chunk size."""
+
+    @staticmethod
+    def _query_result(documents: list[str]) -> QueryResult:
+        return QueryResult(
+            documents=[documents],
+            metadatas=[[{"source": f"source-{index}"} for index in range(len(documents))]],
+            distances=[[0.1] * len(documents)],
+            ids=[[f"id-{index}" for index in range(len(documents))]],
+        )
+
+    def test_default_budget_keeps_five_new_sized_passages_but_not_old_sized_ones(self):
+        plugin = ExpertPlugin(
+            llm=MockLLMPort(response="Expert answer"),
+            knowledge_store=MockKnowledgeStorePort(),
+        )
+        new_sized_docs = ["n" * 2500 for _ in range(5)]
+        old_sized_docs = ["o" * 9000 for _ in range(5)]
+
+        kept_new, _ = plugin._enforce_context_budget(
+            new_sized_docs,
+            self._query_result(new_sized_docs),
+        )
+        kept_old, _ = plugin._enforce_context_budget(
+            old_sized_docs,
+            self._query_result(old_sized_docs),
+        )
+
+        assert plugin._n_results == 5
+        assert plugin._max_context_chars == 20000
+        assert len(kept_new) == 5
+        assert len(kept_old) == 2

@@ -458,6 +458,28 @@ class TestIngestWebsitePlugin:
         # (websites are URL-identified, not UUID-keyed) — lock in the contract.
         assert result.body_of_knowledge_id == ""
 
+    async def test_chunk_size_remains_unchanged(self, plugin):
+        """Website ingestion remains at its existing 2,000-character chunks."""
+        mock_pages = [
+            {
+                "url": "https://example.com",
+                "html": "<p>Content for ingestion test.</p>",
+            },
+        ]
+
+        with (
+            patch("plugins.ingest_website.plugin.crawl", return_value=mock_pages),
+            patch("plugins.ingest_website.plugin.IngestEngine") as mock_engine,
+        ):
+            mock_engine.return_value.run = AsyncMock(
+                return_value=MagicMock(success=True, errors=[]),
+            )
+            await plugin.handle(make_ingest_website())
+
+        chunk_step = mock_engine.call_args.kwargs["batch_steps"][0]
+        assert chunk_step._chunk_size == 2000
+        assert chunk_step._chunk_overlap == 400
+
     async def test_empty_crawl_runs_cleanup(self):
         """When crawl returns [], cleanup deletes pre-existing chunks."""
         store = MockKnowledgeStorePort()

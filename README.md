@@ -313,7 +313,7 @@ A separate LLM can be configured for ingest pipeline summarization. All three fi
 | `CHUNK_SIZE` | `2000` | Characters per chunk |
 | `CHUNK_OVERLAP` | `400` | Overlap between chunks |
 | `BATCH_SIZE` | `20` | Embedding batch size |
-| `SUMMARY_LENGTH` | `10000` | Max summary length |
+| `SUMMARY_LENGTH` | `2500` | Max summary length |
 | `SUMMARY_CHUNK_THRESHOLD` | `4` | Minimum chunks to trigger summarization |
 | `PROCESS_PAGES_LIMIT` | `20` | Max pages to crawl (ingest-website) |
 
@@ -356,7 +356,7 @@ Web crawler that fetches pages from a base URL (configurable page limit), extrac
 
 ### Ingest Space (`PLUGIN_TYPE=ingest-space`)
 
-Fetches the Alkemio space tree via GraphQL, parses attached files (PDF, DOCX, XLSX), and runs the ingest pipeline with larger chunk sizes (9000 characters). The collection is named `{body_of_knowledge_id}-{purpose}`.
+Fetches the Alkemio space tree via GraphQL, parses attached files (PDF, DOCX, XLSX), and runs the ingest pipeline with space-specific 2,500-character chunks. The collection is named `{body_of_knowledge_id}-{purpose}`.
 
 ## Ingest Pipeline
 

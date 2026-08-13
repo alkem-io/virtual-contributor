@@ -47,6 +47,9 @@ class IngestSpacePlugin:
         summarize_enabled: bool = True,
         summarize_concurrency: int = 8,
         ingest_batch_size: int = 5,
+        chunk_size: int = 2500,
+        chunk_overlap: int = 300,
+        summary_length: int = 2500,
     ) -> None:
         self._llm = llm
         self._embeddings = embeddings
@@ -58,6 +61,9 @@ class IngestSpacePlugin:
         self._summarize_enabled = summarize_enabled
         self._summarize_concurrency = max(1, summarize_concurrency)
         self._ingest_batch_size = max(1, ingest_batch_size)
+        self._chunk_size = chunk_size
+        self._chunk_overlap = chunk_overlap
+        self._summary_length = summary_length
 
     async def startup(self) -> None:
         logger.info("IngestSpacePlugin started")
@@ -108,7 +114,10 @@ class IngestSpacePlugin:
             # Run ingest pipeline in batched mode
             summary_llm = self._summarize_llm or self._llm
             batch_steps: list = [
-                ChunkStep(chunk_size=9000, chunk_overlap=500),
+                ChunkStep(
+                    chunk_size=self._chunk_size,
+                    chunk_overlap=self._chunk_overlap,
+                ),
                 ContentHashStep(),
                 ChangeDetectionStep(knowledge_store_port=self._knowledge_store),
             ]
@@ -119,6 +128,7 @@ class IngestSpacePlugin:
                     concurrency=self._summarize_concurrency,
                     chunk_threshold=self._chunk_threshold,
                     embeddings_port=self._embeddings,
+                    summary_length=self._summary_length,
                 ))
             batch_steps.extend([
                 EmbedStep(embeddings_port=self._embeddings),
@@ -132,6 +142,7 @@ class IngestSpacePlugin:
                     map_llm_port=summary_llm,
                     knowledge_store_port=self._knowledge_store,
                     embeddings_port=self._embeddings,
+                    summary_length=self._summary_length,
                 ))
                 finalize_steps.append(EmbedStep(embeddings_port=self._embeddings))
                 finalize_steps.append(StoreStep(knowledge_store_port=self._knowledge_store))

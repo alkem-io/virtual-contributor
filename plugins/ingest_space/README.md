@@ -35,7 +35,7 @@ flowchart TD
     O --> P{Documents found?}
     P -->|Yes| Q[Run ingest pipeline]
     P -->|No| R[Run cleanup-only pipeline]
-    Q --> S[ChunkStep — 9000 chars, 500 overlap]
+    Q --> S[ChunkStep — 2500 chars, 300 overlap]
     S --> T[ContentHashStep]
     T --> U[ChangeDetectionStep]
     U --> V[DocumentSummaryStep]
@@ -73,15 +73,25 @@ flowchart TD
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CHUNK_SIZE` | `9000` | Characters per chunk (larger than website due to structured content) |
-| `CHUNK_OVERLAP` | `500` | Overlap between chunks |
+| `CHUNK_SIZE` | `2500` | Characters per space-ingestion chunk |
+| `CHUNK_OVERLAP` | `300` | Overlap between space-ingestion chunks |
 | `BATCH_SIZE` | `20` | Embedding batch size |
+| `SUMMARY_LENGTH` | `2500` | Target length for stored summaries |
 | `SUMMARY_CHUNK_THRESHOLD` | `4` | Minimum chunks to trigger per-document summarization |
 | `SUMMARIZE_ENABLED` | `true` | Enable/disable summarization steps |
 | `SUMMARIZE_CONCURRENCY` | `8` | Concurrent document summarizations |
 | `ALKEMIO_SERVER` | _(required)_ | Alkemio API server URL |
 | `AUTH_ADMIN_EMAIL` | _(required)_ | Kratos authentication email |
 | `AUTH_ADMIN_PASSWORD` | _(required)_ | Kratos authentication password |
+
+### Re-ingestion required
+
+Existing collections retain their current passage boundaries until they are
+re-ingested. Re-ingestion updates passages in place through content-hash change
+detection: replacement passages are stored before superseded ones are removed.
+The first run after this sizing change re-embeds the collection and produces
+approximately 3.6× more passages; later runs resume normal incremental
+ingestion.
 
 ## Key Files
 

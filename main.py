@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import os
 import signal
+from typing import Any
 
-from core.config import BaseConfig
+from core.config import BaseConfig, IngestSpaceConfig
 from core.container import Container
 from core.health import HealthServer
 from core.logging import setup_logging
@@ -50,11 +52,74 @@ def _log_config(config: BaseConfig) -> None:
         "guidance_min_score",
         "max_context_chars",
         "summary_chunk_threshold",
+        "chunk_size",
+        "chunk_overlap",
+        "summary_length",
         "pipeline_timeout",
     ]
     for name in fields:
         value = getattr(config, name, None)
         logger.info("Config: %s=%s", name.upper(), _mask_sensitive(name, value))
+
+
+def _load_config() -> BaseConfig:
+    """Load plugin-specific configuration when it has intentional overrides."""
+    config = BaseConfig()
+    if config.plugin_type.lower() == "ingest-space":
+        return IngestSpaceConfig()
+    return config
+
+
+def _inject_plugin_config(
+    deps: dict[str, Any],
+    plugin_class: type,
+    config: BaseConfig,
+    summarize_llm: LLMPort | None,
+    bok_llm: LLMPort | None,
+) -> inspect.Signature:
+    """Inject configuration fields declared by a plugin constructor."""
+    sig = inspect.signature(plugin_class.__init__)
+    plugin_name = config.plugin_type.lower().replace("-", "_") if config.plugin_type else ""
+
+    # Inject per-plugin retrieval config
+    if "n_results" in sig.parameters:
+        if plugin_name == "expert":
+            deps["n_results"] = config.expert_n_results
+        elif plugin_name == "guidance":
+            deps["n_results"] = config.guidance_n_results
+        else:
+            deps["n_results"] = config.retrieval_n_results
+    if "score_threshold" in sig.parameters:
+        if plugin_name == "expert":
+            deps["score_threshold"] = config.expert_min_score
+        elif plugin_name == "guidance":
+            deps["score_threshold"] = config.guidance_min_score
+        else:
+            deps["score_threshold"] = config.retrieval_score_threshold
+    if "max_context_chars" in sig.parameters:
+        deps["max_context_chars"] = config.max_context_chars
+
+    # Inject summarization configuration for ingest plugins
+    if "summarize_llm" in sig.parameters:
+        deps["summarize_llm"] = summarize_llm
+    if "bok_llm" in sig.parameters:
+        deps["bok_llm"] = bok_llm
+    if "chunk_threshold" in sig.parameters:
+        deps["chunk_threshold"] = config.summary_chunk_threshold
+    if "summarize_enabled" in sig.parameters:
+        deps["summarize_enabled"] = config.summarize_enabled
+    if "summarize_concurrency" in sig.parameters:
+        deps["summarize_concurrency"] = config.summarize_concurrency
+    if "ingest_batch_size" in sig.parameters:
+        deps["ingest_batch_size"] = config.ingest_batch_size
+    if "chunk_size" in sig.parameters:
+        deps["chunk_size"] = config.chunk_size
+    if "chunk_overlap" in sig.parameters:
+        deps["chunk_overlap"] = config.chunk_overlap
+    if "summary_length" in sig.parameters:
+        deps["summary_length"] = config.summary_length
+
+    return sig
 
 
 def _resolve_plugin_llm_config(config: BaseConfig) -> BaseConfig:
@@ -226,42 +291,13 @@ async def _run(config: BaseConfig) -> None:
 
     # Construct plugin with dependencies
     deps = container.resolve_for_plugin(plugin_class)
-    # Inject per-plugin retrieval config
-    import inspect
-    sig = inspect.signature(plugin_class.__init__)
-    plugin_name = config.plugin_type.lower().replace("-", "_") if config.plugin_type else ""
-    if "n_results" in sig.parameters:
-        if plugin_name == "expert":
-            deps["n_results"] = config.expert_n_results
-        elif plugin_name == "guidance":
-            deps["n_results"] = config.guidance_n_results
-        else:
-            deps["n_results"] = config.retrieval_n_results
-    if "score_threshold" in sig.parameters:
-        if plugin_name == "expert":
-            deps["score_threshold"] = config.expert_min_score
-        elif plugin_name == "guidance":
-            deps["score_threshold"] = config.guidance_min_score
-        else:
-            deps["score_threshold"] = config.retrieval_score_threshold
-    if "max_context_chars" in sig.parameters:
-        deps["max_context_chars"] = config.max_context_chars
-    # Inject summarization LLM for ingest plugins
-    if "summarize_llm" in sig.parameters:
-        deps["summarize_llm"] = summarize_llm
-    # Inject BoK LLM for ingest plugins (large-context model for BoK summary)
-    if "bok_llm" in sig.parameters:
-        deps["bok_llm"] = bok_llm
-    # Inject chunk threshold for ingest plugins
-    if "chunk_threshold" in sig.parameters:
-        deps["chunk_threshold"] = config.summary_chunk_threshold
-    # Inject summarization toggle and concurrency for ingest plugins
-    if "summarize_enabled" in sig.parameters:
-        deps["summarize_enabled"] = config.summarize_enabled
-    if "summarize_concurrency" in sig.parameters:
-        deps["summarize_concurrency"] = config.summarize_concurrency
-    if "ingest_batch_size" in sig.parameters:
-        deps["ingest_batch_size"] = config.ingest_batch_size
+    sig = _inject_plugin_config(
+        deps,
+        plugin_class,
+        config,
+        summarize_llm,
+        bok_llm,
+    )
     # Inject GraphQL client for ingest-space plugin
     if "graphql_client" in sig.parameters:
         from plugins.ingest_space.graphql_client import GraphQLClient
@@ -521,7 +557,7 @@ async def _run(config: BaseConfig) -> None:
 def main() -> None:
     import concurrent.futures
 
-    config = BaseConfig()
+    config = _load_config()
     setup_logging(level=config.log_level, plugin_type=config.plugin_type)
     logger.info("Starting virtual-contributor engine with plugin: %s", config.plugin_type)
     _log_config(config)

@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
-from core.config import BaseConfig, LLMProvider
+from core.config import BaseConfig, IngestSpaceConfig, LLMProvider
 
 
 class TestBackwardCompatibility:
@@ -114,6 +116,128 @@ class TestInvalidRanges:
     def test_summarize_enabled_false(self) -> None:
         config = BaseConfig(llm_api_key="key", summarize_enabled=False)
         assert config.summarize_enabled is False
+
+
+class TestIngestSizingConfiguration:
+    """Test sizing validation and startup injection for space ingestion."""
+
+    def test_space_defaults_are_valid_and_proportional(self) -> None:
+        config = IngestSpaceConfig(llm_api_key="key")
+
+        assert config.chunk_size == 2500
+        assert config.chunk_overlap == 300
+        assert 0.10 <= config.chunk_overlap / config.chunk_size <= 0.15
+
+    def test_summary_defaults_match_embedding_target(self) -> None:
+        from core.domain.pipeline import (
+            BodyOfKnowledgeSummaryStep,
+            DocumentSummaryStep,
+        )
+        from tests.conftest import MockLLMPort
+
+        llm = MockLLMPort()
+        assert BaseConfig(llm_api_key="key").summary_length == 2500
+        assert DocumentSummaryStep(llm)._summary_length == 2500
+        assert BodyOfKnowledgeSummaryStep(llm)._summary_length == 2500
+
+    @pytest.mark.parametrize(
+        ("values", "setting"),
+        [
+            ({"chunk_size": 0}, "CHUNK_SIZE"),
+            ({"chunk_overlap": -1}, "CHUNK_OVERLAP"),
+            ({"chunk_size": 300, "chunk_overlap": 300}, "CHUNK_OVERLAP"),
+            ({"chunk_size": 300, "chunk_overlap": 301}, "CHUNK_OVERLAP"),
+            ({"summary_length": 0}, "SUMMARY_LENGTH"),
+        ],
+    )
+    def test_rejects_invalid_sizing_values(
+        self,
+        values: dict[str, int],
+        setting: str,
+    ) -> None:
+        with pytest.raises(ValueError, match=setting) as exc_info:
+            BaseConfig(llm_api_key="key", **values)
+
+        assert str(next(iter(values.values()))) in str(exc_info.value)
+
+    def test_main_injects_non_default_sizing_values(self) -> None:
+        from main import _inject_plugin_config
+
+        class SizingPlugin:
+            def __init__(
+                self,
+                *,
+                chunk_size: int = 0,
+                chunk_overlap: int = 0,
+                summary_length: int = 0,
+            ) -> None:
+                self.chunk_size = chunk_size
+                self.chunk_overlap = chunk_overlap
+                self.summary_length = summary_length
+
+        config = IngestSpaceConfig(
+            llm_api_key="key",
+            chunk_size=137,
+            chunk_overlap=11,
+            summary_length=911,
+        )
+        deps: dict[str, object] = {}
+
+        _inject_plugin_config(
+            deps,
+            SizingPlugin,
+            config,
+            summarize_llm=None,
+            bok_llm=None,
+        )
+
+        plugin = SizingPlugin(**deps)
+        assert (plugin.chunk_size, plugin.chunk_overlap, plugin.summary_length) == (
+            137,
+            11,
+            911,
+        )
+
+    def test_main_loads_space_specific_sizing_config(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from main import _load_config
+
+        monkeypatch.setenv("PLUGIN_TYPE", "ingest-space")
+        monkeypatch.setenv("LLM_API_KEY", "key")
+        monkeypatch.setenv("CHUNK_SIZE", "137")
+        monkeypatch.setenv("CHUNK_OVERLAP", "11")
+        monkeypatch.setenv("SUMMARY_LENGTH", "911")
+
+        config = _load_config()
+
+        assert isinstance(config, IngestSpaceConfig)
+        assert (config.chunk_size, config.chunk_overlap, config.summary_length) == (
+            137,
+            11,
+            911,
+        )
+
+    def test_startup_log_reports_effective_sizing(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        from main import _log_config
+
+        config = IngestSpaceConfig(
+            llm_api_key="key",
+            chunk_size=137,
+            chunk_overlap=11,
+            summary_length=911,
+        )
+
+        with caplog.at_level(logging.INFO, logger="main"):
+            _log_config(config)
+
+        assert "Config: CHUNK_SIZE=137" in caplog.messages
+        assert "Config: CHUNK_OVERLAP=11" in caplog.messages
+        assert "Config: SUMMARY_LENGTH=911" in caplog.messages
 
 
 class TestPerPluginOverride:

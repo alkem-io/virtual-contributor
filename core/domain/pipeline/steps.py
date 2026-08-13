@@ -411,7 +411,7 @@ class DocumentSummaryStep:
     def __init__(
         self,
         llm_port: LLMPort,
-        summary_length: int = 10000,
+        summary_length: int = 2500,
         concurrency: int = 8,
         chunk_threshold: int = 4,
         embeddings_port: EmbeddingsPort | None = None,
@@ -637,7 +637,7 @@ class BodyOfKnowledgeSummaryStep:
     def __init__(
         self,
         llm_port: LLMPort,
-        summary_length: int = 10000,
+        summary_length: int = 2500,
         max_section_chars: int = 30000,
         knowledge_store_port: "KnowledgeStorePort | None" = None,
         embeddings_port: "EmbeddingsPort | None" = None,
@@ -1014,4 +1014,3 @@ class OrphanCleanupStep:
                 len(context.orphan_ids),
                 len(context.removed_document_ids),
             )
-
