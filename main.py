@@ -33,8 +33,20 @@ def _mask_sensitive(name: str, value) -> str:
     return s
 
 
-def _log_config(config: BaseConfig) -> None:
-    """Log all configurable summarization/retrieval fields at startup."""
+def _log_config(config: BaseConfig, plugin_class: type | None = None) -> None:
+    """Log all configurable summarization/retrieval fields at startup.
+
+    Ingest sizing is logged only for plugins that actually consume it — the
+    log is the permanent detector for a silent sizing no-op, so reporting
+    values a pipeline ignores would recreate exactly the false confidence it
+    exists to prevent.
+    """
+    sizing_fields = {"chunk_size", "chunk_overlap", "summary_length"}
+    consumed = (
+        set(inspect.signature(plugin_class.__init__).parameters)
+        if plugin_class is not None
+        else sizing_fields
+    )
     fields = [
         "summarize_llm_provider",
         "summarize_llm_model",
@@ -58,16 +70,25 @@ def _log_config(config: BaseConfig) -> None:
         "pipeline_timeout",
     ]
     for name in fields:
+        if name in sizing_fields and name not in consumed:
+            continue
         value = getattr(config, name, None)
         logger.info("Config: %s=%s", name.upper(), _mask_sensitive(name, value))
 
 
 def _load_config() -> BaseConfig:
-    """Load plugin-specific configuration when it has intentional overrides."""
-    config = BaseConfig()
-    if config.plugin_type.lower() == "ingest-space":
+    """Load plugin-specific configuration when it has intentional overrides.
+
+    The plugin type is read straight from the environment rather than from a
+    probe ``BaseConfig()``: constructing the base class would validate the
+    ingest-space environment against the *shared* defaults, so a legal
+    ``CHUNK_OVERLAP`` between BaseConfig's chunk_size and IngestSpaceConfig's
+    would abort startup with an error naming a size the operator never set.
+    """
+    plugin_type = os.environ.get("PLUGIN_TYPE", "")
+    if plugin_type.lower() == "ingest-space":
         return IngestSpaceConfig()
-    return config
+    return BaseConfig()
 
 
 def _inject_plugin_config(
@@ -560,7 +581,12 @@ def main() -> None:
     config = _load_config()
     setup_logging(level=config.log_level, plugin_type=config.plugin_type)
     logger.info("Starting virtual-contributor engine with plugin: %s", config.plugin_type)
-    _log_config(config)
+    # Resolve the plugin class up front so sizing is logged only where consumed.
+    try:
+        logged_plugin_class: type | None = PluginRegistry().discover(config.plugin_type)
+    except Exception:  # discovery errors surface later in _run with full context
+        logged_plugin_class = None
+    _log_config(config, logged_plugin_class)
 
     # Expand default thread pool to prevent deadlocks when multiple
     # concurrent pipelines use asyncio.to_thread for sync LLM calls

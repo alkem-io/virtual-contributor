@@ -458,8 +458,12 @@ class TestIngestWebsitePlugin:
         # (websites are URL-identified, not UUID-keyed) — lock in the contract.
         assert result.body_of_knowledge_id == ""
 
-    async def test_chunk_size_remains_unchanged(self, plugin):
-        """Website ingestion remains at its existing 2,000-character chunks."""
+    async def test_chunking_unchanged_and_summary_length_is_shared(self, plugin):
+        """Website CHUNKING is untouched at 2,000/400 (this feature is
+        space-scoped for chunk sizing), while SUMMARY_LENGTH is a shared
+        setting: story #12's rationale — a summary is embedded as one passage,
+        so an oversized one is maximally diluted — applies to every ingest
+        path, so website summaries follow the new 2,500 default too."""
         mock_pages = [
             {
                 "url": "https://example.com",
@@ -476,9 +480,16 @@ class TestIngestWebsitePlugin:
             )
             await plugin.handle(make_ingest_website())
 
-        chunk_step = mock_engine.call_args.kwargs["batch_steps"][0]
+        batch_steps = mock_engine.call_args.kwargs["batch_steps"]
+        chunk_step = batch_steps[0]
         assert chunk_step._chunk_size == 2000
         assert chunk_step._chunk_overlap == 400
+        # Shared summary sizing: deliberate, and enforced rather than incidental.
+        summary_steps = [
+            step for step in batch_steps if hasattr(step, "_summary_length")
+        ]
+        assert summary_steps, "expected a summary step in the website pipeline"
+        assert all(step._summary_length == 2500 for step in summary_steps)
 
     async def test_empty_crawl_runs_cleanup(self):
         """When crawl returns [], cleanup deletes pre-existing chunks."""
