@@ -19,6 +19,7 @@ from core.domain.pipeline.steps import (
     EmbedStep,
     OrphanCleanupStep,
     StoreStep,
+    _root_position,
 )
 from tests.conftest import MockEmbeddingsPort, MockKnowledgeStorePort, MockLLMPort
 
@@ -3244,3 +3245,77 @@ class TestReingestionRewritesPosition:
             e["metadata"].get("subspaceId") for e in store.collections["c"]
         }
         assert remaining == {"sub-b"}
+
+
+class TestRootPositionResolution:
+    """The overview's root must resolve in every shape the pipeline produces."""
+
+    @staticmethod
+    def _doc(**kw):
+        base = dict(document_id="d", source="s")
+        base.update(kw)
+        return Document(content="x", metadata=DocumentMetadata(**base))
+
+    def test_prefers_the_root_document(self):
+        ctx = PipelineContext(
+            collection_name="c",
+            documents=[
+                self._doc(space_id="sp-1", space_name="Root", depth=0),
+                self._doc(space_id="sp-1", space_name="Root",
+                          subspace_id="sub-1", depth=1),
+            ],
+        )
+        assert _root_position(ctx) == ("sp-1", "Root")
+
+    def test_root_document_wins_regardless_of_order(self):
+        ctx = PipelineContext(
+            collection_name="c",
+            documents=[
+                self._doc(space_id="sp-1", space_name="Root",
+                          subspace_id="sub-1", depth=1),
+                self._doc(space_id="sp-1", space_name="Root", depth=0),
+            ],
+        )
+        assert _root_position(ctx) == ("sp-1", "Root")
+
+    def test_resolves_when_the_root_has_no_description(self):
+        """A space with no description emits no depth-0 document at all."""
+        ctx = PipelineContext(
+            collection_name="c",
+            documents=[
+                self._doc(space_id="sp-1", space_name="Root",
+                          subspace_id="sub-1", depth=1),
+            ],
+        )
+        assert _root_position(ctx) == ("sp-1", "Root")
+
+    def test_resolves_in_batched_finalize_where_chunks_are_empty(self):
+        """Batched mode builds the finalize context with chunks empty."""
+        ctx = PipelineContext(
+            collection_name="c",
+            documents=[self._doc(space_id="sp-1", space_name="Root", depth=0)],
+        )
+        ctx.chunks = []
+        assert _root_position(ctx) == ("sp-1", "Root")
+
+    def test_falls_back_to_chunks_when_documents_are_empty(self):
+        ctx = PipelineContext(collection_name="c", documents=[])
+        ctx.chunks = [Chunk(
+            content="x",
+            metadata=DocumentMetadata(
+                document_id="d", source="s",
+                space_id="sp-9", space_name="Nine", depth=0,
+            ),
+            chunk_index=0,
+        )]
+        assert _root_position(ctx) == ("sp-9", "Nine")
+
+    def test_website_ingestion_gets_no_fabricated_root(self):
+        ctx = PipelineContext(
+            collection_name="c", documents=[self._doc()],
+        )
+        assert _root_position(ctx) == (None, None)
+
+    def test_empty_ingestion_gets_no_root(self):
+        ctx = PipelineContext(collection_name="c", documents=[])
+        assert _root_position(ctx) == (None, None)
