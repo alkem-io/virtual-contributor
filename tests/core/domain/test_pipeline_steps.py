@@ -3053,12 +3053,38 @@ class TestChunkStepIsTypeAware:
         assert all(c.metadata.embedding_type == "overview" for c in ctx.chunks)
 
     async def test_short_document_stays_whole_for_every_type(self):
-        """Property, not a coincidence of the configured number."""
+        """A property of each kind's resolved size, not of one small number.
+
+        Derived from the strategy table rather than hard-coded, so the test
+        tracks the table: a body at the resolved size stays whole, and one
+        comfortably above it does not. A size regression would fail here
+        instead of slipping through on a body small enough to survive any
+        threshold.
+        """
+        from core.domain.pipeline.chunk_strategy import resolve_strategy
+
+        configured = 2500
         for doc_type in ("space", "subspace", "callout", "post", "knowledge"):
-            doc = _typed_doc("short body text", doc_type)
+            strategy = resolve_strategy(doc_type)
+            size = (
+                strategy.chunk_size
+                if strategy.chunk_size is not None
+                else configured
+            )
+
+            for length in (size - 1, size):
+                doc = _typed_doc("x" * length, doc_type)
+                ctx = PipelineContext(collection_name="c", documents=[doc])
+                await ChunkStep(
+                    chunk_size=configured, chunk_overlap=300,
+                ).execute(ctx)
+                assert len(ctx.chunks) == 1, f"{doc_type} at {length}"
+
+            # Negative half: comfortably above its size, it must split.
+            doc = _typed_doc("x " * size, doc_type)
             ctx = PipelineContext(collection_name="c", documents=[doc])
-            await ChunkStep(chunk_size=2500, chunk_overlap=300).execute(ctx)
-            assert len(ctx.chunks) == 1, doc_type
+            await ChunkStep(chunk_size=configured, chunk_overlap=300).execute(ctx)
+            assert len(ctx.chunks) > 1, f"{doc_type} above {size}"
 
     async def test_mixed_corpus_is_split_per_document(self):
         """One run, several kinds — each sized by its own rule."""
@@ -3307,3 +3333,67 @@ class TestDerivedDocumentIdRecognition:
 
         for doc_id in ("doc-1", "summary", "my-summary-doc", "", None):
             assert not _is_derived_document_id(doc_id), doc_id
+
+
+class TestLabelReachesTheStoreBoundary:
+    """Retrieval reads stored metadata, not the in-memory chunk.
+
+    Everything else asserts `chunk.metadata.embedding_type`. This asserts the
+    key retrieval actually reads, so a change to how metadata is written
+    cannot quietly stop the label from arriving.
+    """
+
+    async def test_overview_and_detail_are_distinguishable_in_the_store(self):
+        store = MockKnowledgeStorePort()
+        docs = [
+            _typed_doc("a description", "space", "sp-1"),
+            _typed_doc("word " * 2000, "post", "po-1"),
+        ]
+        ctx = PipelineContext(collection_name="c", documents=docs)
+        await ChunkStep(chunk_size=9000, chunk_overlap=100).execute(ctx)
+        await ContentHashStep().execute(ctx)
+        for c in ctx.chunks:
+            c.embedding = [0.1]
+        await StoreStep(knowledge_store_port=store).execute(ctx)
+
+        labels: dict[str, set[str]] = {}
+        for entry in store.collections["c"]:
+            meta = entry["metadata"]
+            labels.setdefault(meta["documentId"], set()).add(
+                meta["embeddingType"]
+            )
+
+        assert labels["sp-1"] == {"overview"}
+        assert labels["po-1"] == {"chunk"}
+
+
+class TestRetrievalPredicateShape:
+    """A retrieval predicate over content must be exclusion-shaped.
+
+    Pure vocabulary reasoning — no dependency on any particular filter module.
+    An inclusion-shaped predicate would silently drop every space and subspace
+    description from results, and nothing else in this suite would notice.
+    """
+
+    def test_exclusion_shape_admits_overview(self):
+        from core.domain.pipeline.chunk_strategy import (
+            CONTENT_EMBEDDING_TYPES,
+            EMBEDDING_TYPE_SUMMARY,
+        )
+
+        for label in CONTENT_EMBEDDING_TYPES:
+            assert label != EMBEDDING_TYPE_SUMMARY, (
+                f"an exclusion filter on {EMBEDDING_TYPE_SUMMARY!r} must admit "
+                f"{label!r}"
+            )
+
+    def test_inclusion_on_chunk_alone_would_drop_overviews(self):
+        """Stated as an assertion so the hazard is recorded, not folklore."""
+        from core.domain.pipeline.chunk_strategy import (
+            CONTENT_EMBEDDING_TYPES,
+            EMBEDDING_TYPE_CHUNK,
+            EMBEDDING_TYPE_OVERVIEW,
+        )
+
+        assert CONTENT_EMBEDDING_TYPES != {EMBEDDING_TYPE_CHUNK}
+        assert EMBEDDING_TYPE_OVERVIEW in CONTENT_EMBEDDING_TYPES
