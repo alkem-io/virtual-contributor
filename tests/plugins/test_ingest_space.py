@@ -1168,20 +1168,59 @@ class TestNameSanitisationAndTolerantIds:
         by_id = await _walk(space)
         assert by_id["sp-3"].space_name == "Real Name"
 
-    async def test_missing_callout_id_costs_only_its_own_position(self):
-        """One malformed node must not abort the whole ingestion."""
+    async def test_malformed_callout_is_skipped_not_fatal(self):
+        """One malformed node costs its own content, not the whole ingestion.
+
+        The callout has a description, so it reaches document emission — the
+        case a shallower fixture would miss. Its healthy sibling must survive
+        and no document may be emitted without a stable identity.
+        """
         space = {
             "id": "sp-4",
             "profile": {"displayName": "Root", "description": "root text"},
             "collaboration": {"calloutsSet": {"callouts": [
                 {"id": None,
-                 "framing": {"profile": {"displayName": "c",
-                                         "description": "callout text"}},
+                 "framing": {"profile": {"displayName": "bad",
+                                         "description": "has a description"}},
+                 "contributions": []},
+                {"id": "co-ok",
+                 "framing": {"profile": {"displayName": "ok",
+                                         "description": "healthy callout"}},
                  "contributions": []},
             ]}},
             "subspaces": [],
         }
-        # Does not raise; the root document is still emitted with its position.
         by_id = await _walk(space)
-        assert by_id["sp-4"].space_id == "sp-4"
-        assert by_id["sp-4"].depth == 0
+        assert set(by_id) == {"sp-4", "co-ok"}
+        assert by_id["co-ok"].callout_id == "co-ok"
+        assert all(meta.document_id for meta in by_id.values())
+
+    async def test_callout_without_an_id_key_is_skipped(self):
+        space = {
+            "id": "sp-5",
+            "profile": {"displayName": "Root", "description": "root text"},
+            "collaboration": {"calloutsSet": {"callouts": [
+                {"framing": {"profile": {"displayName": "bad",
+                                         "description": "no id key at all"}},
+                 "contributions": []},
+            ]}},
+            "subspaces": [],
+        }
+        by_id = await _walk(space)
+        assert set(by_id) == {"sp-5"}
+
+    async def test_malformed_subspace_is_skipped_with_its_subtree(self):
+        space = {
+            "id": "sp-6",
+            "profile": {"displayName": "Root", "description": "root text"},
+            "collaboration": {"calloutsSet": {"callouts": []}},
+            "subspaces": [
+                {"id": None,
+                 "profile": {"displayName": "bad", "description": "bad sub"},
+                 "collaboration": {"calloutsSet": {"callouts": []}},
+                 "subspaces": []},
+            ],
+        }
+        by_id = await _walk(space)
+        assert set(by_id) == {"sp-6"}
+        assert all(meta.document_id for meta in by_id.values())

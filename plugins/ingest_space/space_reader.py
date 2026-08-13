@@ -308,13 +308,22 @@ async def _process_space(
     `position` accumulates the tree position: the depth-0 node becomes the
     space, each deeper node becomes the nearest containing subspace.
     """
+    space_id = space.get("id")
+    if not space_id:
+        # No stable identity means the node's documents could never be
+        # change-detected or orphan-swept, so skip it and its subtree rather
+        # than emit entries that can only accumulate. One malformed node
+        # costs its own content, not the whole ingestion.
+        logger.warning("Skipping space node with no id at depth %d", depth)
+        return
+
     profile = space.get("profile") or {}
     space_name = profile.get("displayName", "") or ""
     description = profile.get("description", "") or ""
     space_url = profile.get("url", "") or None
 
     node_position = (position or _Position()).for_node(
-        space.get("id"), space_name, depth,
+        space_id, space_name, depth,
     )
 
     if description:
@@ -328,8 +337,8 @@ async def _process_space(
         _append_unique(
             documents, seen,
             content=f"{space_name}\n\n{description}",
-            document_id=space["id"],
-            source=f"space:{space['id']}",
+            document_id=space_id,
+            source=f"space:{space_id}",
             doc_type=doc_type_value,
             title=space_name,
             uri=space_url,
@@ -369,20 +378,28 @@ async def _process_callout(
     The callout keeps the tier of the node that owns it and names itself;
     its contributions inherit that and drop to the contribution tier.
     """
+    callout_id = callout.get("id")
+    if not callout_id:
+        # As for spaces: without a stable identity these documents could never
+        # be change-detected or swept, so skip the callout and its
+        # contributions instead of failing the whole ingestion.
+        logger.warning("Skipping callout with no id")
+        return
+
     framing = (callout.get("framing") or {}).get("profile") or {}
     callout_name = framing.get("displayName", "") or ""
     callout_desc = framing.get("description", "") or ""
     callout_url = framing.get("url", "") or None
 
-    callout_position = (position or _Position()).for_callout(callout.get("id"))
+    callout_position = (position or _Position()).for_callout(callout_id)
     contribution_position = callout_position.for_contribution()
 
     if callout_desc:
         _append_unique(
             documents, seen,
             content=f"{callout_name}\n\n{callout_desc}",
-            document_id=callout["id"],
-            source=f"callout:{callout['id']}",
+            document_id=callout_id,
+            source=f"callout:{callout_id}",
             doc_type=DocumentType.CALLOUT.value,
             title=callout_name,
             uri=callout_url,

@@ -652,7 +652,7 @@ class TestWebsiteHasNoTreePosition:
     them and fails the whole batch.
     """
 
-    async def test_website_entries_carry_no_hierarchy_but_do_carry_depth(self):
+    async def test_website_entries_carry_no_position_fields_at_all(self):
         store = MockKnowledgeStorePort()
         plugin = IngestWebsitePlugin(
             llm=MockLLMPort(),
@@ -678,8 +678,10 @@ class TestWebsiteHasNoTreePosition:
             assert "subspaceId" not in meta
             assert "subspaceName" not in meta
             assert "calloutId" not in meta
-            # depth is an int and always written, including its 0 default.
-            assert meta["depth"] == 0
+            # Position is all-or-nothing: no depth either. Writing a depth the
+            # fingerprint ignores would mean an unchanged page keeps its old
+            # id, the write is skipped, and the depth is silently discarded.
+            assert "depth" not in meta
 
     async def test_website_metadata_has_no_none_values(self):
         store = MockKnowledgeStorePort()

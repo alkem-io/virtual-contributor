@@ -44,6 +44,25 @@ _HIERARCHY_STRING_KEYS: tuple[tuple[str, str], ...] = (
 )
 
 
+def has_position(metadata: DocumentMetadata) -> bool:
+    """Whether this content sits anywhere in a space tree.
+
+    Position is **all-or-nothing**: content with no tree position (website
+    ingestion) stores no position fields at all and is excluded from the
+    fingerprint's position segments. The two must agree — if the fingerprint
+    ignored position while the metadata still wrote ``depth``, an unchanged
+    entry would keep its old id, the store would skip the write, and the
+    ``depth`` would be silently discarded. That is precisely the failure this
+    feature exists to fix, so the same predicate governs both.
+    """
+    return bool(
+        metadata.space_id
+        or metadata.subspace_id
+        or metadata.callout_id
+        or metadata.depth
+    )
+
+
 def hierarchy_metadata(metadata: DocumentMetadata) -> dict:
     """Render a document's tree position as storable metadata.
 
@@ -51,14 +70,17 @@ def hierarchy_metadata(metadata: DocumentMetadata) -> dict:
     whole batch it belongs to — so an unknown field is **omitted** rather than
     written as ``None`` or a blank sentinel.
 
-    ``depth`` is written unconditionally. It is an ``int`` whose most common
-    value is ``0`` (root spaces, root-level callouts, website pages); guarding
-    it with a truthiness test would silently drop it from exactly those
-    entries, so it is emitted whenever it is not ``None``.
+    ``depth`` is written whenever the content has a position at all, including
+    its falsy ``0`` (a root space, a root-level callout) — guarding it with a
+    truthiness test would drop it from exactly those entries. Content with no
+    position whatsoever stores no position fields, matching what the
+    fingerprint sees, so nothing can be silently discarded.
 
     Every path that writes to the knowledge store goes through here, so a new
     field cannot be added to one writer and forgotten in another.
     """
+    if not has_position(metadata):
+        return {}
     rendered: dict = {}
     for attr, key in _HIERARCHY_STRING_KEYS:
         value = getattr(metadata, attr, None)
@@ -74,14 +96,23 @@ def hierarchy_metadata(metadata: DocumentMetadata) -> dict:
             )
             continue
         rendered[key] = value
+    # depth is never dropped: a positioned entry missing it would be invisible
+    # to a depth filter, which is the silent gap the contract exists to
+    # prevent — and it would go missing precisely when something upstream is
+    # already wrong. Anything unusable is coerced to the root tier, loudly.
+    # bool is excluded deliberately: it is a subclass of int, and storing True
+    # would fail a `{"depth": 1}` equality filter.
     depth = getattr(metadata, "depth", None)
-    if isinstance(depth, (int, float, bool)):
+    if isinstance(depth, int) and not isinstance(depth, bool):
         rendered["depth"] = depth
-    elif depth is not None:
+    elif isinstance(depth, float):
+        rendered["depth"] = int(depth)
+    else:
         logger.warning(
-            "Dropping non-scalar depth on document %s: %r",
+            "Unusable depth on document %s (%s); storing 0",
             getattr(metadata, "document_id", "?"), type(depth).__name__,
         )
+        rendered["depth"] = 0
     return rendered
 
 
@@ -350,9 +381,11 @@ class ContentHashStep:
             # otherwise re-embed an entire space for a label change. Names are
             # display-only; scoped retrieval filters on identities.
             #
-            # Content with no tree position at all — website ingestion — keeps
-            # the fingerprint it had before this feature, so those collections
-            # are not rewritten and re-embedded to gain nothing.
+            # Position is all-or-nothing. Content with no tree position at all
+            # — website ingestion — stores no position fields and so keeps the
+            # fingerprint it had before this feature: there is nothing new to
+            # land, so skipping the rewrite discards nothing. Those collections
+            # are not re-embedded to gain nothing.
             meta = chunk.metadata
             segments = [
                 chunk.content,
@@ -361,7 +394,7 @@ class ContentHashStep:
                 meta.type,
                 meta.document_id,
             ]
-            if meta.space_id or meta.subspace_id or meta.callout_id or meta.depth:
+            if has_position(meta):
                 segments += [
                     meta.space_id or "",
                     meta.subspace_id or "",
