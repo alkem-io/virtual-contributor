@@ -29,6 +29,73 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Hierarchy metadata
+# ---------------------------------------------------------------------------
+
+#: snake_case attribute -> stored camelCase key, for the five optional
+#: identity/name fields. ``depth`` is handled separately: it is an int that is
+#: always written.
+_HIERARCHY_STRING_KEYS: tuple[tuple[str, str], ...] = (
+    ("space_id", "spaceId"),
+    ("space_name", "spaceName"),
+    ("subspace_id", "subspaceId"),
+    ("subspace_name", "subspaceName"),
+    ("callout_id", "calloutId"),
+)
+
+
+def hierarchy_metadata(metadata: DocumentMetadata) -> dict:
+    """Render a document's tree position as storable metadata.
+
+    The store accepts only scalar values and rejects ``None``, failing the
+    whole batch it belongs to — so an unknown field is **omitted** rather than
+    written as ``None`` or a blank sentinel.
+
+    ``depth`` is written unconditionally. It is an ``int`` whose most common
+    value is ``0`` (root spaces, root-level callouts, website pages); guarding
+    it with a truthiness test would silently drop it from exactly those
+    entries, so it is emitted whenever it is not ``None``.
+
+    Every path that writes to the knowledge store goes through here, so a new
+    field cannot be added to one writer and forgotten in another.
+    """
+    rendered: dict = {}
+    for attr, key in _HIERARCHY_STRING_KEYS:
+        value = getattr(metadata, attr, None)
+        if value:
+            rendered[key] = value
+    depth = getattr(metadata, "depth", None)
+    if depth is not None:
+        rendered["depth"] = depth
+    return rendered
+
+
+def _root_position(context: PipelineContext) -> tuple[str | None, str | None]:
+    """Identify the ingest root from the documents already collected.
+
+    Every document in one ingestion shares the same root, so any document
+    carrying it answers the question. Prefer a depth-0 entry, which is the
+    root's own description, and otherwise take the first document that names
+    a space at all — content-only ingestions (a space with no description)
+    still resolve correctly. Returns ``(None, None)`` when there is no tree
+    position anywhere, which is the website case.
+    """
+    fallback: tuple[str | None, str | None] = (None, None)
+    for source in (context.documents, context.chunks):
+        for item in source:
+            meta = item.metadata
+            space_id = getattr(meta, "space_id", None)
+            if not space_id:
+                continue
+            name = getattr(meta, "space_name", None)
+            if getattr(meta, "depth", None) == 0:
+                return space_id, name
+            if fallback == (None, None):
+                fallback = (space_id, name)
+    return fallback
+
+
+# ---------------------------------------------------------------------------
 # Shared refine helper
 # ---------------------------------------------------------------------------
 
@@ -258,12 +325,25 @@ class ContentHashStep:
         for chunk in context.chunks:
             if chunk.metadata.embedding_type != "chunk":
                 continue
+            # Position participates in the fingerprint, so moving a node
+            # yields a new id: the entry is rewritten at its new position and
+            # the stale one is swept as an orphan. Without this, unchanged
+            # text keeps its old id, the store skips the write entirely, and
+            # the position silently rots.
+            #
+            # Display names are deliberately excluded — a rename would
+            # otherwise re-embed an entire space for a label change. Names are
+            # display-only; scoped retrieval filters on identities.
             canonical = "\0".join([
                 chunk.content,
                 chunk.metadata.title,
                 chunk.metadata.source,
                 chunk.metadata.type,
                 chunk.metadata.document_id,
+                chunk.metadata.space_id or "",
+                chunk.metadata.subspace_id or "",
+                chunk.metadata.callout_id or "",
+                str(chunk.metadata.depth),
             ])
             chunk.content_hash = hashlib.sha256(
                 canonical.encode("utf-8")
@@ -541,12 +621,24 @@ class DocumentSummaryStep:
                             ),
                         )
                     source_meta = doc_chunks[0].metadata
+                    # A summary must report the same tree position as the
+                    # document it summarises, so retrieval scoped to a space
+                    # or subspace finds the summary alongside its content.
+                    # NB: this is a field-by-field rebuild, so every field
+                    # must be copied deliberately — `uri` is knowingly not
+                    # carried here, matching existing behaviour.
                     summary_meta = DocumentMetadata(
                         document_id=f"{doc_id}-summary",
                         source=source_meta.source,
                         type=source_meta.type,
                         title=source_meta.title,
                         embedding_type="summary",
+                        space_id=source_meta.space_id,
+                        space_name=source_meta.space_name,
+                        subspace_id=source_meta.subspace_id,
+                        subspace_name=source_meta.subspace_name,
+                        callout_id=source_meta.callout_id,
+                        depth=source_meta.depth,
                     )
                     summary_chunk = Chunk(
                         content=summary, metadata=summary_meta, chunk_index=0,
@@ -771,12 +863,18 @@ class BodyOfKnowledgeSummaryStep:
                 concurrency=5,
                 reduce_fanin=10,
             )
+            root_id, root_name = _root_position(context)
             bok_meta = DocumentMetadata(
                 document_id="body-of-knowledge-summary",
                 source="generated",
                 type="bodyOfKnowledgeSummary",
                 title="Body of Knowledge Overview",
                 embedding_type="summary",
+                # The overview spans the whole body, so it belongs to the
+                # ingest root and to no subspace or callout in particular.
+                space_id=root_id,
+                space_name=root_name,
+                depth=0,
             )
             bok_chunk = Chunk(content=bok_summary, metadata=bok_meta, chunk_index=0)
 
@@ -798,6 +896,10 @@ class BodyOfKnowledgeSummaryStep:
                             "title": bok_meta.title,
                             "embeddingType": bok_meta.embedding_type,
                             "chunkIndex": 0,
+                            # This inline write bypasses StoreStep, so the
+                            # position must be rendered here too — through the
+                            # same helper, so the two paths cannot diverge.
+                            **hierarchy_metadata(bok_meta),
                         }],
                         ids=[f"{bok_meta.document_id}-0"],
                         embeddings=[embeddings[0]],
@@ -923,6 +1025,7 @@ class StoreStep:
                 }
                 if getattr(c.metadata, "uri", None):
                     meta_entry["uri"] = c.metadata.uri
+                meta_entry.update(hierarchy_metadata(c.metadata))
                 metadatas.append(meta_entry)
                 ids.append(storage_id)
             batch_embeddings = [c.embedding for c in batch]
