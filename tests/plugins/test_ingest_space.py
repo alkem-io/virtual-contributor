@@ -876,3 +876,253 @@ class TestIngestSpacePluginDispatchesOnType:
         assert embeddings.calls == []
         assert embeddings.query_calls == []
         assert store.deleted == []
+
+
+def _nested_space_fixture() -> dict:
+    """A space tree covering every level and every contribution kind.
+
+    root (sp-1)
+      ├── callout co-root
+      ├── L1 subspace sub-1
+      │     └── callout co-l1  ── post / whiteboard / link
+      └── L2 subspace sub-2 (nested under sub-1)
+            └── callout co-l2
+    """
+    return {
+        "id": "sp-1",
+        "profile": {
+            "displayName": "Root Space",
+            "description": "The root description",
+            "url": "https://example.test/sp-1",
+        },
+        "collaboration": {"calloutsSet": {"callouts": [
+            {
+                "id": "co-root",
+                "framing": {"profile": {
+                    "displayName": "Root Callout",
+                    "description": "Root callout description",
+                }},
+                "contributions": [],
+            },
+        ]}},
+        "subspaces": [
+            {
+                "id": "sub-1",
+                "profile": {
+                    "displayName": "First Level",
+                    "description": "L1 description",
+                },
+                "collaboration": {"calloutsSet": {"callouts": [
+                    {
+                        "id": "co-l1",
+                        "framing": {"profile": {
+                            "displayName": "L1 Callout",
+                            "description": "L1 callout description",
+                        }},
+                        "contributions": [
+                            {"post": {
+                                "id": "post-1",
+                                "profile": {
+                                    "displayName": "A Post",
+                                    "description": "Post body text",
+                                },
+                            }},
+                            {"whiteboard": {
+                                "id": "wb-1",
+                                "content": "Whiteboard scene text",
+                                "profile": {"displayName": "A Whiteboard"},
+                            }},
+                            {"link": {
+                                "id": "link-1",
+                                "uri": "https://example.test/doc",
+                                "profile": {
+                                    "displayName": "A Link",
+                                    "description": "Link description",
+                                },
+                            }},
+                        ],
+                    },
+                ]}},
+                "subspaces": [
+                    {
+                        "id": "sub-2",
+                        "profile": {
+                            "displayName": "Second Level",
+                            "description": "L2 description",
+                        },
+                        "collaboration": {"calloutsSet": {"callouts": [
+                            {
+                                "id": "co-l2",
+                                "framing": {"profile": {
+                                    "displayName": "L2 Callout",
+                                    "description": "L2 callout description",
+                                }},
+                                "contributions": [],
+                            },
+                        ]}},
+                        "subspaces": [],
+                    },
+                ],
+            },
+        ],
+    }
+
+
+async def _walk(space: dict, **kwargs) -> dict:
+    """Run the reader and index the emitted documents by document_id."""
+    documents: list = []
+    await _process_space(
+        space, documents, set(),
+        graphql_client=_mock_graphql_client(),
+        stats=_default_stats(), depth=0, **kwargs,
+    )
+    return {d.metadata.document_id: d.metadata for d in documents}
+
+
+class TestHierarchyPosition:
+    """Every emitted document records where in the tree it came from."""
+
+    async def test_full_tree_positions(self):
+        by_id = await _walk(_nested_space_fixture())
+
+        # Expected (space_id, subspace_id, callout_id, depth) per document.
+        expected = {
+            "sp-1":     ("sp-1", None,    None,      0),  # root description
+            "co-root":  ("sp-1", None,    "co-root", 0),  # callout keeps owner tier
+            "sub-1":    ("sp-1", "sub-1", None,      1),
+            "co-l1":    ("sp-1", "sub-1", "co-l1",   1),
+            "post-1":   ("sp-1", "sub-1", "co-l1",   3),
+            "wb-1":     ("sp-1", "sub-1", "co-l1",   3),
+            "link-1":   ("sp-1", "sub-1", "co-l1",   3),
+            "sub-2":    ("sp-1", "sub-2", None,      2),  # nearest subspace is itself
+            "co-l2":    ("sp-1", "sub-2", "co-l2",   2),
+        }
+        assert set(by_id) == set(expected)
+        for doc_id, (space_id, subspace_id, callout_id, depth) in expected.items():
+            meta = by_id[doc_id]
+            assert meta.space_id == space_id, doc_id
+            assert meta.subspace_id == subspace_id, doc_id
+            assert meta.callout_id == callout_id, doc_id
+            assert meta.depth == depth, doc_id
+
+    async def test_space_id_identical_at_every_level(self):
+        by_id = await _walk(_nested_space_fixture())
+        assert {m.space_id for m in by_id.values()} == {"sp-1"}
+
+    async def test_display_names_recorded(self):
+        by_id = await _walk(_nested_space_fixture())
+        assert by_id["sp-1"].space_name == "Root Space"
+        assert by_id["sub-2"].subspace_name == "Second Level"
+        assert by_id["post-1"].space_name == "Root Space"
+        assert by_id["post-1"].subspace_name == "First Level"
+
+    async def test_position_invariants_hold(self):
+        """subspace_id present => depth >= 1; depth 0 => no subspace."""
+        by_id = await _walk(_nested_space_fixture())
+        for doc_id, meta in by_id.items():
+            if meta.subspace_id is not None:
+                assert meta.depth >= 1, doc_id
+            if meta.depth == 0:
+                assert meta.subspace_id is None, doc_id
+
+    async def test_l2_reports_itself_not_its_l1_ancestor(self):
+        """The nearest containing subspace wins — not the first-level one."""
+        by_id = await _walk(_nested_space_fixture())
+        assert by_id["sub-2"].subspace_id == "sub-2"
+        assert by_id["co-l2"].subspace_id == "sub-2"
+
+    async def test_blank_name_leaves_name_unknown(self):
+        """A known identity with a blank name records the id, not a blank."""
+        space = {
+            "id": "sp-blank",
+            "profile": {"displayName": "", "description": "Has no name"},
+            "collaboration": {"calloutsSet": {"callouts": []}},
+            "subspaces": [],
+        }
+        by_id = await _walk(space)
+        assert by_id["sp-blank"].space_id == "sp-blank"
+        assert by_id["sp-blank"].space_name is None
+
+    async def test_long_name_capped(self):
+        space = {
+            "id": "sp-long",
+            "profile": {"displayName": "N" * 500, "description": "Long name"},
+            "collaboration": {"calloutsSet": {"callouts": []}},
+            "subspaces": [],
+        }
+        by_id = await _walk(space)
+        assert len(by_id["sp-long"].space_name or "") == 200
+
+    async def test_flat_knowledge_base_has_no_subspace(self):
+        """The flat case falls out of the depth-0 rule — no special casing."""
+        kb_shaped = {
+            "id": "kb-1",
+            "profile": {"displayName": "A Knowledge Base", "description": "KB"},
+            "collaboration": {"calloutsSet": {"callouts": [
+                {
+                    "id": "co-kb",
+                    "framing": {"profile": {
+                        "displayName": "KB Callout",
+                        "description": "KB callout description",
+                    }},
+                    "contributions": [
+                        {"post": {
+                            "id": "kb-post",
+                            "profile": {
+                                "displayName": "KB Post",
+                                "description": "KB post body",
+                            },
+                        }},
+                    ],
+                },
+            ]}},
+            "subspaces": [],
+        }
+        by_id = await _walk(
+            kb_shaped, top_doc_type=DocumentType.KNOWLEDGE.value,
+        )
+        assert by_id["kb-1"].space_id == "kb-1"
+        assert by_id["kb-1"].subspace_id is None
+        assert by_id["kb-1"].depth == 0
+        assert by_id["co-kb"].callout_id == "co-kb"
+        assert by_id["co-kb"].subspace_id is None
+        assert by_id["co-kb"].depth == 0
+        assert by_id["kb-post"].callout_id == "co-kb"
+        assert by_id["kb-post"].depth == 3
+
+
+class TestMixedCorpusRetrieval:
+    """Legacy entries stay retrievable; a positive scope narrows deliberately."""
+
+    async def _seeded_store(self) -> MockKnowledgeStorePort:
+        store = MockKnowledgeStorePort()
+        await store.ingest(
+            collection="c",
+            documents=["legacy text", "new text"],
+            metadatas=[
+                # Ingested before this feature — carries no position at all.
+                {"documentId": "old-1", "embeddingType": "chunk"},
+                {"documentId": "new-1", "embeddingType": "chunk",
+                 "spaceId": "sp-1", "depth": 0},
+            ],
+            ids=["old-1-0", "new-1-0"],
+            embeddings=[[0.1], [0.2]],
+        )
+        return store
+
+    async def test_unscoped_returns_legacy_and_new(self):
+        store = await self._seeded_store()
+        result = await store.get(collection="c", include=["metadatas"])
+        assert set(result.ids) == {"old-1-0", "new-1-0"}
+
+    async def test_positive_scope_excludes_legacy_entries(self):
+        """Documented narrowing: absent keys do not match a positive scope.
+
+        Pinned as an expected decision so consumers (#18/#19) treat a mixed
+        corpus as the default state rather than discovering this in production.
+        """
+        store = await self._seeded_store()
+        result = await store.get(
+            collection="c", where={"spaceId": "sp-1"}, include=["metadatas"],
+        )
+        assert result.ids == ["new-1-0"]

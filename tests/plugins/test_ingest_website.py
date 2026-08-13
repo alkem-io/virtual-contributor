@@ -642,3 +642,62 @@ class TestIngestWebsiteSummarizationBehavior:
         finalize_names = [type(s).__name__ for s in call_kwargs.kwargs["finalize_steps"]]
         assert "DocumentSummaryStep" not in batch_names
         assert "BodyOfKnowledgeSummaryStep" not in finalize_names
+
+
+class TestWebsiteHasNoTreePosition:
+    """Website ingestion shares the storage path but has no space tree.
+
+    It must complete unchanged: no fabricated position, no errors, and — the
+    failure mode that matters — no None values reaching a store that rejects
+    them and fails the whole batch.
+    """
+
+    async def test_website_entries_carry_no_hierarchy_but_do_carry_depth(self):
+        store = MockKnowledgeStorePort()
+        plugin = IngestWebsitePlugin(
+            llm=MockLLMPort(),
+            embeddings=MockEmbeddingsPort(),
+            knowledge_store=store,
+        )
+        event = make_ingest_website()
+        mock_pages = [
+            {"url": "https://example.com",
+             "html": "<p>Some substantial page content for ingestion.</p>"},
+        ]
+
+        with patch("plugins.ingest_website.plugin.crawl", return_value=mock_pages):
+            result = await plugin.handle(event)
+
+        assert isinstance(result, IngestWebsiteResult)
+        entries = store.collections["example.com-knowledge"]
+        assert entries, "website ingestion stored nothing"
+        for entry in entries:
+            meta = entry["metadata"]
+            assert "spaceId" not in meta
+            assert "spaceName" not in meta
+            assert "subspaceId" not in meta
+            assert "subspaceName" not in meta
+            assert "calloutId" not in meta
+            # depth is an int and always written, including its 0 default.
+            assert meta["depth"] == 0
+
+    async def test_website_metadata_has_no_none_values(self):
+        store = MockKnowledgeStorePort()
+        plugin = IngestWebsitePlugin(
+            llm=MockLLMPort(),
+            embeddings=MockEmbeddingsPort(),
+            knowledge_store=store,
+        )
+        event = make_ingest_website()
+        mock_pages = [
+            {"url": "https://example.com",
+             "html": "<p>Some substantial page content for ingestion.</p>"},
+        ]
+
+        with patch("plugins.ingest_website.plugin.crawl", return_value=mock_pages):
+            await plugin.handle(event)
+
+        for entry in store.collections["example.com-knowledge"]:
+            for key, value in entry["metadata"].items():
+                assert value is not None, key
+                assert isinstance(value, (str, int)), key
