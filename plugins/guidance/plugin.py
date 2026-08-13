@@ -83,7 +83,10 @@ class GuidancePlugin:
                 if result.documents:
                     for i, doc in enumerate(result.documents[0]):
                         distance = result.distances[0][i] if result.distances else 1.0
-                        score = 1.0 - distance
+                        # No distance means the passage was matched literally,
+                        # not by similarity — there is no score to report, and
+                        # inventing one would misrepresent it as a semantic hit.
+                        score = None if distance is None else 1.0 - distance
                         docs.append(doc)
                         meta = result.metadatas[0][i] if result.metadatas else {}
                         source_url = meta.get("source", collection)
@@ -104,13 +107,21 @@ class GuidancePlugin:
         for docs, sources in query_results:
             all_pairs.extend(zip(docs, sources))
 
-        # Sort by relevance (highest score first)
-        all_pairs.sort(key=lambda p: p[1].score or 0, reverse=True)
+        # Sort by relevance (highest score first). A literal match has no score
+        # to sort by; it is ordered after the scored passages rather than being
+        # treated as the least relevant possible result.
+        all_pairs.sort(
+            key=lambda p: (p[1].score is not None, p[1].score or 0.0),
+            reverse=True,
+        )
 
-        # Filter by score threshold — discard low-relevance chunks
+        # Filter by score threshold — discard low-relevance chunks. A passage
+        # with no score was matched literally rather than by similarity, so the
+        # threshold does not apply to it; treating its absent score as 0 would
+        # drop exactly the exact-name matches the lexical arm exists to find.
         all_pairs = [
             (doc, src) for doc, src in all_pairs
-            if (src.score or 0) >= self._score_threshold
+            if src.score is None or src.score >= self._score_threshold
         ]
 
         # Deduplicate by source URL, keeping the highest-scoring chunk per page

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from typing import Any, Protocol
 
 import chromadb
@@ -70,8 +71,79 @@ class ChromaDBAdapter:
             return QueryResult(
                 documents=results.get("documents", []),
                 metadatas=results.get("metadatas", []),
-                distances=results.get("distances", []),
+                distances=results.get("distances") or [],
                 ids=results.get("ids", []),
+            )
+
+        return await self._retry(_query)
+
+    @staticmethod
+    def _document_predicate(terms: list[str]) -> dict:
+        """Build a case-insensitive literal-match predicate over document text.
+
+        ``$regex`` rather than ``$contains``: the latter is case-sensitive, so
+        a member asking about "traefik" would not match a passage saying
+        "Traefik" — silently failing at exactly the exact-name matching this
+        arm exists to provide.
+
+        Every term is escaped. A member's query is text, not a pattern: left
+        raw, punctuation like ``C++`` changes what matches, and an unbalanced
+        bracket is rejected by the store outright, so a member's own question
+        would error their own search.
+
+        A single term uses the bare form — the store rejects a one-element
+        ``$or``.
+        """
+        predicates = [
+            {"$regex": f"(?i){re.escape(term)}"} for term in terms
+        ]
+        if len(predicates) == 1:
+            return predicates[0]
+        return {"$or": predicates}
+
+    async def query_lexical(
+        self,
+        collection: str,
+        terms: list[str],
+        n_results: int = 10,
+    ) -> QueryResult:
+        if not terms:
+            # Nothing to match literally — say so without troubling the store.
+            return QueryResult(documents=[[]], metadatas=[[]], distances=[[]], ids=[[]])
+        if self._embeddings is None:
+            raise ValueError(
+                "ChromaDBAdapter requires an embeddings provider when "
+                "embedding_function=None"
+            )
+
+        # The store has no text-only query: a vector is still required, and the
+        # document predicate narrows the candidates it ranks.
+        query_embeddings = await self._embeddings.embed_query([" ".join(terms)])
+        where_document = self._document_predicate(terms)
+
+        def _query():
+            col = self._client.get_or_create_collection(
+                collection,
+                embedding_function=None,
+                metadata={"hnsw:space": self._distance_fn},
+            )
+            results = col.query(
+                query_embeddings=query_embeddings,
+                n_results=n_results,
+                where_document=where_document,
+            )
+            ids = results.get("ids", []) or [[]]
+            # Matching is a yes/no, so there is no lexical distance to report.
+            # None rather than 0.0: a fabricated zero would read downstream as
+            # a perfect semantic match.
+            distances: list[list[float | None]] = [
+                [None] * len(row) for row in ids
+            ]
+            return QueryResult(
+                documents=results.get("documents", []) or [[]],
+                metadatas=results.get("metadatas", []) or [[]],
+                distances=distances,
+                ids=ids,
             )
 
         return await self._retry(_query)

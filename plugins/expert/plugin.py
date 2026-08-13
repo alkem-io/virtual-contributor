@@ -27,10 +27,18 @@ def _filter_and_format(
 
     kept_docs, kept_distances, kept_metadatas, kept_ids = [], [], [], []
     for i, doc in enumerate(docs):
-        score = 1.0 - distances[i] if i < len(distances) else 0.0
-        if score >= score_threshold:
+        distance = distances[i] if i < len(distances) else None
+        # A passage found by literal matching has no semantic distance. The
+        # threshold is defined on that distance, so it has nothing to say about
+        # such a passage — dropping it would discard exactly the exact-name
+        # match the lexical arm was added to find.
+        if distance is None:
+            keep = True
+        else:
+            keep = (1.0 - distance) >= score_threshold
+        if keep:
             kept_docs.append(doc)
-            kept_distances.append(distances[i] if i < len(distances) else 1.0)
+            kept_distances.append(distance)
             kept_metadatas.append(metadatas[i] if i < len(metadatas) else {})
             kept_ids.append(ids[i] if i < len(ids) else "")
 
