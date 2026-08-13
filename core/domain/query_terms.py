@@ -45,6 +45,21 @@ STOP_WORDS: frozenset[str] = frozenset({
 })
 
 
+def _looks_like_an_identifier(raw: str) -> bool:
+    """Whether a short word is a name rather than filler.
+
+    Two signals, both cheap and both about how the member wrote it: it is not
+    all-lowercase (``AI``, ``S3``, ``GDPR``), or it mixes letters and digits
+    (``v2``, ``k8s``). Ordinary short words — "is", "the", "and" — match
+    neither.
+    """
+    if len(raw) < 2:
+        return False
+    if raw != raw.lower():
+        return True
+    return any(c.isdigit() for c in raw) and any(c.isalpha() for c in raw)
+
+
 def extract_terms(text: str, *, min_len: int, max_terms: int) -> list[str]:
     """Pull the terms worth matching literally out of a question.
 
@@ -64,8 +79,13 @@ def extract_terms(text: str, *, min_len: int, max_terms: int) -> list[str]:
     for raw in _WORD_SPLIT_RE.split(text):
         if not raw:
             continue
+        if len(raw) > MAX_TERM_LEN:
+            continue
         term = raw.casefold()
-        if len(term) < min_len or len(term) > MAX_TERM_LEN:
+        if len(term) < min_len and not _looks_like_an_identifier(raw):
+            # Short words are usually filler, but the short ones that are not —
+            # AI, S3, v2, GDPR — are precisely the names this arm exists to
+            # match. A length rule alone throws them away.
             continue
         if term in STOP_WORDS:
             continue

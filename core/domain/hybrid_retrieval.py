@@ -67,6 +67,20 @@ async def retrieve(
             collection=collection, query_texts=[query], n_results=n_results,
         )
 
+    query_lexical = getattr(store, "query_lexical", None)
+    if query_lexical is None:
+        # A store predating this feature. Retrieval is still correct without a
+        # lexical arm, so the request proceeds rather than failing on a
+        # capability it never needed.
+        logger.warning(
+            "Hybrid retrieval is enabled but %s provides no lexical query; "
+            "using semantic results only",
+            type(store).__name__,
+        )
+        return await store.query(
+            collection=collection, query_texts=[query], n_results=n_results,
+        )
+
     terms = extract_terms(
         query,
         min_len=config.hybrid_min_term_len,
@@ -88,7 +102,7 @@ async def retrieve(
         store.query(
             collection=collection, query_texts=[query], n_results=n_results,
         ),
-        store.query_lexical(
+        query_lexical(
             collection=collection, terms=terms, n_results=n_results,
         ),
         return_exceptions=True,
@@ -98,10 +112,12 @@ async def retrieve(
         raise dense_result
 
     if isinstance(lexical_result, BaseException):
+        # The exception type, not its message: a store error can echo the
+        # member's own query terms back into the log.
         logger.warning(
-            "Lexical retrieval failed for collection %s, continuing with "
-            "semantic results only: %s",
-            collection, lexical_result,
+            "Lexical retrieval failed for collection %s (%s), continuing with "
+            "semantic results only",
+            collection, type(lexical_result).__name__,
         )
         lexical_result = _empty()
 

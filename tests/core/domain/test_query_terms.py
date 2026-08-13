@@ -77,3 +77,25 @@ class TestPayloadIsBounded:
         terms = _terms(query)
         assert all(len(t) <= MAX_TERM_LEN for t in terms)
         assert sum(len(t) for t in terms) <= 8 * MAX_TERM_LEN
+
+
+class TestShortIdentifiersSurvive:
+    """A length rule alone throws away the names this arm exists to match."""
+
+    def test_uppercase_acronyms_are_kept(self):
+        for query, expected in [
+            ("what is AI governance", "ai"),
+            ("GDPR compliance rules", "gdpr"),
+            ("the S3 bucket policy", "s3"),
+        ]:
+            assert expected in _terms(query), query
+
+    def test_letter_digit_identifiers_are_kept(self):
+        assert "v2" in _terms("upgrade to v2")
+        assert "k8s" in _terms("a k8s cluster")
+
+    def test_ordinary_short_filler_is_still_dropped(self):
+        assert _terms("is it the and or a of to") == []
+
+    def test_a_single_character_is_never_an_identifier(self):
+        assert _terms("a X b") == []

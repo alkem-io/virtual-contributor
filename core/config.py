@@ -3,6 +3,7 @@ from __future__ import annotations
 from enum import Enum
 
 import logging
+import math
 
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings
@@ -166,6 +167,16 @@ class BaseConfig(BaseSettings):
         if self.hybrid_rrf_k <= 0:
             raise ValueError(
                 f"HYBRID_RRF_K must be greater than 0, got {self.hybrid_rrf_k}"
+            )
+        if not math.isfinite(self.hybrid_dense_weight) or not math.isfinite(
+            self.hybrid_lexical_weight
+        ):
+            # NaN compares false against everything, so it would slip past the
+            # bounds below and then make every ordering comparison arbitrary.
+            raise ValueError(
+                "HYBRID_DENSE_WEIGHT and HYBRID_LEXICAL_WEIGHT must be finite "
+                f"numbers, got {self.hybrid_dense_weight} and "
+                f"{self.hybrid_lexical_weight}"
             )
         if self.hybrid_dense_weight < 0:
             raise ValueError(
