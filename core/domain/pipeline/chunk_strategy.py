@@ -46,10 +46,12 @@ OVERVIEW_MAX_CHARS = 8000
 def is_content(embedding_type: str | None) -> bool:
     """Whether an entry is primary content rather than a derived artifact.
 
-    An absent or ``None`` value counts as content. Entries written before the
-    embedding type existed carry no such key, and treating them as non-content
-    would make the entire legacy corpus invisible to change detection — every
-    one of those entries would be re-embedded forever and never swept.
+    A missing value counts as content. This is defensive totality, not a claim
+    about historical data: every revision of the pipeline has written the
+    label, so an unlabelled entry is not expected to exist. Defaulting an
+    unknown entry to content is the safe direction — it may cost a redundant
+    re-embed, whereas the opposite makes the entry invisible to change
+    detection and so impossible to ever sweep.
     """
     if embedding_type is None:
         return True

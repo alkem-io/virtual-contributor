@@ -273,10 +273,18 @@ class ChunkStep:
             if strategy.chunk_overlap is not None
             else self._chunk_overlap
         )
-        # An overlap at or above the size makes the splitter loop; clamp rather
-        # than fail, since the sizes come from config that 042 also tunes.
+        # An overlap at or above the size is a misconfiguration the splitter
+        # rejects outright. Clamp to zero — the neutral value, since the
+        # configured one is meaningless — but say so loudly: silently running
+        # at some invented overlap would multiply passages, and every extra
+        # passage is an extra embedding paid for indefinitely.
         if overlap >= size:
-            overlap = max(0, size // 2)
+            logger.warning(
+                "Chunk overlap %d is not below chunk size %d; using 0. "
+                "Check the configured chunk sizing.",
+                overlap, size,
+            )
+            overlap = 0
         return RecursiveCharacterTextSplitter(
             chunk_size=size, chunk_overlap=overlap,
         )
@@ -416,20 +424,21 @@ class ChangeDetectionStep:
         if all_existing.metadatas:
             for meta in all_existing.metadatas:
                 doc_id_val = meta.get("documentId")
-                # Absent key => legacy entry, counted as content; excluding it
-                # would make the whole pre-embeddingType corpus invisible here
-                # and so never sweepable.
+                label = meta.get("embeddingType")
+                # These ids feed the removed-document set, and anything landing
+                # there is deleted outright. An unlabelled entry is treated as
+                # content, which is the safe default in general — but it cannot
+                # distinguish a passage from a summary, and deleting a summary
+                # is effectively permanent (one is regenerated only when its
+                # source document changes). So where, and only where, the label
+                # is missing, fall back to the synthetic id conventions.
                 #
-                # But "absent" cannot distinguish a legacy passage from a
-                # legacy summary, and the ids below feed the removed-document
-                # set: a summary landing there is deleted outright. So an entry
-                # that is recognisably a derived artifact by its id is excluded
-                # regardless of its label. A per-document summary is only ever
-                # regenerated when its source document changes, so deleting one
-                # is permanent until an unrelated edit happens to restore it.
-                if _is_derived_document_id(doc_id_val):
+                # Scoped to the unlabelled case deliberately: document ids on
+                # the website path are page URLs, so a page whose slug happens
+                # to end in "-summary" would otherwise never be swept.
+                if label is None and _is_derived_document_id(doc_id_val):
                     continue
-                if not is_content(meta.get("embeddingType")):
+                if not is_content(label):
                     continue
                 if doc_id_val:
                     existing_doc_ids.add(doc_id_val)

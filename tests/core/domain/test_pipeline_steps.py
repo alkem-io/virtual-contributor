@@ -3079,14 +3079,36 @@ class TestChunkStepIsTypeAware:
         assert len(by_doc["po-1"]) > 1          # 10,000 chars at the 2,000 band
         assert len(by_doc["co-1"]) == 1         # short, inherits 9,000
 
-    async def test_overlap_at_or_above_size_is_clamped_not_fatal(self):
-        """Sizes come from config that another feature also tunes."""
+    async def test_overlap_at_or_above_size_clamps_to_zero_and_warns(
+        self, caplog,
+    ):
+        """A misconfiguration must not silently multiply embedding spend.
+
+        The splitter rejects an overlap at or above the size, so it has to be
+        clamped — but to zero, the neutral value, and loudly. Clamping to some
+        invented fraction would inflate the passage count permanently, and
+        every extra passage is an extra embedding paid for on every run.
+        """
+        import logging
+
         doc = _typed_doc("word " * 400, "callout")
         ctx = PipelineContext(collection_name="c", documents=[doc])
-        await ChunkStep(chunk_size=200, chunk_overlap=500).execute(ctx)
+        with caplog.at_level(logging.WARNING):
+            await ChunkStep(chunk_size=200, chunk_overlap=500).execute(ctx)
 
         assert ctx.chunks, "chunking must still produce passages"
-        assert not ctx.errors
+        assert any(
+            "overlap" in record.message.lower() for record in caplog.records
+        ), "the misconfiguration must be surfaced, not swallowed"
+
+        sane = PipelineContext(
+            collection_name="c",
+            documents=[_typed_doc("word " * 400, "callout")],
+        )
+        await ChunkStep(chunk_size=200, chunk_overlap=0).execute(sane)
+        assert len(ctx.chunks) == len(sane.chunks), (
+            "clamping must not inflate the passage count"
+        )
 
 
 class TestOverviewParticipatesInTheContentLifecycle:
