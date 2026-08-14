@@ -70,13 +70,22 @@ class LexicalReranker:
     #: Min-max normalisation pins the best-vector candidate to exactly 1.0 and
     #: the worst to exactly 0.0. So for the case this feature exists for — the
     #: passage holding the query's terms is *worst* on vector distance and best
-    #: on lexical overlap — the two blended scores come out as ``w`` and
-    #: ``1-w``. They are equal at exactly 0.5, and the stable sort then keeps
-    #: the incumbent ahead. At the arithmetic midpoint the feature provably
-    #: cannot promote that passage however strong its match.
+    #: on lexical overlap — the blended scores are ``w`` for that passage and
+    #: ``(1-w) + w*L0`` for the incumbent, where ``L0`` is the incumbent's own
+    #: normalised lexical score. Promotion therefore needs::
     #:
-    #: 0.6 clears the boundary with margin while staying close enough to the
-    #: middle that vector similarity still leads and lexical overlap corrects.
+    #:     w > 1 / (2 - L0)
+    #:
+    #: When the incumbent shares none of the query's wording (``L0 = 0``) that
+    #: is ``w > 0.5`` — so at exactly 0.5 the two tie, the stable sort keeps
+    #: the incumbent, and the feature provably cannot promote the passage it
+    #: exists to promote.
+    #:
+    #: 0.6 clears that boundary for ``L0 < 1/3``. It is **not** a general
+    #: guarantee: where the best-vector passage also carries moderate lexical
+    #: overlap (``L0 = 0.4`` needs ``w > 0.625``) promotion still will not
+    #: happen. The value is chosen to clear the strict case while keeping
+    #: vector similarity in the lead; it is not tuned against a corpus.
     DEFAULT_LEXICAL_WEIGHT = 0.6
 
     def __init__(self, lexical_weight: float = DEFAULT_LEXICAL_WEIGHT) -> None:
@@ -98,6 +107,16 @@ class LexicalReranker:
         """
         if not documents:
             return []
+
+        if len(vector_scores) != len(documents):
+            # Stated rather than tolerated. Too few scores would raise an
+            # opaque IndexError deep in the blend; too many would be silently
+            # truncated by zip, hiding a caller bug that misaligns every
+            # subsequent citation.
+            raise ValueError(
+                f"vector_scores has {len(vector_scores)} entries for "
+                f"{len(documents)} documents; they must be parallel"
+            )
 
         scores = blend(
             vector_scores, lexical_scores(query, documents), self._lexical_weight,

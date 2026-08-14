@@ -18,7 +18,6 @@ def _apply_rerank(
     reranker: RerankerPort,
     query: str,
     result: QueryResult,
-    top_k: int,
 ) -> QueryResult:
     """Re-order a result set, keeping its four parallel lists in step.
 
@@ -26,6 +25,14 @@ def _apply_rerank(
     holds must be permuted the same way. Getting this wrong would not raise —
     it would attribute one passage's text to another passage's source URL and
     cite it confidently, which is worse than an error.
+
+    **Reorders only; never truncates.** Cutting to top-K here would hand the
+    relevance threshold a pre-filtered list, and re-ranking legitimately lifts
+    term-matching passages that are *below* the threshold. Those would then
+    occupy the whole top-K and be discarded by the threshold immediately
+    after, leaving the answer with fewer sources than it had before
+    re-ranking — or none at all, silently ungrounded. Truncation belongs
+    after the threshold, where the caller does it.
 
     Distances are carried through **unmodified**, only reordered. The blended
     ranking score is deliberately not written back: it is normalised across the
@@ -48,13 +55,13 @@ def _apply_rerank(
         for i in range(len(docs))
     ]
 
-    order = reranker.rerank(query, docs, vector_scores, top_k=top_k)
+    order = reranker.rerank(query, docs, vector_scores)
 
     # Logged so an operator can see the stage is running and what it costs
     # without having to reason about it from answer quality alone.
     logger.info(
-        "Re-ranked %d candidates to %d in %.1fms",
-        len(docs), len(order), (time.perf_counter() - started) * 1000,
+        "Re-ranked %d candidates in %.1fms",
+        len(docs), (time.perf_counter() - started) * 1000,
     )
 
     return QueryResult(
@@ -146,7 +153,30 @@ class ExpertPlugin:
         """Re-order candidates when re-ranking is on; otherwise pass through."""
         if self._reranker is None:
             return result
-        return _apply_rerank(self._reranker, query, result, self._rerank_top_k)
+        return _apply_rerank(self._reranker, query, result)
+
+    def _truncate_to_top_k(
+        self, docs: list[str], result: QueryResult,
+    ) -> tuple[list[str], QueryResult]:
+        """Keep the best K of what survived the threshold.
+
+        Deliberately after `_filter_and_format`, not before. Re-ranking lifts
+        term-matching passages that may sit below the relevance threshold; if
+        the cut happened first those would fill the whole top-K and then be
+        discarded, leaving fewer sources than before re-ranking — possibly
+        none. Filtering first, then cutting, means K good passages are kept
+        whenever K good passages exist.
+        """
+        if self._reranker is None:
+            return docs, result
+
+        k = self._rerank_top_k
+        return docs[:k], QueryResult(
+            documents=[(result.documents[0] if result.documents else [])[:k]],
+            metadatas=[(result.metadatas[0] if result.metadatas else [])[:k]],
+            distances=[(result.distances[0] if result.distances else [])[:k]],
+            ids=[(result.ids[0] if result.ids else [])[:k]],
+        )
 
     async def startup(self) -> None:
         logger.info("ExpertPlugin started")
@@ -222,6 +252,7 @@ class ExpertPlugin:
         score_threshold = self._score_threshold
         enforce_budget = self._enforce_context_budget
         maybe_rerank = self._maybe_rerank
+        truncate_to_top_k = self._truncate_to_top_k
 
         async def retrieve_node(state: dict) -> dict:
             query = (
@@ -237,6 +268,7 @@ class ExpertPlugin:
             # was retrieved on.
             result = maybe_rerank(query, result)
             docs, filtered_result = _filter_and_format(result, score_threshold)
+            docs, filtered_result = truncate_to_top_k(docs, filtered_result)
             docs, filtered_result = enforce_budget(docs, filtered_result)
             knowledge = "\n".join(docs)
             # The expert state schema expects ``combined_knowledge_docs``
@@ -297,6 +329,7 @@ class ExpertPlugin:
         )
         result = self._maybe_rerank(event.message, result)
         docs, result = _filter_and_format(result, self._score_threshold)
+        docs, result = self._truncate_to_top_k(docs, result)
         docs, result = self._enforce_context_budget(docs, result)
         knowledge = "\n".join(docs)
 

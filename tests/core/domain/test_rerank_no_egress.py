@@ -26,8 +26,10 @@ from core.domain.rerank import LexicalReranker
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
-#: Every module on the re-ranking path.
-_RERANK_MODULES = (
+#: Entry points to the re-ranking path. The scan walks outward from these
+#: through first-party imports, so a module added later is covered without
+#: anyone remembering to list it here — the failure mode a fixed list has.
+_RERANK_ENTRY_MODULES = (
     "core/ports/reranker.py",
     "core/domain/rerank.py",
     "core/domain/lexical_score.py",
@@ -37,6 +39,7 @@ _RERANK_MODULES = (
 _FORBIDDEN_IMPORTS = frozenset({
     "httpx", "requests", "aiohttp", "openai", "socket", "urllib",
     "http", "http.client", "ftplib", "smtplib", "telnetlib",
+    "asyncio", "ssl", "importlib",
     "core.adapters", "plugins", "core.ports.knowledge_store",
 })
 
@@ -60,18 +63,59 @@ def _imported_names(path: Path) -> set[str]:
     return names
 
 
+def _module_path(dotted: str) -> Path | None:
+    """Map a first-party dotted name to a file, if it is one of ours."""
+    candidate = _REPO_ROOT / (dotted.replace(".", "/") + ".py")
+    if candidate.is_file():
+        return candidate
+    package = _REPO_ROOT / dotted.replace(".", "/") / "__init__.py"
+    return package if package.is_file() else None
+
+
+def _reachable_modules() -> dict[str, Path]:
+    """Every first-party module reachable from the re-ranking entry points.
+
+    Transitive on purpose. A scan of three hardcoded files proves only that
+    *those three* are clean — someone adding a helper module that performs I/O
+    and importing it from `rerank.py` would pass such a scan while sending
+    member content off-box. Walking the graph means new modules are covered
+    the moment they join the path.
+    """
+    found: dict[str, Path] = {}
+    queue = [_REPO_ROOT / m for m in _RERANK_ENTRY_MODULES]
+    while queue:
+        path = queue.pop()
+        key = str(path.relative_to(_REPO_ROOT))
+        if key in found:
+            continue
+        found[key] = path
+        for name in _imported_names(path):
+            resolved = _module_path(name)
+            if resolved is not None:
+                queue.append(resolved)
+    return found
+
+
 class TestStaticNoNetworkImport:
     """US4-AS1 — nothing on this path can even reach the network."""
 
-    @pytest.mark.parametrize("module", _RERANK_MODULES)
-    def test_module_imports_nothing_that_can_perform_io(self, module: str) -> None:
-        imported = _imported_names(_REPO_ROOT / module)
-        for name in imported:
-            root = name.split(".")[0]
-            assert name not in _FORBIDDEN_IMPORTS, f"{module} imports {name}"
-            assert root not in _FORBIDDEN_IMPORTS, f"{module} imports {name}"
-            assert not name.startswith("core.adapters"), f"{module} imports {name}"
-            assert not name.startswith("plugins"), f"{module} imports {name}"
+    def test_the_scan_actually_reaches_the_whole_path(self) -> None:
+        """Guard the guard: an empty or truncated walk would pass vacuously."""
+        reachable = _reachable_modules()
+        for entry in _RERANK_ENTRY_MODULES:
+            assert entry in reachable
+        # rerank.py imports lexical_score.py — if the walk is not transitive,
+        # this is the first thing that stops being true.
+        assert "core/domain/lexical_score.py" in reachable
+
+    def test_no_module_on_the_path_can_perform_io(self) -> None:
+        for module, path in _reachable_modules().items():
+            for name in _imported_names(path):
+                root = name.split(".")[0]
+                assert name not in _FORBIDDEN_IMPORTS, f"{module} imports {name}"
+                assert root not in _FORBIDDEN_IMPORTS, f"{module} imports {name}"
+                assert not name.startswith("core.adapters"), f"{module} imports {name}"
+                assert not name.startswith("plugins"), f"{module} imports {name}"
 
 
 class TestRuntimeNoEgress:
@@ -139,6 +183,30 @@ class TestNoNewDependency:
              "pyproject.toml", "poetry.lock"],
             cwd=_REPO_ROOT, capture_output=True, text=True, check=False,
         )
+        # Assert the command SUCCEEDED before trusting its silence. CI checks
+        # out shallow by default, so `origin/develop` may not resolve — git
+        # then exits non-zero with empty stdout and a bare "assert not stdout"
+        # passes without having compared anything. The guard would be green
+        # exactly where it was supposed to fire.
+        if result.returncode != 0:
+            pytest.skip(
+                f"cannot resolve origin/develop to compare against "
+                f"({result.stderr.strip()}); dependency guard not evaluated"
+            )
         assert not result.stdout.strip(), (
             f"re-ranking must add no dependency; changed: {result.stdout.strip()}"
         )
+
+    def test_no_heavy_ml_dependency_declared(self) -> None:
+        """A base-ref-independent backstop for the guard above.
+
+        This one cannot pass vacuously: it reads the manifest directly, so it
+        holds in a shallow checkout where the diff cannot run. Re-ranking must
+        stay stdlib-only — there is no GPU here and the runtime image has a
+        size floor.
+        """
+        manifest = (_REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        for package in ("torch", "sentence-transformers", "transformers",
+                        "rank_bm25", "scikit-learn", "faiss"):
+            assert f'\n{package} ' not in manifest, f"{package} was added"
+            assert f'"{package}"' not in manifest, f"{package} was added"

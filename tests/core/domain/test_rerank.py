@@ -179,3 +179,22 @@ class TestOrderingBehaviour:
     def test_top_k_larger_than_candidates_returns_all(self) -> None:
         order = LexicalReranker(0.5).rerank("doc", ["a", "b"], [0.5, 0.6], top_k=99)
         assert sorted(order) == [0, 1]
+
+
+class TestPreconditions:
+    def test_mismatched_lengths_raise_explicitly(self) -> None:
+        """Too few scores would be an opaque IndexError; too many, silent truncation.
+
+        Either way the caller's lists have drifted, and every citation after
+        this point would be misattributed. Say so instead.
+        """
+        import pytest
+
+        with pytest.raises(ValueError, match="parallel"):
+            LexicalReranker().rerank("invite", ["a", "b", "c"], [0.9])
+        with pytest.raises(ValueError, match="parallel"):
+            LexicalReranker().rerank("invite", ["a", "b"], [0.9, 0.5, 0.1])
+
+    def test_none_document_does_not_raise(self) -> None:
+        order = LexicalReranker().rerank("invite", ["a invite", None, "c"], [0.9, 0.5, 0.1])  # type: ignore[list-item]
+        assert sorted(order) == [0, 1, 2]

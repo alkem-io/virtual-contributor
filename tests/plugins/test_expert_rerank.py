@@ -71,7 +71,7 @@ class TestApplyRerank:
             "gamma doc": ({"source": "c"}, 0.9, "id-c"),
         }
 
-        out = _apply_rerank(LexicalReranker(), "beta", result, top_k=3)
+        out = _apply_rerank(LexicalReranker(), "beta", result)
 
         for i, doc in enumerate(out.documents[0]):
             expected_meta, expected_dist, expected_id = original[doc]
@@ -91,22 +91,28 @@ class TestApplyRerank:
             distances=[[0.10, 0.45]],
             ids=[["id0", "id1"]],
         )
-        out = _apply_rerank(LexicalReranker(), "invite members space", result, top_k=2)
+        out = _apply_rerank(LexicalReranker(), "invite members space", result)
         assert sorted(out.distances[0]) == [0.10, 0.45]
 
-    def test_top_k_truncates(self) -> None:
+    def test_reorders_without_truncating(self) -> None:
+        """Truncation is the caller's job, after the threshold — not here.
+
+        Cutting the pool at this point would hand the relevance threshold a
+        pre-filtered list and could leave an answer with no sources at all.
+        """
         result = QueryResult(
             documents=[["a", "b", "c", "d"]],
             metadatas=[[{}] * 4],
             distances=[[0.1, 0.2, 0.3, 0.4]],
             ids=[["1", "2", "3", "4"]],
         )
-        out = _apply_rerank(LexicalReranker(), "a", result, top_k=2)
-        assert len(out.documents[0]) == 2
+        out = _apply_rerank(LexicalReranker(), "a", result)
+        assert len(out.documents[0]) == 4
+        assert sorted(out.ids[0]) == ["1", "2", "3", "4"]
 
     def test_empty_result_passes_through(self) -> None:
         empty = QueryResult(documents=[[]], metadatas=[[]], distances=[[]], ids=[[]])
-        assert _apply_rerank(LexicalReranker(), "q", empty, top_k=5) is empty
+        assert _apply_rerank(LexicalReranker(), "q", empty) is empty
 
 
 class TestDisabledIsIdentical:
@@ -225,7 +231,7 @@ class TestObservability:
             await plugin.handle(make_input(message="how do I invite members to a space"))
 
         messages = [r.getMessage() for r in caplog.records]  # type: ignore[attr-defined]
-        assert any("Re-ranked 4 candidates to 2" in m for m in messages)
+        assert any("Re-ranked 4 candidates" in m for m in messages)
 
     async def test_no_rerank_log_when_disabled(self, caplog: object) -> None:
         import logging
@@ -238,3 +244,60 @@ class TestObservability:
         assert not any(
             "Re-ranked" in r.getMessage() for r in caplog.records  # type: ignore[attr-defined]
         )
+
+
+class _ThresholdTrapStore(MockKnowledgeStorePort):
+    """Term-dense passages that FAIL the threshold, above generic ones that pass.
+
+    Re-ranking lifts the term-dense stubs to the front. If truncation happened
+    before the threshold they would fill the whole top-K and then all be
+    discarded, leaving the answer with no sources at all.
+    """
+
+    async def query(
+        self, collection: str, query_texts: list[str], n_results: int = 10,
+    ) -> QueryResult:
+        self.query_calls.append((collection, query_texts, n_results))
+        docs = [f"General overview of the Alkemio platform, page {i}." for i in range(6)]
+        distances = [0.35 + 0.02 * i for i in range(6)]          # pass a 0.3 threshold
+        docs += [f"invite members space FAQ stub {i}" for i in range(14)]
+        distances += [0.72 + 0.005 * i for i in range(14)]        # fail it
+        keep = min(n_results, len(docs))
+        return QueryResult(
+            documents=[docs[:keep]],
+            metadatas=[[{"source": f"s{i}"} for i in range(keep)]],
+            distances=[distances[:keep]],
+            ids=[[f"id{i}" for i in range(keep)]],
+        )
+
+
+class TestTruncationHappensAfterThreshold:
+    """Re-ranking must never leave an answer with fewer sources than without it."""
+
+    async def test_enabling_does_not_starve_the_context_window(self) -> None:
+        question = "how do I invite members to a space"
+
+        off = _ThresholdTrapStore()
+        off_response = await ExpertPlugin(
+            llm=MockLLMPort(response="a"), knowledge_store=off,
+            n_results=5, score_threshold=0.3,
+        ).handle(make_input(message=question))
+
+        on = _ThresholdTrapStore()
+        on_response = await ExpertPlugin(
+            llm=MockLLMPort(response="a"), knowledge_store=on,
+            n_results=5, score_threshold=0.3,
+            reranker=LexicalReranker(), rerank_candidate_n=20, rerank_top_k=5,
+        ).handle(make_input(message=question))
+
+        assert on_response.sources, "re-ranking left the answer with no sources at all"
+        assert len(on_response.sources) >= len(off_response.sources)
+
+    async def test_top_k_still_bounds_the_result(self) -> None:
+        store = _ThresholdTrapStore()
+        response = await ExpertPlugin(
+            llm=MockLLMPort(response="a"), knowledge_store=store,
+            n_results=5, score_threshold=0.3,
+            reranker=LexicalReranker(), rerank_candidate_n=20, rerank_top_k=3,
+        ).handle(make_input(message="how do I invite members to a space"))
+        assert len(response.sources) <= 3

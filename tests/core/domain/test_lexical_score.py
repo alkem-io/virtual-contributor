@@ -84,3 +84,35 @@ class TestLexicalScores:
 
     def test_empty_documents_do_not_raise(self) -> None:
         assert lexical_scores("invite", ["", ""]) == [0.0, 0.0]
+
+
+class TestBoundsAndCaps:
+    def test_scores_never_exceed_one(self) -> None:
+        """A short exact match must not exceed the documented ceiling.
+
+        BM25 saturation reaches ~K1+1 when a matching document is far shorter
+        than the pool average — a bare heading among long prose. The caller
+        rescales it away today, so nothing would notice until a second port
+        implementation took the range at its word.
+        """
+        assert max(lexical_scores("invite", ["invite", "x " * 400, "y " * 400])) <= 1.0
+        assert max(
+            lexical_scores("invite", ["invite invite invite", "filler " * 500])
+        ) <= 1.0
+
+    def test_oversized_query_is_bounded(self) -> None:
+        """Scoring is synchronous and runs on the event loop.
+
+        An unbounded query would block every other message in the process
+        while being tokenised.
+        """
+        import time
+
+        docs = ["invite members space " * 100 for _ in range(60)]
+        start = time.perf_counter()
+        lexical_scores("invite " * 1_000_000, docs)
+        assert (time.perf_counter() - start) * 1000 < 100
+
+    def test_none_document_scores_zero_rather_than_raising(self) -> None:
+        """A malformed store entry costs that passage its signal, not the answer."""
+        assert lexical_scores("invite", ["a invite", None, "c"])[1] == 0.0  # type: ignore[list-item]

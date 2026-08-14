@@ -34,9 +34,33 @@ K1 = 1.2
 #: able to win.
 B = 0.75
 
+#: Characters of query text considered. Scoring is synchronous and runs on the
+#: event loop, so an oversized message would block every other message in the
+#: process while it was tokenised — measured at hundreds of milliseconds for a
+#: multi-megabyte query, against a pod limited to ~1.5 CPU. No question a
+#: person writes approaches this; anything beyond it is not a query.
+MAX_QUERY_CHARS = 8_000
+
+#: Distinct query terms scored. Past this the marginal term adds nothing to
+#: ranking, and the cost is per-term per-document.
+MAX_QUERY_TERMS = 64
+
+#: Characters of each document considered. Retrieval returns chunks, and the
+#: deployed chunk size is an order of magnitude below this — so in normal
+#: operation nothing is truncated. It bounds the pathological case where a
+#: caller passes whole documents rather than chunks.
+MAX_DOCUMENT_CHARS = 100_000
+
 
 def tokenize(text: str) -> list[str]:
-    """Split text into lowercased alphanumeric terms."""
+    """Split text into lowercased alphanumeric terms.
+
+    Tolerates ``None`` and other non-strings: a malformed entry in a store
+    result should cost that one passage its lexical signal, not raise and turn
+    a working answer into an error.
+    """
+    if not isinstance(text, str):
+        return []
     return _TOKEN_RE.findall(text.lower())
 
 
@@ -74,6 +98,14 @@ def compute_idf(docs_tokens: list[list[str]]) -> dict[str, float]:
 def lexical_scores(query: str, documents: list[str]) -> list[float]:
     """Score every document against the query's terms, in ``[0, 1]``.
 
+    Clamped at 1.0 deliberately. The BM25 saturation factor
+    ``count*(K1+1)/(count + K1*norm)`` approaches ``K1+1`` as ``norm`` tends to
+    zero, which happens when a matching document is far shorter than the pool
+    average — a bare heading among long prose. Unclamped that reaches ~2.19,
+    and today nothing notices because the caller min-max rescales it away. It
+    would stop being invisible the moment a second implementation behind
+    ``RerankerPort``, or any telemetry, took the documented range at its word.
+
     Returns all zeros — never raises — when there is nothing to measure: no
     documents, an empty or whitespace query, a query whose terms appear
     nowhere, or text in a script this tokenizer does not segment. "No lexical
@@ -83,11 +115,19 @@ def lexical_scores(query: str, documents: list[str]) -> list[float]:
     if not documents:
         return []
 
-    query_terms = set(tokenize(query))
+    # Bounded before tokenising, not after: the cost being capped is the
+    # tokenisation itself, and this runs synchronously on the event loop.
+    query_terms = set(tokenize(query[:MAX_QUERY_CHARS]))
     if not query_terms:
         return [0.0] * len(documents)
+    if len(query_terms) > MAX_QUERY_TERMS:
+        # Deterministic, so the same question always scores the same way.
+        query_terms = set(sorted(query_terms)[:MAX_QUERY_TERMS])
 
-    docs_tokens = [tokenize(doc) for doc in documents]
+    docs_tokens = [
+        tokenize(doc[:MAX_DOCUMENT_CHARS] if isinstance(doc, str) else doc)
+        for doc in documents
+    ]
     lengths = [len(t) for t in docs_tokens]
     avg_len = (sum(lengths) / len(lengths)) if lengths else 0.0
 
@@ -110,5 +150,5 @@ def lexical_scores(query: str, documents: list[str]) -> list[float]:
                 continue
             norm = 1.0 - B + B * (length / avg_len if avg_len else 1.0)
             score += idf.get(term, 0.0) * (count * (K1 + 1.0)) / (count + K1 * norm)
-        scores.append(score / total_idf)
+        scores.append(min(1.0, score / total_idf))
     return scores
