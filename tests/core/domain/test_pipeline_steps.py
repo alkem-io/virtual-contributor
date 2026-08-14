@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import time
 
 import pytest
@@ -19,6 +20,7 @@ from core.domain.pipeline.steps import (
     EmbedStep,
     OrphanCleanupStep,
     StoreStep,
+    _root_position,
 )
 from tests.conftest import MockEmbeddingsPort, MockKnowledgeStorePort, MockLLMPort
 
@@ -2975,3 +2977,508 @@ class TestBoKInlinePersistence:
 
         bok_chunks = [c for c in ctx.chunks if c.metadata.document_id == "body-of-knowledge-summary"]
         assert len(bok_chunks) == 1
+
+
+def _positioned_meta(**overrides) -> DocumentMetadata:
+    base = dict(
+        document_id="d1", source="s", type="post", title="T",
+        embedding_type="chunk",
+        space_id="sp-1", space_name="Root Space",
+        subspace_id="sub-1", subspace_name="First Level",
+        callout_id="co-1", depth=3,
+    )
+    base.update(overrides)
+    return DocumentMetadata(**base)
+
+
+class TestStoreStepHierarchy:
+    """Tree position is persisted as scalars, omitting whatever is unknown."""
+
+    async def test_stores_full_position(self):
+        store = MockKnowledgeStorePort()
+        ctx = PipelineContext(
+            collection_name="c", documents=[],
+            chunks=[Chunk(
+                content="text", metadata=_positioned_meta(), chunk_index=0,
+                embedding=[0.1], content_hash="h-full",
+            )],
+        )
+        await StoreStep(knowledge_store_port=store).execute(ctx)
+
+        meta = store.collections["c"][0]["metadata"]
+        assert meta["spaceId"] == "sp-1"
+        assert meta["spaceName"] == "Root Space"
+        assert meta["subspaceId"] == "sub-1"
+        assert meta["subspaceName"] == "First Level"
+        assert meta["calloutId"] == "co-1"
+        assert meta["depth"] == 3
+
+    async def test_omits_unknown_position_fields(self):
+        """Unknown means the key is absent — never None, never blank.
+
+        The store rejects None and fails the whole batch it belongs to, so a
+        space description (which never has a subspace) must not write one.
+        """
+        store = MockKnowledgeStorePort()
+        meta_in = _positioned_meta(
+            subspace_id=None, subspace_name=None, callout_id=None, depth=0,
+        )
+        ctx = PipelineContext(
+            collection_name="c", documents=[],
+            chunks=[Chunk(
+                content="text", metadata=meta_in, chunk_index=0,
+                embedding=[0.1], content_hash="h-partial",
+            )],
+        )
+        await StoreStep(knowledge_store_port=store).execute(ctx)
+
+        meta = store.collections["c"][0]["metadata"]
+        assert "subspaceId" not in meta
+        assert "subspaceName" not in meta
+        assert "calloutId" not in meta
+        assert meta["spaceId"] == "sp-1"
+
+    async def test_depth_written_even_when_zero(self):
+        """0 is falsy and is the commonest depth — it must still be written."""
+        store = MockKnowledgeStorePort()
+        ctx = PipelineContext(
+            collection_name="c", documents=[],
+            chunks=[Chunk(
+                content="text",
+                # A root space: has a position, and its depth is the falsy 0.
+                metadata=DocumentMetadata(
+                    document_id="d1", source="s", embedding_type="chunk",
+                    space_id="sp-1", depth=0,
+                ),
+                chunk_index=0, embedding=[0.1], content_hash="h-root",
+            )],
+        )
+        await StoreStep(knowledge_store_port=store).execute(ctx)
+
+        meta = store.collections["c"][0]["metadata"]
+        assert meta["depth"] == 0
+        assert meta["spaceId"] == "sp-1"
+        assert "subspaceId" not in meta
+
+    async def test_positionless_content_stores_no_position_fields(self):
+        """Position is all-or-nothing.
+
+        Content with no tree position stores no position fields — including
+        `depth`. That must match what the fingerprint sees: if metadata wrote
+        a depth the fingerprint ignored, an unchanged entry would keep its old
+        id, the write would be skipped, and the depth silently discarded.
+        """
+        store = MockKnowledgeStorePort()
+        ctx = PipelineContext(
+            collection_name="c", documents=[],
+            chunks=[Chunk(
+                content="text",
+                metadata=DocumentMetadata(
+                    document_id="d1", source="s", embedding_type="chunk",
+                ),
+                chunk_index=0, embedding=[0.1], content_hash="h-nohier",
+            )],
+        )
+        await StoreStep(knowledge_store_port=store).execute(ctx)
+
+        meta = store.collections["c"][0]["metadata"]
+        assert "depth" not in meta
+        assert "spaceId" not in meta
+
+    async def test_blank_name_omitted_but_id_kept(self):
+        store = MockKnowledgeStorePort()
+        ctx = PipelineContext(
+            collection_name="c", documents=[],
+            chunks=[Chunk(
+                content="text",
+                metadata=_positioned_meta(space_name="", subspace_name=""),
+                chunk_index=0, embedding=[0.1], content_hash="h-blank",
+            )],
+        )
+        await StoreStep(knowledge_store_port=store).execute(ctx)
+
+        meta = store.collections["c"][0]["metadata"]
+        assert meta["spaceId"] == "sp-1"
+        assert "spaceName" not in meta
+        assert "subspaceName" not in meta
+
+    async def test_every_stored_value_is_a_scalar(self):
+        """The store accepts only str/int — a None fails the whole batch."""
+        store = MockKnowledgeStorePort()
+        ctx = PipelineContext(
+            collection_name="c", documents=[],
+            chunks=[
+                Chunk(
+                    content="a", metadata=_positioned_meta(), chunk_index=0,
+                    embedding=[0.1], content_hash="h-a",
+                ),
+                Chunk(
+                    content="b",
+                    metadata=_positioned_meta(
+                        subspace_id=None, subspace_name=None,
+                        callout_id=None, depth=0,
+                    ),
+                    chunk_index=0, embedding=[0.2], content_hash="h-b",
+                ),
+            ],
+        )
+        await StoreStep(knowledge_store_port=store).execute(ctx)
+
+        for entry in store.collections["c"]:
+            for key, value in entry["metadata"].items():
+                assert value is not None, key
+                assert isinstance(value, (str, int)), key
+
+    async def test_split_parts_share_one_position(self):
+        """Every chunk of one document reports the same position."""
+        store = MockKnowledgeStorePort()
+        meta = _positioned_meta()
+        ctx = PipelineContext(
+            collection_name="c", documents=[],
+            chunks=[
+                Chunk(content="part one", metadata=meta, chunk_index=0,
+                      embedding=[0.1], content_hash="h-p0"),
+                Chunk(content="part two", metadata=meta, chunk_index=1,
+                      embedding=[0.2], content_hash="h-p1"),
+            ],
+        )
+        await StoreStep(knowledge_store_port=store).execute(ctx)
+
+        positions = {
+            (m["metadata"]["spaceId"], m["metadata"]["subspaceId"],
+             m["metadata"]["calloutId"], m["metadata"]["depth"])
+            for m in store.collections["c"]
+        }
+        assert positions == {("sp-1", "sub-1", "co-1", 3)}
+
+
+class TestSummaryHierarchy:
+    """Derived entries inherit the position of what they summarise."""
+
+    async def test_document_summary_inherits_position(self):
+        llm = MockLLMPort(response="a summary")
+        meta = _positioned_meta()
+        ctx = PipelineContext(
+            collection_name="c", documents=[],
+            chunks=[
+                Chunk(content=f"chunk {i}", metadata=meta, chunk_index=i)
+                for i in range(4)
+            ],
+        )
+        await DocumentSummaryStep(llm_port=llm, chunk_threshold=4).execute(ctx)
+
+        summaries = [
+            c for c in ctx.chunks if c.metadata.embedding_type == "summary"
+        ]
+        assert len(summaries) == 1
+        summary_meta = summaries[0].metadata
+        assert summary_meta.space_id == "sp-1"
+        assert summary_meta.subspace_id == "sub-1"
+        assert summary_meta.callout_id == "co-1"
+        assert summary_meta.depth == 3
+
+    async def test_bok_overview_carries_root_and_no_subtree(self):
+        """The overview spans the whole body: root position, nothing narrower."""
+        llm = MockLLMPort(response="overview")
+        meta = _positioned_meta()
+        ctx = PipelineContext(
+            collection_name="c", documents=[],
+            chunks=[
+                Chunk(content="some content", metadata=meta, chunk_index=0),
+            ],
+        )
+        await BodyOfKnowledgeSummaryStep(llm_port=llm).execute(ctx)
+
+        bok = [
+            c for c in ctx.chunks
+            if c.metadata.document_id == "body-of-knowledge-summary"
+        ]
+        assert len(bok) == 1
+        bok_meta = bok[0].metadata
+        assert bok_meta.space_id == "sp-1"
+        assert bok_meta.space_name == "Root Space"
+        assert bok_meta.subspace_id is None
+        assert bok_meta.callout_id is None
+        assert bok_meta.depth == 0
+
+    async def test_bok_overview_inline_write_carries_position(self):
+        """The inline path bypasses StoreStep — it must render position too."""
+        llm = MockLLMPort(response="overview")
+        store = MockKnowledgeStorePort()
+        embeddings = MockEmbeddingsPort()
+        meta = _positioned_meta()
+        ctx = PipelineContext(
+            collection_name="c", documents=[],
+            chunks=[
+                Chunk(content="some content", metadata=meta, chunk_index=0),
+            ],
+        )
+        await BodyOfKnowledgeSummaryStep(
+            llm_port=llm, knowledge_store_port=store, embeddings_port=embeddings,
+        ).execute(ctx)
+
+        stored = [
+            e for e in store.collections["c"]
+            if e["metadata"]["documentId"] == "body-of-knowledge-summary"
+        ]
+        assert len(stored) == 1
+        stored_meta = stored[0]["metadata"]
+        assert stored_meta["spaceId"] == "sp-1"
+        assert stored_meta["depth"] == 0
+        assert "subspaceId" not in stored_meta
+        assert "calloutId" not in stored_meta
+
+
+class TestReingestionRewritesPosition:
+    """A reparent must rewrite the entry, not be skipped as unchanged."""
+
+    async def test_moved_content_is_rewritten_and_old_id_orphaned(self):
+        store = MockKnowledgeStorePort()
+        text = "identical body text"
+
+        async def ingest_at(subspace_id: str) -> PipelineContext:
+            meta = _positioned_meta(
+                subspace_id=subspace_id, subspace_name=subspace_id, depth=1,
+            )
+            ctx = PipelineContext(
+                collection_name="c",
+                documents=[Document(content=text, metadata=meta)],
+                chunks=[Chunk(content=text, metadata=meta, chunk_index=0)],
+            )
+            await ContentHashStep().execute(ctx)
+            await ChangeDetectionStep(store).execute(ctx)
+            for c in ctx.chunks:
+                if c.embedding is None:
+                    c.embedding = [0.1]
+            await StoreStep(knowledge_store_port=store).execute(ctx)
+            return ctx
+
+        first = await ingest_at("sub-a")
+        assert first.chunks_stored == 1
+
+        second = await ingest_at("sub-b")
+        # Not skipped: the position changed, so the fingerprint changed.
+        assert second.chunks_skipped == 0
+        assert second.chunks_stored == 1
+
+        moved = [
+            e for e in store.collections["c"]
+            if e["metadata"].get("subspaceId") == "sub-b"
+        ]
+        assert len(moved) == 1
+        # The stale entry is collected for the orphan sweep.
+        assert second.orphan_ids
+
+        await OrphanCleanupStep(store).execute(second)
+        remaining = {
+            e["metadata"].get("subspaceId") for e in store.collections["c"]
+        }
+        assert remaining == {"sub-b"}
+
+
+class TestRootPositionResolution:
+    """The overview's root must resolve in every shape the pipeline produces."""
+
+    @staticmethod
+    def _doc(**kw):
+        base = dict(document_id="d", source="s")
+        base.update(kw)
+        return Document(content="x", metadata=DocumentMetadata(**base))
+
+    def test_prefers_the_root_document(self):
+        ctx = PipelineContext(
+            collection_name="c",
+            documents=[
+                self._doc(space_id="sp-1", space_name="Root", depth=0),
+                self._doc(space_id="sp-1", space_name="Root",
+                          subspace_id="sub-1", depth=1),
+            ],
+        )
+        assert _root_position(ctx) == ("sp-1", "Root")
+
+    def test_root_document_wins_regardless_of_order(self):
+        """The depth-0 document is authoritative for the root's own name.
+
+        A deeper document carries an inherited copy that can diverge, so the
+        names differ here deliberately — otherwise dropping the preference
+        would leave the suite green.
+        """
+        ctx = PipelineContext(
+            collection_name="c",
+            documents=[
+                self._doc(space_id="sp-1", space_name="Stale Inherited",
+                          subspace_id="sub-1", depth=1),
+                self._doc(space_id="sp-1", space_name="Root", depth=0),
+            ],
+        )
+        assert _root_position(ctx) == ("sp-1", "Root")
+
+    def test_resolves_when_the_root_has_no_description(self):
+        """A space with no description emits no depth-0 document at all."""
+        ctx = PipelineContext(
+            collection_name="c",
+            documents=[
+                self._doc(space_id="sp-1", space_name="Root",
+                          subspace_id="sub-1", depth=1),
+            ],
+        )
+        assert _root_position(ctx) == ("sp-1", "Root")
+
+    def test_resolves_in_batched_finalize_where_chunks_are_empty(self):
+        """Batched mode builds the finalize context with chunks empty."""
+        ctx = PipelineContext(
+            collection_name="c",
+            documents=[self._doc(space_id="sp-1", space_name="Root", depth=0)],
+        )
+        ctx.chunks = []
+        assert _root_position(ctx) == ("sp-1", "Root")
+
+    def test_falls_back_to_chunks_when_documents_are_empty(self):
+        ctx = PipelineContext(collection_name="c", documents=[])
+        ctx.chunks = [Chunk(
+            content="x",
+            metadata=DocumentMetadata(
+                document_id="d", source="s",
+                space_id="sp-9", space_name="Nine", depth=0,
+            ),
+            chunk_index=0,
+        )]
+        assert _root_position(ctx) == ("sp-9", "Nine")
+
+    def test_website_ingestion_gets_no_fabricated_root(self):
+        ctx = PipelineContext(
+            collection_name="c", documents=[self._doc()],
+        )
+        assert _root_position(ctx) == (None, None)
+
+    def test_empty_ingestion_gets_no_root(self):
+        ctx = PipelineContext(collection_name="c", documents=[])
+        assert _root_position(ctx) == (None, None)
+
+
+class TestHierarchyMetadataScalarContract:
+    """The single render chokepoint enforces the whole scalar contract."""
+
+    def test_non_scalar_value_is_dropped_not_stored(self, caplog):
+        """A nested value would be rejected and take its whole batch with it."""
+        from core.domain.pipeline.steps import hierarchy_metadata
+
+        meta = DocumentMetadata(document_id="d1", source="s", space_id="sp-1")
+        meta.subspace_id = {"nested": "object"}  # type: ignore[assignment]
+        rendered = hierarchy_metadata(meta)
+
+        assert "subspaceId" not in rendered
+        assert rendered["spaceId"] == "sp-1"
+        assert all(
+            isinstance(v, (str, int, float, bool)) for v in rendered.values()
+        )
+
+    def test_unusable_depth_falls_back_to_root_tier_never_absent(self):
+        """A positioned entry must never lose depth — it would go unfilterable.
+
+        Coerce to the root tier rather than omit, so the key stays total over
+        positioned entries even when something upstream is already wrong.
+        """
+        from core.domain.pipeline.steps import hierarchy_metadata
+
+        meta = DocumentMetadata(document_id="d1", source="s", space_id="sp-1")
+        meta.depth = ["not", "an", "int"]  # type: ignore[assignment]
+        rendered = hierarchy_metadata(meta)
+        assert rendered["depth"] == 0
+        assert rendered["spaceId"] == "sp-1"
+
+    def test_bool_depth_is_not_stored_as_bool(self):
+        """bool subclasses int; True would fail a {"depth": 1} equality filter."""
+        from core.domain.pipeline.steps import hierarchy_metadata
+
+        meta = DocumentMetadata(document_id="d1", source="s", space_id="sp-1")
+        meta.depth = True  # type: ignore[assignment]
+        rendered = hierarchy_metadata(meta)
+        assert rendered["depth"] == 0
+        assert not isinstance(rendered["depth"], bool)
+
+
+class TestFailedReingestionLeavesBothRegimes:
+    """The one R-3 consequence with no coverage: a failed campaign run.
+
+    The first post-043 re-ingestion turns over every positioned fingerprint.
+    If a step errors mid-run the destructive gate correctly refuses to sweep
+    the old ids — which is the safe choice, but it leaves the collection
+    holding both regimes until a clean run converges it. That is observable
+    behaviour an operator will meet during the campaign, so it is pinned
+    rather than discovered.
+    """
+
+    @staticmethod
+    def _meta(**kw):
+        base = dict(document_id="d-1", source="space:sp-1", type="subspace",
+                    title="T", embedding_type="chunk")
+        base.update(kw)
+        return DocumentMetadata(**base)
+
+    async def _seed_legacy(self, store, text):
+        """A pre-043 entry: old fingerprint, no position recorded."""
+        legacy = hashlib.sha256(
+            "\0".join([text, "T", "space:sp-1", "subspace", "d-1"]).encode()
+        ).hexdigest()
+        await store.ingest(
+            collection="c", documents=[text],
+            metadatas=[{"documentId": "d-1", "embeddingType": "chunk"}],
+            ids=[legacy], embeddings=[[0.1]],
+        )
+        return legacy
+
+    async def test_error_gates_the_sweep_and_leaves_both_regimes(self):
+        store = MockKnowledgeStorePort()
+        text = "body text that has not changed"
+        legacy_id = await self._seed_legacy(store, text)
+
+        meta = self._meta(space_id="sp-1", subspace_id="sub-1", depth=1)
+        ctx = PipelineContext(
+            collection_name="c",
+            documents=[Document(content=text, metadata=meta)],
+            chunks=[Chunk(content=text, metadata=meta, chunk_index=0)],
+        )
+        await ContentHashStep().execute(ctx)
+        await ChangeDetectionStep(store).execute(ctx)
+        for c in ctx.chunks:
+            c.embedding = [0.2]
+        await StoreStep(knowledge_store_port=store).execute(ctx)
+
+        # Something earlier in the run failed.
+        ctx.errors.append("EmbedStep: provider unavailable for batch 3")
+
+        engine = IngestEngine(steps=[OrphanCleanupStep(store)])
+        await engine._run_steps([OrphanCleanupStep(store)], ctx)
+
+        ids = {e["id"] for e in store.collections["c"]}
+        assert legacy_id in ids, "the old entry must survive a failed run"
+        assert len(ids) == 2, "both regimes are present until a clean run"
+        assert ctx.chunks_deleted == 0
+
+    async def test_a_clean_rerun_converges_to_the_positioned_set(self):
+        store = MockKnowledgeStorePort()
+        text = "body text that has not changed"
+        legacy_id = await self._seed_legacy(store, text)
+
+        async def run() -> PipelineContext:
+            meta = self._meta(space_id="sp-1", subspace_id="sub-1", depth=1)
+            ctx = PipelineContext(
+                collection_name="c",
+                documents=[Document(content=text, metadata=meta)],
+                chunks=[Chunk(content=text, metadata=meta, chunk_index=0)],
+            )
+            await ContentHashStep().execute(ctx)
+            await ChangeDetectionStep(store).execute(ctx)
+            for c in ctx.chunks:
+                if c.embedding is None:
+                    c.embedding = [0.2]
+            await StoreStep(knowledge_store_port=store).execute(ctx)
+            await OrphanCleanupStep(store).execute(ctx)
+            return ctx
+
+        await run()
+        ids = {e["id"] for e in store.collections["c"]}
+        assert legacy_id not in ids, "the stale entry is swept on a clean run"
+        assert len(ids) == 1, "no duplicate survives"
+        assert store.collections["c"][0]["metadata"]["subspaceId"] == "sub-1"

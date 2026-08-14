@@ -17,6 +17,12 @@ def _make_chunk(
     title: str = "Title",
     embedding_type: str = "chunk",
     chunk_index: int = 0,
+    space_id: str | None = None,
+    space_name: str | None = None,
+    subspace_id: str | None = None,
+    subspace_name: str | None = None,
+    callout_id: str | None = None,
+    depth: int = 0,
 ) -> Chunk:
     return Chunk(
         content=content,
@@ -26,6 +32,12 @@ def _make_chunk(
             type=doc_type,
             title=title,
             embedding_type=embedding_type,
+            space_id=space_id,
+            space_name=space_name,
+            subspace_id=subspace_id,
+            subspace_name=subspace_name,
+            callout_id=callout_id,
+            depth=depth,
         ),
         chunk_index=chunk_index,
     )
@@ -37,8 +49,17 @@ def _expected_hash(
     source: str = "src",
     doc_type: str = "knowledge",
     doc_id: str = "doc-1",
+    space_id: str = "",
+    subspace_id: str = "",
+    callout_id: str = "",
+    depth: int = 0,
 ) -> str:
-    canonical = "\0".join([content, title, source, doc_type, doc_id])
+    segments = [content, title, source, doc_type, doc_id]
+    # Content with no tree position keeps its pre-043 fingerprint, so website
+    # collections are not rewritten to gain nothing.
+    if space_id or subspace_id or callout_id or depth:
+        segments += [space_id, subspace_id, callout_id, str(depth)]
+    canonical = "\0".join(segments)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
@@ -150,3 +171,117 @@ class TestContentHashStep:
         )
         await ContentHashStep().execute(ctx)
         assert c1.content_hash != c2.content_hash
+
+
+class TestContentHashPosition:
+    """Position participates in the fingerprint; display names do not."""
+
+    async def test_sensitive_to_subspace_id(self):
+        """Identical text under two parents fingerprints differently.
+
+        This is what makes a reparent rewrite the entry instead of being
+        skipped as unchanged.
+        """
+        c1 = _make_chunk(space_id="sp-1", subspace_id="sub-a", depth=1)
+        c2 = _make_chunk(space_id="sp-1", subspace_id="sub-b", depth=1)
+        ctx = PipelineContext(
+            collection_name="c", documents=[], chunks=[c1, c2]
+        )
+        await ContentHashStep().execute(ctx)
+        assert c1.content_hash != c2.content_hash
+
+    async def test_sensitive_to_space_id(self):
+        c1 = _make_chunk(space_id="sp-1")
+        c2 = _make_chunk(space_id="sp-2")
+        ctx = PipelineContext(
+            collection_name="c", documents=[], chunks=[c1, c2]
+        )
+        await ContentHashStep().execute(ctx)
+        assert c1.content_hash != c2.content_hash
+
+    async def test_sensitive_to_callout_id(self):
+        c1 = _make_chunk(space_id="sp-1", callout_id="co-1", depth=3)
+        c2 = _make_chunk(space_id="sp-1", callout_id="co-2", depth=3)
+        ctx = PipelineContext(
+            collection_name="c", documents=[], chunks=[c1, c2]
+        )
+        await ContentHashStep().execute(ctx)
+        assert c1.content_hash != c2.content_hash
+
+    async def test_sensitive_to_depth(self):
+        c1 = _make_chunk(space_id="sp-1", subspace_id="sub-a", depth=1)
+        c2 = _make_chunk(space_id="sp-1", subspace_id="sub-a", depth=2)
+        ctx = PipelineContext(
+            collection_name="c", documents=[], chunks=[c1, c2]
+        )
+        await ContentHashStep().execute(ctx)
+        assert c1.content_hash != c2.content_hash
+
+    async def test_insensitive_to_display_names(self):
+        """A rename must not re-embed a whole space — names are display-only."""
+        c1 = _make_chunk(
+            space_id="sp-1", space_name="Old Name",
+            subspace_id="sub-a", subspace_name="Old Sub", depth=1,
+        )
+        c2 = _make_chunk(
+            space_id="sp-1", space_name="New Name",
+            subspace_id="sub-a", subspace_name="New Sub", depth=1,
+        )
+        ctx = PipelineContext(
+            collection_name="c", documents=[], chunks=[c1, c2]
+        )
+        await ContentHashStep().execute(ctx)
+        assert c1.content_hash == c2.content_hash
+
+    async def test_unknown_position_matches_explicit_empty(self):
+        """Absent position hashes as empty — no sentinel leaks into the id."""
+        ctx = PipelineContext(
+            collection_name="c", documents=[], chunks=[_make_chunk()]
+        )
+        await ContentHashStep().execute(ctx)
+        assert ctx.chunks[0].content_hash == _expected_hash()
+
+
+class TestPositionlessContentKeepsItsFingerprint:
+    """Content with no tree position must not be re-fingerprinted.
+
+    The fingerprint is the storage id, so changing it rewrites and re-embeds
+    every entry and sweeps the old ids as orphans. Website ingestion gains no
+    position at all, so it must not pay that cost.
+    """
+
+    async def test_website_shaped_chunk_hashes_as_before_this_feature(self):
+        """Pinned against the pre-043 canonical form, computed independently."""
+        chunk = _make_chunk()  # no position: every hierarchy field at default
+        ctx = PipelineContext(
+            collection_name="c", documents=[], chunks=[chunk]
+        )
+        await ContentHashStep().execute(ctx)
+
+        legacy_canonical = "\0".join([
+            "Hello world", "Title", "src", "knowledge", "doc-1",
+        ])
+        legacy_hash = hashlib.sha256(
+            legacy_canonical.encode("utf-8")
+        ).hexdigest()
+        assert chunk.content_hash == legacy_hash
+
+    async def test_positioned_content_does_get_a_new_fingerprint(self):
+        """The exemption applies only where there is genuinely no position."""
+        bare = _make_chunk()
+        placed = _make_chunk(space_id="sp-1", depth=0)
+        ctx = PipelineContext(
+            collection_name="c", documents=[], chunks=[bare, placed]
+        )
+        await ContentHashStep().execute(ctx)
+        assert bare.content_hash != placed.content_hash
+
+    async def test_depth_alone_is_enough_to_engage_position(self):
+        """A contribution at depth 3 with no ids still fingerprints distinctly."""
+        bare = _make_chunk()
+        deep = _make_chunk(depth=3)
+        ctx = PipelineContext(
+            collection_name="c", documents=[], chunks=[bare, deep]
+        )
+        await ContentHashStep().execute(ctx)
+        assert bare.content_hash != deep.content_hash
