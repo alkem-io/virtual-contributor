@@ -343,3 +343,49 @@ class TestReasonCodesAreNotFreeText:
         }
         assert emitted <= KNOWN_REASONS
         assert emitted == KNOWN_REASONS, "a documented code is unreachable"
+
+
+class TestSuppressionIsNarrow:
+    """Hedge detection may only suppress a real decline.
+
+    Every widening that fixes a spurious flag risks suppressing the signal.
+    Review found both failure directions in one round, so both are pinned here
+    with the corpora that exposed them.
+    """
+
+    #: Assertions that merely CONTAIN a negation near an information noun.
+    #: Negated assertions are how a model states a limit, and Alkemio's own
+    #: vocabulary is the noun set — an unanchored rule suppressed 8 of 9.
+    NEGATED_ASSERTIONS = [
+        "Members without admin rights cannot edit the knowledge base.",
+        "The platform does not support SAML; only OIDC records are kept.",
+        "There is no way to export your details as CSV.",
+        "Whiteboards are not versioned, so previous data is discarded.",
+        "Alkemio does not store data outside the EU.",
+        "The knowledge base does not include archived spaces.",
+        "Sources are not shown when the context is empty.",
+    ]
+
+    #: An apology or softener is not a decline. It is also the most common
+    #: opener there is, so admitting one as a substring hands the model a
+    #: prefix that switches the check off.
+    APOLOGY_PREFIXED_FABRICATIONS = [
+        "I'm sorry to hear that. The space was founded in 1997 by Dr. Amelia Hartwell.",
+        "I'm sorry for the confusion — the correct fee is 40 euros per seat.",
+        "I'm not sure I follow, but the mission is to accelerate collaboration.",
+        "Sorry about that! There are 4,200 registered contributors.",
+    ]
+
+    @pytest.mark.parametrize("answer", NEGATED_ASSERTIONS)
+    def test_a_negated_assertion_is_not_a_decline(self, answer: str) -> None:
+        assert not is_hedged(answer)
+        assert VALIDATOR.validate(answer=answer, context="").supported is False
+
+    @pytest.mark.parametrize("answer", APOLOGY_PREFIXED_FABRICATIONS)
+    def test_an_apology_prefix_does_not_suppress(self, answer: str) -> None:
+        assert VALIDATOR.validate(answer=answer, context="").supported is False
+
+    def test_the_structural_rule_requires_a_first_person_subject(self) -> None:
+        """The anchor is the whole point: the SPEAKER must lack the information."""
+        assert is_hedged("I do not have information on that.")
+        assert not is_hedged("The archive does not have information on that.")

@@ -198,10 +198,23 @@ class GuidancePlugin:
                 context=context, question=question, language=language
             ),
         }])
-        self._validate_faithfulness(answer=answer, context=context)
-
         # Try to parse JSON response for source scores
         parsed_sources = self._parse_json_sources(answer)
+
+        # Validate the string the MEMBER receives, not the JSON envelope.
+        # retrieve_prompt asks for {"answer": ..., "sources": [...]}, and the
+        # envelope's own "sources" key is an information-noun — so validating
+        # the raw output made detection depend on the model's serialisation
+        # format rather than on what it said. It also made the logged
+        # answer_chars the envelope's length instead of the answer's, which
+        # corrupts the measurement this feature exists to collect.
+        member_answer = (
+            parsed_sources.get("answer", answer)
+            if parsed_sources is not None
+            else answer
+        )
+        self._validate_faithfulness(answer=member_answer, context=context)
+
         if parsed_sources is not None:
             return Response(
                 result=parsed_sources.get("answer", answer),

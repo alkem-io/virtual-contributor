@@ -331,3 +331,41 @@ class TestLogsCarryNoMemberContent:
             await plugin.handle(make_input(message="who founded this?"))
         assert _flagged(caplog)
         assert not any(secret in r.getMessage() for r in caplog.records)
+
+
+class TestGuidanceValidatesTheMemberVisibleAnswer:
+    """`retrieve_prompt` asks for a JSON envelope, and the envelope's own
+    "sources" key is an information-noun. Validating the raw output made
+    detection depend on the model's serialisation format rather than on what
+    it said, and logged the envelope's length as `answer_chars`."""
+
+    class _JsonLLM(MockLLMPort):
+        async def invoke(self, messages, **kw) -> str:  # type: ignore[override]
+            return '{"answer": "' + FABRICATION + '", "sources": []}'
+
+    async def test_a_fabrication_inside_the_envelope_is_still_flagged(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        plugin = GuidancePlugin(
+            llm=self._JsonLLM(response=""),
+            knowledge_store=_EmptyStore(),
+            faithfulness_validator=ContextSufficiencyValidator(),
+        )
+        with caplog.at_level(logging.WARNING, logger="plugins.guidance.plugin"):
+            await plugin.handle(make_input(message="who founded this space?"))
+        assert _flagged(caplog)
+
+    async def test_answer_chars_reports_the_answer_not_the_envelope(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The frequency measurement is this feature's whole deliverable; a
+        length taken from the envelope corrupts it."""
+        plugin = GuidancePlugin(
+            llm=self._JsonLLM(response=""),
+            knowledge_store=_EmptyStore(),
+            faithfulness_validator=ContextSufficiencyValidator(),
+        )
+        with caplog.at_level(logging.WARNING, logger="plugins.guidance.plugin"):
+            await plugin.handle(make_input(message="who founded this space?"))
+        record = next(r for r in caplog.records if "Unsupported answer" in r.getMessage())
+        assert f"answer_chars={len(FABRICATION)}" in record.getMessage()

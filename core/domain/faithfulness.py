@@ -83,36 +83,48 @@ _HEDGE_PHRASES = (
     "i don't have enough",
     "i'm afraid i can't",
     "i am afraid i can't",
-    "i'm not sure",
-    "i am not sure",
+    "i'm not sure about",
+    "i am not sure about",
+    "i'm not sure i can",
     "i'd need more",
     "i would need more",
     "not something i'm able to",
     "not something i am able to",
     "outside what i can",
-    "i'm sorry",
-    "i am sorry",
     "sorry, i don't",
     "sorry, i do not",
     "unfortunately, i don't",
     "unfortunately, i do not",
 )
 
-#: A bounded negation near an information noun, for phrasings the list misses.
-#: The two mechanisms are a union on purpose: measured during design, the list
-#: alone missed 3 of 13 realistic phrasings and the regex alone missed
-#: "I don't know" — ``\bn't\b`` cannot match inside ``don't``.
+#: Every entry above must *itself* state the lack. A bare apology or softener
+#: ("i'm sorry", "i'm not sure") is not a decline — review showed it suppressed
+#: "I'm sorry to hear that. The space was founded in 1997 by Dr. Amelia
+#: Hartwell." An apology is the most common opener there is, so admitting one
+#: as a substring hands the model a prefix that disables the check.
+
+#: A structural decline: **the speaker** saying they lack the information.
+#:
+#: The first-person subject is load-bearing, not decoration. A free-floating
+#: negation near an information noun matches ordinary assertions about limits —
+#: "The platform does not support SAML; only OIDC records are kept" is a claim,
+#: not a decline, and review measured 8 of 9 such fabrications silently
+#: suppressed. Negated assertions are exactly how a model states a constraint,
+#: and Alkemio's own vocabulary (knowledge/context/data/records) is the noun
+#: set, so the unanchored form failed on a large and ordinary class of answers.
+#:
+#: Contracted negations are matched as whole words: ``\bn't\b`` cannot work,
+#: because the apostrophe leaves no word boundary before the "n" inside
+#: ``don't``.
 _HEDGE_RE = re.compile(
-    # Contracted negations are matched as whole words (don't, doesn't, isn't,
-    # can't, won't). `\bn't\b` cannot work: the apostrophe form leaves no word
-    # boundary before the "n", which is why "I don't know" needed the phrase
-    # list before this was widened.
-    r"\b(?:no|not|cannot|unable|lack(?:s|ing)?|without"
-    r"|(?:do|does|did|is|are|was|were|has|have|had|ca|wo|would|could|should)n't"
-    r")\b"
-    r"[^.!?]{0,60}?"
+    r"\b(?:i|we)\b"
+    r"[^.!?]{0,30}?"
+    r"\b(?:do not|don't|does not|doesn't|cannot|can't|could not|couldn't"
+    r"|am not|'m not|are not|aren't|was not|wasn't|have no|has no|had no"
+    r"|lack|lacks|lacking|unable|without)\b"
+    r"[^.!?]{0,40}?"
     r"\b(?:information|context|knowledge|details?|data|evidence|records?|"
-    r"sources?|documentation)\b",
+    r"sources?|documentation|answer|idea)\b",
     re.IGNORECASE,
 )
 
