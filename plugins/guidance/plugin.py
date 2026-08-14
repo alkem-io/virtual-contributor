@@ -11,6 +11,12 @@ from core.events.input import Input
 from core.events.response import Response, Source
 from core.ports.llm import LLMPort
 from core.ports.knowledge_store import KnowledgeStorePort
+from core.domain.query_rewrite import (
+    DEFAULT_MAX_EXPANSION_RATIO,
+    RewritePolicy,
+    rewrite_query,
+    should_rewrite,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,12 +46,18 @@ class GuidancePlugin:
         n_results: int = 5,
         score_threshold: float = 0.3,
         max_context_chars: int = 20000,
+        rewrite_policy: RewritePolicy | None = None,
+        max_expansion_ratio: float = DEFAULT_MAX_EXPANSION_RATIO,
     ) -> None:
         self._llm = llm
         self._knowledge_store = knowledge_store
         self._n_results = n_results
         self._score_threshold = score_threshold
         self._max_context_chars = max_context_chars
+        # None means "never skip" — the gate is opt-in, so an unconfigured
+        # deployment behaves exactly as before apart from output validation.
+        self._rewrite_policy = rewrite_policy
+        self._max_expansion_ratio = max_expansion_ratio
 
     async def startup(self) -> None:
         logger.info("GuidancePlugin started")
@@ -57,19 +69,26 @@ class GuidancePlugin:
         question = event.message
         language = event.language or "EN"
 
-        # Condense history if present
-        if event.history:
+        # Resolve the question against history when that is worth a call.
+        # Was: an unconditional LLM round-trip on ANY history, whose output was
+        # assigned verbatim however malformed, and whose failure aborted the
+        # whole request.
+        if should_rewrite(question, event.history, self._rewrite_policy):
             from plugins.guidance.prompts import condense_prompt
             history_text = "\n".join(
                 f"{h.role}: {h.content}" for h in event.history
             )
-            condensed = await self._llm.invoke([{
-                "role": "human",
-                "content": condense_prompt.format(
-                    chat_history=history_text, question=question
-                ),
-            }])
-            question = condensed
+            question = await rewrite_query(
+                self._llm,
+                [{
+                    "role": "human",
+                    "content": condense_prompt.format(
+                        chat_history=history_text, question=question
+                    ),
+                }],
+                question,
+                max_expansion_ratio=self._max_expansion_ratio,
+            )
 
         # Query multiple collections in parallel
         n_results = self._n_results

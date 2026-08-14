@@ -8,6 +8,12 @@ from core.events.input import Input
 from core.events.response import Response
 from core.ports.llm import LLMPort
 from plugins.generic.prompts import condenser_system_prompt
+from core.domain.query_rewrite import (
+    DEFAULT_MAX_EXPANSION_RATIO,
+    RewritePolicy,
+    rewrite_query,
+    should_rewrite,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -32,8 +38,17 @@ class GenericPlugin:
     name = "generic"
     event_type = Input
 
-    def __init__(self, llm: LLMPort) -> None:
+    def __init__(
+        self,
+        llm: LLMPort,
+        *,
+        rewrite_policy: RewritePolicy | None = None,
+        max_expansion_ratio: float = DEFAULT_MAX_EXPANSION_RATIO,
+    ) -> None:
         self._llm = llm
+        # None means "never skip" — see GuidancePlugin.
+        self._rewrite_policy = rewrite_policy
+        self._max_expansion_ratio = max_expansion_ratio
 
     async def startup(self) -> None:
         logger.info("GenericPlugin started")
@@ -44,14 +59,19 @@ class GenericPlugin:
     async def handle(self, event: Input, **ports) -> Response:
         question = event.message
 
-        # Condense history if present
-        if event.history:
+        # Resolve the question against history when that is worth a call.
+        if should_rewrite(question, event.history, self._rewrite_policy):
             history_text = _history_as_text(event.history)
             condenser_messages = [
                 {"role": "system", "content": condenser_system_prompt},
                 {"role": "human", "content": f"History:\n{history_text}\n\nLatest question: {question}"},
             ]
-            question = await self._llm.invoke(condenser_messages)
+            question = await rewrite_query(
+                self._llm,
+                condenser_messages,
+                question,
+                max_expansion_ratio=self._max_expansion_ratio,
+            )
             logger.info("Condensed question from history")
 
         # Build final messages

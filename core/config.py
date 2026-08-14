@@ -137,6 +137,16 @@ class BaseConfig(BaseSettings):
                 f"SUMMARIZE_LLM_TEMPERATURE must be between 0.0 and 2.0, "
                 f"got {self.summarize_llm_temperature}"
             )
+        # Query rewrite validation. A ratio <= 1.0 would reject every rewrite
+        # longer than the original — which is what resolving a follow-up
+        # against its history normally produces — so the gate would silently
+        # discard all of them and always fall back.
+        if self.query_rewrite_max_expansion_ratio <= 1.0:
+            raise ValueError(
+                f"QUERY_REWRITE_MAX_EXPANSION_RATIO must be greater than 1.0, "
+                f"got {self.query_rewrite_max_expansion_ratio}"
+            )
+
         if self.summarize_llm_timeout is not None and self.summarize_llm_timeout <= 0:
             raise ValueError(
                 f"SUMMARIZE_LLM_TIMEOUT must be greater than 0, "
@@ -286,6 +296,12 @@ class BaseConfig(BaseSettings):
     summary_length: int = 10000
     summarize_concurrency: int = 8
     summarize_enabled: bool = True
+
+    # Query rewrite — gating and output validation (workspace#049)
+    # Both default to develop's behaviour: no gate, and a ratio permissive
+    # enough that only a model which started explaining is rejected.
+    query_rewrite_gating_enabled: bool = False
+    query_rewrite_max_expansion_ratio: float = 8.0
 
     # Health
     health_port: int = 8080

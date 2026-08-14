@@ -8,6 +8,12 @@ from core.events.input import Input
 from core.events.response import Response, Source
 from core.ports.llm import LLMPort
 from core.ports.knowledge_store import KnowledgeStorePort, QueryResult
+from core.domain.query_rewrite import (
+    DEFAULT_MAX_EXPANSION_RATIO,
+    RewritePolicy,
+    rewrite_query,
+    should_rewrite,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -63,12 +69,17 @@ class ExpertPlugin:
         n_results: int = 5,
         score_threshold: float = 0.3,
         max_context_chars: int = 20000,
+        rewrite_policy: RewritePolicy | None = None,
+        max_expansion_ratio: float = DEFAULT_MAX_EXPANSION_RATIO,
     ) -> None:
         self._llm = llm
         self._knowledge_store = knowledge_store
         self._n_results = n_results
         self._score_threshold = score_threshold
         self._max_context_chars = max_context_chars
+        # None means "never skip" — see GuidancePlugin.
+        self._rewrite_policy = rewrite_policy
+        self._max_expansion_ratio = max_expansion_ratio
 
     async def startup(self) -> None:
         logger.info("ExpertPlugin started")
@@ -190,6 +201,13 @@ class ExpertPlugin:
             "description": event.description,
             "display_name": event.display_name,
         }
+        # `retrieve_node` already prefers `rephrased_question` over
+        # `current_question` — nothing ever wrote it. Seeding it activates a
+        # dormant seam rather than adding one. Only when it differs, so a graph
+        # whose own node writes this key is not pre-empted by an identical value.
+        resolved = await self._resolve_question(event)
+        if resolved != event.message:
+            initial_state["rephrased_question"] = resolved
 
         final_state = await graph.invoke(initial_state)
 
@@ -205,10 +223,36 @@ class ExpertPlugin:
             original_result=final_state.get("original_result"),
         )
 
+    async def _resolve_question(self, event: Input) -> str:
+        """Resolve a follow-up against its history before retrieval.
+
+        Expert is the one plugin that genuinely matched the story's premise:
+        it sent the raw message to the vector store, so "and the other one?"
+        was searched for literally. Guidance's condense prompt is reused rather
+        than a new one invented — its wording is plugin-neutral.
+        """
+        if not should_rewrite(event.message, event.history, self._rewrite_policy):
+            return event.message
+        from plugins.guidance.prompts import condense_prompt
+
+        history_text = "\n".join(f"{h.role}: {h.content}" for h in event.history or [])
+        return await rewrite_query(
+            self._llm,
+            [{
+                "role": "human",
+                "content": condense_prompt.format(
+                    chat_history=history_text, question=event.message
+                ),
+            }],
+            event.message,
+            max_expansion_ratio=self._max_expansion_ratio,
+        )
+
     async def _handle_simple(self, event: Input, collection: str) -> Response:
         """Simple RAG without graph execution."""
+        question = await self._resolve_question(event)
         result = await self._knowledge_store.query(
-            collection=collection, query_texts=[event.message], n_results=self._n_results,
+            collection=collection, query_texts=[question], n_results=self._n_results,
         )
         docs, result = _filter_and_format(result, self._score_threshold)
         docs, result = self._enforce_context_budget(docs, result)

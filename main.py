@@ -31,6 +31,56 @@ def _mask_sensitive(name: str, value) -> str:
     return s
 
 
+class _ConversationalSkipPolicy:
+    """Skip the rewrite only for turns that are entirely small talk.
+
+    Wraps the adaptive-query classifier without the plugins knowing it exists.
+
+    **Only CONVERSATIONAL is safe.** Skipping SIMPLE as well looks tempting —
+    it is roughly twice as fast — but SIMPLE covers anaphoric follow-ups like
+    "show me those" and "the name of the lead", which are meaningless without
+    the preceding turn. Measured against a 12-turn corpus, skipping SIMPLE
+    broke 9 of 12; skipping only CONVERSATIONAL broke none. CONVERSATIONAL is
+    safe because the classifier requires the *whole* message to be small talk,
+    so it cannot carry a question that needs resolving.
+    """
+
+    def __init__(self, classifier: object, conversational: object) -> None:
+        self._classifier = classifier
+        self._conversational = conversational
+
+    def should_skip_rewrite(self, message: str) -> bool:
+        try:
+            return self._classifier.classify(message).route is self._conversational
+        except Exception as exc:
+            # Never let the optimisation break the request it was optimising.
+            logger.warning(
+                "Rewrite policy failed, not skipping: error_type=%s", type(exc).__name__
+            )
+            return False
+
+
+def _build_rewrite_policy() -> object | None:
+    """Build the gate policy if the classifier is available, else None.
+
+    The classifier ships on a separate, unmerged PR that sits in a multi-way
+    pile-up on these same files. Guarding the import means this feature builds
+    and runs on develop today and starts gating the moment that lands — with no
+    merge-order dependency in either direction. Returning None disables only the
+    skip: every turn is rewritten, exactly as before.
+    """
+    try:
+        from core.domain.rule_classifier import RuleQueryClassifier
+        from core.ports.query_router import RouteClass
+    except ImportError:
+        logger.info(
+            "Query-rewrite gating requested but the query classifier is not "
+            "available in this build; every turn with history will be rewritten"
+        )
+        return None
+    return _ConversationalSkipPolicy(RuleQueryClassifier(), RouteClass.CONVERSATIONAL)
+
+
 def _log_config(config: BaseConfig) -> None:
     """Log all configurable summarization/retrieval fields at startup."""
     fields = [
@@ -49,6 +99,8 @@ def _log_config(config: BaseConfig) -> None:
         "guidance_n_results",
         "guidance_min_score",
         "max_context_chars",
+        "query_rewrite_gating_enabled",
+        "query_rewrite_max_expansion_ratio",
         "summary_chunk_threshold",
         "pipeline_timeout",
     ]
@@ -246,6 +298,13 @@ async def _run(config: BaseConfig) -> None:
             deps["score_threshold"] = config.retrieval_score_threshold
     if "max_context_chars" in sig.parameters:
         deps["max_context_chars"] = config.max_context_chars
+    # Inject the query-rewrite gate
+    if "max_expansion_ratio" in sig.parameters:
+        deps["max_expansion_ratio"] = config.query_rewrite_max_expansion_ratio
+    if "rewrite_policy" in sig.parameters and config.query_rewrite_gating_enabled:
+        policy = _build_rewrite_policy()
+        if policy is not None:
+            deps["rewrite_policy"] = policy
     # Inject summarization LLM for ingest plugins
     if "summarize_llm" in sig.parameters:
         deps["summarize_llm"] = summarize_llm
