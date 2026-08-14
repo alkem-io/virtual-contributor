@@ -80,7 +80,7 @@ flowchart TD
 | `SUMMARY_CHUNK_THRESHOLD` | `4` | Minimum chunks to trigger per-document summarization |
 | `SUMMARIZE_ENABLED` | `true` | Enable/disable summarization steps |
 | `SUMMARIZE_CONCURRENCY` | `8` | Concurrent document summarizations |
-| `ALKEMIO_SERVER` | _(required)_ | Alkemio API server URL |
+| `API_ENDPOINT_PRIVATE_GRAPHQL` | _(required)_ | Alkemio private GraphQL endpoint. `main.py` reads this via `IngestSpaceConfig`; `ALKEMIO_SERVER` is not read by any code and leaves the GraphQL client unconfigured. |
 | `AUTH_ADMIN_EMAIL` | _(required)_ | Kratos authentication email |
 | `AUTH_ADMIN_PASSWORD` | _(required)_ | Kratos authentication password |
 

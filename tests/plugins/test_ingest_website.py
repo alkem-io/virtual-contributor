@@ -675,3 +675,53 @@ class TestIngestWebsiteSummarizationBehavior:
         finalize_names = [type(s).__name__ for s in call_kwargs.kwargs["finalize_steps"]]
         assert "DocumentSummaryStep" not in batch_names
         assert "BodyOfKnowledgeSummaryStep" not in finalize_names
+
+
+class TestSizingConfigReachesWebsiteIngestion:
+    """`main.py` injects by signature, so a parameter this plugin does not
+    declare is silently never passed.
+
+    `ingest_space` declared `chunk_size`, `chunk_overlap` and `summary_length`;
+    `ingest_website` did not — so its chunking and *both* summary steps used
+    constructor defaults no matter what an operator configured. The existing
+    test only checked the shared default, which is identical either way.
+    """
+
+    @pytest.mark.parametrize(
+        "parameter", ["chunk_size", "chunk_overlap", "summary_length"]
+    )
+    def test_the_plugin_declares_the_sizing_parameter(self, parameter: str) -> None:
+        import inspect
+
+        from plugins.ingest_website.plugin import IngestWebsitePlugin
+
+        assert parameter in inspect.signature(IngestWebsitePlugin.__init__).parameters
+
+    def test_both_ingest_plugins_accept_the_same_sizing_knobs(self) -> None:
+        """A knob honoured by one ingest path and ignored by the other is worse
+        than one honoured by neither — it looks configured and is not."""
+        import inspect
+
+        from plugins.ingest_space.plugin import IngestSpacePlugin
+        from plugins.ingest_website.plugin import IngestWebsitePlugin
+
+        knobs = {"chunk_size", "chunk_overlap", "summary_length"}
+        website = set(inspect.signature(IngestWebsitePlugin.__init__).parameters)
+        space = set(inspect.signature(IngestSpacePlugin.__init__).parameters)
+        assert knobs <= website
+        assert knobs <= space
+
+    def test_a_non_default_summary_length_is_stored(self) -> None:
+        from plugins.ingest_website.plugin import IngestWebsitePlugin
+
+        plugin = IngestWebsitePlugin(
+            llm=MockLLMPort(response="s"),
+            embeddings=MockEmbeddingsPort(),
+            knowledge_store=MockKnowledgeStorePort(),
+            summary_length=9_999,
+            chunk_size=1_234,
+            chunk_overlap=56,
+        )
+        assert plugin._summary_length == 9_999
+        assert plugin._chunk_size == 1_234
+        assert plugin._chunk_overlap == 56
