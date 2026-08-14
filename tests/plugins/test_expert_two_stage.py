@@ -311,11 +311,20 @@ async def test_real_graph_answer_receives_the_exact_observed_final_context() -> 
     _CapturingGraphModel.calls = []
     observed: list[list[str]] = []
     store = _store()
-    # Stage 2 has two relevant rows; threshold drops the second. The orienting
-    # overview is never answer context regardless of its high rank.
+    store.collections["c-knowledge"].insert(3, {
+        "id": "a-threshold", "document": "THRESHOLD DROPPED SENTINEL",
+        "metadata": {
+            "embeddingType": "chunk", "spaceId": "a", "subspaceId": "a-sub",
+            "source": "threshold-source",
+        },
+    })
+    # The first two Stage-2 rows score .9 and .8; the compact budget retains
+    # only the first. The third scores .7 and is independently thresholded.
+    # The overview is orienting-only and the Beta row is scope-excluded.
     plugin = ExpertPlugin(
         LangChainLLMAdapter(_CapturingGraphModel()), store,
-        hierarchical_retrieval_enabled=True, score_threshold=0.85,
+        hierarchical_retrieval_enabled=True, score_threshold=0.75,
+        max_context_chars=80,
         context_observer=observed.append,
     )
     response = await plugin.handle(make_input(
@@ -327,7 +336,8 @@ async def test_real_graph_answer_receives_the_exact_observed_final_context() -> 
     answer_prompt = str(_CapturingGraphModel.calls[-1][0].content)
     assert answer_prompt.encode() == f"FINAL ANSWER CONTEXT:\n{rendered}".encode()
     assert "Alpha overview" not in answer_prompt  # Stage 1 orienting row
-    assert "Alpha evidence" not in answer_prompt  # threshold-dropped candidate
+    assert "Alpha evidence" not in answer_prompt  # rendered-budget dropped
+    assert "THRESHOLD DROPPED SENTINEL" not in answer_prompt
     assert "Beta liability noise" not in answer_prompt  # sibling scoped out
 
 
