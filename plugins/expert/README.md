@@ -55,3 +55,29 @@ Per-plugin LLM overrides are supported via `EXPERT_LLM_*` prefix.
 ```bash
 poetry run pytest tests/plugins/test_expert.py
 ```
+
+## Adaptive routing
+
+When `ROUTING_ENABLED=true`, each question is classified before retrieval and
+this plugin's retrieval width, score threshold and context budget come from the
+matching profile instead of the configured constants.
+
+| Route | Behaviour here |
+|---|---|
+| conversational | **no retrieval at all** — the store is not queried |
+| simple | narrower retrieval than today |
+| moderate | exactly today's behaviour (the fallback for unrecognised input) |
+| complex | wider retrieval **and** a wider context budget |
+
+**Off by default.** With routing disabled no classifier is injected and this
+plugin takes its existing code path with its existing constants — that is the
+rollback, and it is a config change rather than a deploy.
+
+Classification is rule-based and in-process: no model, no network call,
+sub-millisecond. See `docs/adr/0016-adaptive-query-routing.md` for why an LLM
+classifier was rejected on arithmetic, and `README.md` for the settings.
+
+Both retrieval sites route: `_handle_simple` and the `retrieve_node` closure
+inside `_handle_with_graph`. The closure captures its settings from the
+enclosing scope, so a change touching only one would leave graph-driven queries
+on today's behaviour — covered by `tests/plugins/test_expert_routing.py`.
