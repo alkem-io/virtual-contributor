@@ -153,6 +153,16 @@ def validate_rewrite(
 
     ``candidate`` is typed ``object`` on purpose — it is whatever the LLM
     adapter returned, and this function is the boundary that makes it a ``str``.
+
+    **What this does not catch.** These are length and type checks, so a short
+    refusal or preamble — ``"I cannot help with that."``, ``"Sure! Here you
+    go:"``, ``"N/A"`` — passes and becomes the retrieval query. No length rule
+    can separate those from a short legitimate query like ``"Who is the lead of
+    Space Alpha?"``; telling them apart needs semantics, which means another
+    model call, which is the cost this feature exists to avoid. The consequence
+    is bounded and confined to one turn: retrieval returns poor chunks, the
+    answer is still generated, nothing crosses collection scope, and the
+    request does not fail.
     """
     if not isinstance(candidate, str):
         return original

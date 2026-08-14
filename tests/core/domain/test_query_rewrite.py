@@ -241,3 +241,25 @@ class TestHistoryIsBounded:
         """An operator may opt out; the default is what protects them."""
         assert recent_history([1, 2, 3], 0) == [1, 2, 3]
         assert recent_history([1, 2, 3], -1) == [1, 2, 3]
+
+
+class TestValidationIsLengthNotMeaning:
+    """Records the limit of a length check, so nobody assumes it is stronger.
+
+    A short refusal or preamble passes and becomes the retrieval query. No
+    length rule can separate it from a short legitimate query — that needs
+    semantics, i.e. another model call, which is the cost this feature removes.
+    """
+
+    @pytest.mark.parametrize(
+        "preamble",
+        ["I cannot help with that.", "Sure! Here you go:", "N/A", "..."],
+    )
+    def test_a_short_preamble_is_not_caught(self, preamble: str) -> None:
+        assert validate_rewrite(preamble, "who is he?") == preamble
+
+    def test_a_short_legitimate_query_is_indistinguishable_by_length(self) -> None:
+        """Why the above cannot simply be fixed here."""
+        legit = "Who is the lead of Space Alpha?"
+        assert len(legit) < MIN_REWRITE_ALLOWANCE
+        assert validate_rewrite(legit, "who is he?") == legit
