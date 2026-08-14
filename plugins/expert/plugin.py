@@ -184,6 +184,15 @@ class ExpertPlugin:
         score_threshold = self._score_threshold
         enforce_budget = self._enforce_context_budget
 
+        # What retrieval actually produced, captured where it happens rather
+        # than read back from the final state. The graph definition arrives on
+        # the event, so its state schema is caller-supplied: LangGraph drops
+        # any key the schema does not declare, and a RAG graph omitting
+        # ``combined_knowledge_docs`` would make a real zero-context answer
+        # indistinguishable from a graph that never retrieved. This closure
+        # knows the difference; the final state does not.
+        retrieved: dict[str, str] = {}
+
         async def retrieve_node(state: dict) -> dict:
             query = (
                 state.get("rephrased_question")
@@ -196,6 +205,7 @@ class ExpertPlugin:
             docs, filtered_result = _filter_and_format(result, score_threshold)
             docs, filtered_result = enforce_budget(docs, filtered_result)
             knowledge = "\n".join(docs)
+            retrieved["context"] = knowledge
             # The expert state schema expects ``combined_knowledge_docs``
             # — that's what the answer_question node reads via its
             # ``{combined_knowledge_docs}`` prompt variable.  ``sources``
@@ -234,15 +244,12 @@ class ExpertPlugin:
         final_state = await graph.invoke(initial_state)
 
         answer = final_state.get("final_answer", final_state.get("result", ""))
-        # A graph with no retrieve node never sets this key at all. That is a
-        # graph making no claim about retrieved context, not a retrieval that
-        # came back empty — validating it would flag every answer from every
-        # non-RAG graph, and prompt graphs are configurable per space.
-        if "combined_knowledge_docs" in final_state:
-            self._validate_faithfulness(
-                answer=answer,
-                context=final_state["combined_knowledge_docs"],
-            )
+        # Validate only when retrieval actually ran. A graph with no retrieve
+        # node makes no claim about retrieved context — validating it would
+        # flag every answer from every non-RAG graph, and prompt graphs are
+        # configurable per space.
+        if "context" in retrieved:
+            self._validate_faithfulness(answer=answer, context=retrieved["context"])
         sources = self._extract_sources(final_state)
 
         return Response(
