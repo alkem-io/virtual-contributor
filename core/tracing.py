@@ -150,7 +150,11 @@ def configure_tracing(
         # against a dead collector (measured 35s > k8s 30s grace period).
         shutdown_on_exit=False,
     )
-    if provider._disabled:  # type: ignore[attr-defined]
+    # Read defensively: ``_disabled`` is SDK-private. configure_tracing() is
+    # called unguarded from main(), so a rename in an accepted 1.x minor would
+    # turn an observability detail into a startup crash. Absent flag => not
+    # disabled, which is the fail-open behaviour the rest of this module uses.
+    if getattr(provider, "_disabled", False):
         logger.warning("Tracing is disabled by OTEL_SDK_DISABLED; tracing stays off")
         provider.shutdown()
         return False

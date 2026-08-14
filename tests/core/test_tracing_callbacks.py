@@ -51,6 +51,32 @@ def test_callback_errors_do_not_escape(traced_exporter) -> None:
         callbacks.get_tracer = original
 
 
+def test_llm_error_span_is_ended_even_if_record_failure_raises(traced_exporter) -> None:
+    """The error path must mirror on_llm_end's finally: the span is already
+    popped from self._spans, so if record_failure raises and end() is skipped
+    nothing else can ever end it and the failed provider call — precisely the
+    case this handler exists to report — never reaches the collector."""
+    import core.tracing_callbacks as callbacks
+
+    handler = VCTracingCallbackHandler(_config())
+    run_id = uuid4()
+    handler.on_chat_model_start({"name": "model"}, [[HumanMessage(content="prompt")]], run_id=run_id)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("record_failure exploded")
+
+    original = callbacks.record_failure
+    callbacks.record_failure = boom
+    try:
+        handler.on_llm_error(RuntimeError("provider down"), run_id=run_id)
+    finally:
+        callbacks.record_failure = original
+
+    shutdown_tracing()
+    names = [span.name for span in traced_exporter.get_finished_spans()]
+    assert "chat model" in names, "failed provider span was never ended"
+
+
 def test_non_numeric_usage_still_ends_span(traced_exporter) -> None:
     handler = VCTracingCallbackHandler(_config())
     run_id = uuid4()

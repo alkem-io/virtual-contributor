@@ -52,8 +52,9 @@ async def test_failed_collection_is_recorded_once(traced_exporter, traced_config
                 raise RuntimeError("collection failed")
             return await super().query(collection, query_texts, n_results)
 
-    with handle_span(traced_config, make_input(), "guidance"):
-        await GuidancePlugin(MockLLMPort(), FailingStore()).handle(make_input())
+    event = make_input()
+    with handle_span(traced_config, event, "guidance"):
+        await GuidancePlugin(MockLLMPort(), FailingStore()).handle(event)
     shutdown_tracing()
     failed = next(
         span for span in traced_exporter.get_finished_spans()

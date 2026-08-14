@@ -122,9 +122,17 @@ class VCTracingCallbackHandler(BaseCallbackHandler):
         """Mark and close a failed provider attempt without leaking errors."""
         try:
             span = self._spans.pop(self._key(run_id), None)
-            if span is None:
-                return
-            record_failure(span, error, FailureMode.llm_error, config=self._config)
-            span.end()
         except Exception:
             logger.warning("Tracing callback failed on LLM error", exc_info=True)
+            return
+        if span is None:
+            return
+        # Mirror on_llm_end: the span is already detached from self._spans, so
+        # nothing else can end it. end() must run even if record_failure fails,
+        # otherwise the failed provider call never reaches the collector.
+        try:
+            record_failure(span, error, FailureMode.llm_error, config=self._config)
+        except Exception:
+            logger.warning("Tracing callback failed on LLM error", exc_info=True)
+        finally:
+            span.end()

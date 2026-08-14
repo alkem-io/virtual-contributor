@@ -309,6 +309,7 @@ def build_message_handler(
                 )
 
                 context = handle_span(config, event, plugin.name) if tracing_is_configured() else nullcontext(None)
+                published = False
                 with context as root:
                     try:
                         response = await asyncio.wait_for(
@@ -317,6 +318,7 @@ def build_message_handler(
                         )
                         envelope = router.build_response_envelope(response, event)
                         await _publish_result(envelope)
+                        published = True
                         await message.ack()  # type: ignore[union-attr]
                         if root is not None:
                             from opentelemetry import trace
@@ -353,11 +355,16 @@ def build_message_handler(
                         logger.exception("Error handling engine query: %s", exc)
                         if root is not None:
                             record_failure(root, exc, classify_failure(exc), config=config)
-                        await _retry_or_reject(
-                            message, body,
-                            event=event,
-                            error_text=f"Error: {exc}",
-                        )
+                        # If the answer already reached the result queue and only
+                        # the ACK failed (e.g. a dropped channel), requeuing here
+                        # would re-run the plugin and deliver a second reply for
+                        # one user request. Leave redelivery to the broker.
+                        if not published:
+                            await _retry_or_reject(
+                                message, body,
+                                event=event,
+                                error_text=f"Error: {exc}",
+                            )
         except Exception as exc:
             # parse_event failed — reject the message
             logger.exception("Failed to parse message: %s", exc)

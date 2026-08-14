@@ -1,5 +1,6 @@
 """Main composition seams and startup logging tracing regression coverage."""
 
+import logging
 from unittest.mock import MagicMock, patch
 
 from core.config import BaseConfig
@@ -8,8 +9,15 @@ from main import _log_config, _mask_sensitive, _shutdown_tracing_bounded
 
 
 def test_tracing_config_logging_is_safe(caplog) -> None:
+    """_log_config emits at INFO, which caplog's default WARNING threshold drops.
+    Without set_level the negative assertions below hold vacuously against an
+    empty caplog.text and would not catch a real header leak, so pin the level
+    and first prove the header line was actually captured."""
+    caplog.set_level(logging.INFO)
     _log_config(BaseConfig(llm_base_url="http://local", tracing_otlp_headers="Authorization=secret"))
+    assert "TRACING_OTLP_HEADERS" in caplog.text  # the field was logged at all
     assert "Authorization=secret" not in caplog.text
+    assert "secret" not in caplog.text
 
 
 def test_url_userinfo_is_masked() -> None:
@@ -219,3 +227,46 @@ async def test_early_ack_ingest_path_emits_root_span_and_no_cross_parenting(
     for root in roots:
         assert root.attributes["vc.event_type"] == "IngestWebsite"
         assert root.status.status_code.name == "OK"
+
+
+async def test_failed_ack_does_not_republish_an_already_published_answer() -> None:
+    """A channel drop at ACK time must not cost the user a second reply.
+
+    _publish_result has already put the answer on the result queue, so falling
+    through to _retry_or_reject requeues the message, the broker redelivers it,
+    the plugin runs again and the user receives two responses for one request.
+    """
+    import asyncio as _asyncio
+    from unittest.mock import AsyncMock
+
+    from core.router import Router
+    from main import build_message_handler
+
+    class _AckFailsMessage(_Message):
+        async def ack(self) -> None:
+            raise ConnectionResetError("channel dropped during ack")
+
+    async def handle(event):
+        from core.events.response import Response
+
+        return Response(result="the answer")
+
+    plugin = MagicMock()
+    plugin.name = "guidance"
+    plugin.handle = handle
+    transport = AsyncMock()
+    active: set[_asyncio.Task] = set()
+    handler = build_message_handler(
+        config=_MainConfig(llm_base_url="http://local-model"),
+        plugin=plugin,
+        router=Router(plugin_type="guidance"),
+        transport=transport,
+        active_tasks=active,
+    )
+    await handler(_query_body(), _AckFailsMessage())
+
+    assert transport.publish.call_count == 1, "the answer should be published exactly once"
+    assert transport.republish_with_headers.call_count == 0, (
+        "a published answer was requeued after a failed ACK — the plugin will "
+        "re-run and the user will receive a duplicate response"
+    )

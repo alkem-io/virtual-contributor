@@ -161,6 +161,38 @@ def test_ambient_resource_and_sdk_disable_are_not_silent(monkeypatch) -> None:
     assert not tracing.tracing_is_configured()
 
 
+def test_missing_private_disabled_flag_does_not_crash_startup() -> None:
+    """``TracerProvider._disabled`` is SDK-private while pyproject accepts any
+    1.x minor, and configure_tracing() is called unguarded from main(). A
+    rename must degrade the OTEL_SDK_DISABLED guard, not crash the service."""
+    from unittest.mock import patch
+
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    class NoDisabledProvider:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def add_span_processor(self, processor) -> None:
+            pass
+
+        def get_tracer(self, name):
+            return object()
+
+        def shutdown(self) -> None:
+            pass
+
+    reset_tracing_for_tests()
+    try:
+        with patch("opentelemetry.sdk.trace.TracerProvider", NoDisabledProvider):
+            assert configure_tracing(
+                _config(tracing_enabled=True, tracing_otlp_endpoint="http://collector.internal/v1/traces"),
+                span_exporter=InMemorySpanExporter(),
+            )
+    finally:
+        reset_tracing_for_tests()
+
+
 async def test_disabled_engine_never_consults_global_provider(monkeypatch) -> None:
     from core.domain.pipeline.engine import IngestEngine, PipelineContext
 

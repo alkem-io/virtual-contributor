@@ -46,6 +46,31 @@ async def test_plugin_and_store_merge_retrieval_attributes_on_one_span(
     assert attributes["vc.retrieval.chunks_passed"] == 2
 
 
+async def test_reused_retrieval_span_records_failure_exactly_once(
+    traced_exporter, traced_config
+) -> None:
+    """In the real wiring the plugin's ``optional_span('vc.retrieval')`` already
+    owns the span and records the failure as it propagates. The reused-span
+    branch must therefore NOT record again: a second record_failure would emit
+    a duplicate exception event on one span and double-count the error rate."""
+    class FailingStore(MockKnowledgeStorePort):
+        async def query(self, collection: str, query_texts: list[str], n_results: int = 10) -> QueryResult:
+            raise RuntimeError("store unavailable")
+
+    event = make_input(bodyOfKnowledgeID="bok")
+    with handle_span(traced_config, event, "expert"):
+        try:
+            await ExpertPlugin(MockLLMPort(), TracedKnowledgeStore(FailingStore())).handle(event)
+        except Exception:
+            pass
+    shutdown_tracing()
+    retrieval = [s for s in traced_exporter.get_finished_spans() if s.name == "vc.retrieval"]
+    assert retrieval, "no retrieval span was exported"
+    for span in retrieval:
+        assert span.status.status_code.name == "ERROR"
+        assert len([e for e in span.events if e.name == "exception"]) == 1
+
+
 async def test_store_operation_span_is_emitted(traced_exporter) -> None:
     store = TracedKnowledgeStore(MockKnowledgeStorePort())
     await store.ingest("knowledge", ["doc"], [{}], ["id"])

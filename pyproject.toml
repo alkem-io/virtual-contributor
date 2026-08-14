@@ -40,6 +40,12 @@ beautifulsoup4 = "^4.14"
 requests = "^2.32"
 
 # Observability (disabled by default; imported lazily by core.tracing)
+# NOTE: core.tracing couples to two SDK/exporter internals to keep the
+# zero-egress guarantee — TracerProvider._disabled and the OTLP exporter's
+# _client_key_file/_client_certificate_file/_client_cert. Both are read or
+# written defensively (getattr with a fail-open default / write-only
+# assignment), so a rename in an accepted 1.x minor degrades a guard rather
+# than crashing startup. If these are pinned tighter, revisit that handling.
 opentelemetry-api = "^1.30"
 opentelemetry-sdk = "^1.30"
 opentelemetry-exporter-otlp-proto-http = "^1.30"
