@@ -10,6 +10,7 @@ import signal
 
 from core.config import BaseConfig
 from core.container import Container
+from core.domain.rerank import LexicalReranker
 from core.health import HealthServer
 from core.logging import setup_logging
 from core.ports.llm import LLMPort
@@ -49,6 +50,10 @@ def _log_config(config: BaseConfig) -> None:
         "guidance_n_results",
         "guidance_min_score",
         "max_context_chars",
+        "rerank_enabled",
+        "rerank_candidate_n",
+        "rerank_top_k",
+        "rerank_lexical_weight",
         "summary_chunk_threshold",
         "pipeline_timeout",
     ]
@@ -246,6 +251,18 @@ async def _run(config: BaseConfig) -> None:
             deps["score_threshold"] = config.retrieval_score_threshold
     if "max_context_chars" in sig.parameters:
         deps["max_context_chars"] = config.max_context_chars
+    # Inject the re-ranker only when enabled. Left absent, the plugins keep
+    # their `reranker=None` default and never take the re-ranking path — which
+    # is what makes disabling it a true rollback rather than a second code
+    # path that merely resembles the old one.
+    if config.rerank_enabled and "reranker" in sig.parameters:
+        deps["reranker"] = LexicalReranker(
+            lexical_weight=config.rerank_lexical_weight,
+        )
+        if "rerank_candidate_n" in sig.parameters:
+            deps["rerank_candidate_n"] = config.rerank_candidate_n
+        if "rerank_top_k" in sig.parameters:
+            deps["rerank_top_k"] = config.rerank_top_k
     # Inject summarization LLM for ingest plugins
     if "summarize_llm" in sig.parameters:
         deps["summarize_llm"] = summarize_llm

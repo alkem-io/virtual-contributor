@@ -8,8 +8,52 @@ from core.events.input import Input
 from core.events.response import Response, Source
 from core.ports.llm import LLMPort
 from core.ports.knowledge_store import KnowledgeStorePort, QueryResult
+from core.ports.reranker import RerankerPort
 
 logger = logging.getLogger(__name__)
+
+
+def _apply_rerank(
+    reranker: RerankerPort,
+    query: str,
+    result: QueryResult,
+    top_k: int,
+) -> QueryResult:
+    """Re-order a result set, keeping its four parallel lists in step.
+
+    The re-ranker returns a permutation of indices, and every list a caller
+    holds must be permuted the same way. Getting this wrong would not raise —
+    it would attribute one passage's text to another passage's source URL and
+    cite it confidently, which is worse than an error.
+
+    Distances are carried through **unmodified**, only reordered. The blended
+    ranking score is deliberately not written back: it is normalised across the
+    candidate pool, so persisting it would corrupt the relevance threshold
+    downstream, which is judged on the real vector distance.
+    """
+    docs = result.documents[0] if result.documents else []
+    if not docs:
+        return result
+
+    distances = result.distances[0] if result.distances else []
+    metadatas = result.metadatas[0] if result.metadatas else []
+    ids = result.ids[0] if result.ids else []
+
+    # The port takes similarity (higher is better), not distance. Passing raw
+    # distances would silently invert the ranking.
+    vector_scores = [
+        1.0 - distances[i] if i < len(distances) else 0.0
+        for i in range(len(docs))
+    ]
+
+    order = reranker.rerank(query, docs, vector_scores, top_k=top_k)
+
+    return QueryResult(
+        documents=[[docs[i] for i in order]],
+        metadatas=[[metadatas[i] if i < len(metadatas) else {} for i in order]],
+        distances=[[distances[i] if i < len(distances) else 1.0 for i in order]],
+        ids=[[ids[i] if i < len(ids) else "" for i in order]],
+    )
 
 
 def _filter_and_format(
@@ -63,12 +107,37 @@ class ExpertPlugin:
         n_results: int = 5,
         score_threshold: float = 0.3,
         max_context_chars: int = 20000,
+        reranker: RerankerPort | None = None,
+        rerank_candidate_n: int = 20,
+        rerank_top_k: int = 5,
     ) -> None:
         self._llm = llm
         self._knowledge_store = knowledge_store
         self._n_results = n_results
         self._score_threshold = score_threshold
         self._max_context_chars = max_context_chars
+        # Absent unless re-ranking is enabled, so an existing deployment keeps
+        # exactly its current retrieval behaviour with no new code path.
+        self._reranker = reranker
+        self._rerank_candidate_n = rerank_candidate_n
+        self._rerank_top_k = rerank_top_k
+
+    @property
+    def _retrieval_n_results(self) -> int:
+        """How many candidates to fetch.
+
+        Re-ranking can only reorder what retrieval returned, so it needs a
+        wider pool to choose from. Without it, the count is unchanged — which
+        is what makes disabling re-ranking a genuine rollback rather than a
+        differently-shaped request.
+        """
+        return self._rerank_candidate_n if self._reranker else self._n_results
+
+    def _maybe_rerank(self, query: str, result: QueryResult) -> QueryResult:
+        """Re-order candidates when re-ranking is on; otherwise pass through."""
+        if self._reranker is None:
+            return result
+        return _apply_rerank(self._reranker, query, result, self._rerank_top_k)
 
     async def startup(self) -> None:
         logger.info("ExpertPlugin started")
@@ -140,9 +209,10 @@ class ExpertPlugin:
         graph = PromptGraph.from_definition(event.prompt_graph)
 
         # Create retrieve special node
-        n_results = self._n_results
+        n_results = self._retrieval_n_results
         score_threshold = self._score_threshold
         enforce_budget = self._enforce_context_budget
+        maybe_rerank = self._maybe_rerank
 
         async def retrieve_node(state: dict) -> dict:
             query = (
@@ -153,6 +223,10 @@ class ExpertPlugin:
             result = await self._knowledge_store.query(
                 collection=collection, query_texts=[query], n_results=n_results,
             )
+            # Re-rank against the question actually asked at this point in the
+            # graph — the rephrased one when there is one, since that is what
+            # was retrieved on.
+            result = maybe_rerank(query, result)
             docs, filtered_result = _filter_and_format(result, score_threshold)
             docs, filtered_result = enforce_budget(docs, filtered_result)
             knowledge = "\n".join(docs)
@@ -208,8 +282,11 @@ class ExpertPlugin:
     async def _handle_simple(self, event: Input, collection: str) -> Response:
         """Simple RAG without graph execution."""
         result = await self._knowledge_store.query(
-            collection=collection, query_texts=[event.message], n_results=self._n_results,
+            collection=collection,
+            query_texts=[event.message],
+            n_results=self._retrieval_n_results,
         )
+        result = self._maybe_rerank(event.message, result)
         docs, result = _filter_and_format(result, self._score_threshold)
         docs, result = self._enforce_context_budget(docs, result)
         knowledge = "\n".join(docs)

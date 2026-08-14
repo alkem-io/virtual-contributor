@@ -161,6 +161,35 @@ class BaseConfig(BaseSettings):
                 f"GUIDANCE_MIN_SCORE must be between 0.0 and 1.0, got {self.guidance_min_score}"
             )
 
+        # Re-ranking validation. Fail at startup naming the variable: a bad
+        # value here would otherwise surface as quietly worse answers, with
+        # nothing in the logs to connect them to a config change.
+        if self.rerank_top_k <= 0:
+            raise ValueError(
+                f"RERANK_TOP_K must be greater than 0, got {self.rerank_top_k}"
+            )
+        if self.rerank_candidate_n <= 0:
+            raise ValueError(
+                f"RERANK_CANDIDATE_N must be greater than 0, "
+                f"got {self.rerank_candidate_n}"
+            )
+        if self.rerank_candidate_n < self.rerank_top_k:
+            # Keeping fewer candidates than we keep results is incoherent —
+            # re-ranking would have nothing to choose between.
+            raise ValueError(
+                f"RERANK_CANDIDATE_N ({self.rerank_candidate_n}) must be at "
+                f"least RERANK_TOP_K ({self.rerank_top_k})"
+            )
+        # NaN and inf are covered by this same check, not by a separate
+        # isfinite guard: every comparison against NaN is False, so `not
+        # (0.0 <= nan <= 1.0)` is True and NaN is rejected here. Both are
+        # asserted in the config tests so this stays true.
+        if not (0.0 <= self.rerank_lexical_weight <= 1.0):
+            raise ValueError(
+                f"RERANK_LEXICAL_WEIGHT must be between 0.0 and 1.0, "
+                f"got {self.rerank_lexical_weight}"
+            )
+
         # Context budget validation
         if self.max_context_chars <= 0:
             raise ValueError(
@@ -278,6 +307,22 @@ class BaseConfig(BaseSettings):
     # Retrieval — deprecated global fields (kept for backward compat)
     retrieval_n_results: int = 5
     retrieval_score_threshold: float = 0.3
+
+    # Re-ranking — off by default. It changes what every answer is grounded
+    # in, so it is opted into rather than inherited. Disabling it restores
+    # prior behaviour exactly: the same n_results is requested and no
+    # re-ranking code runs at all.
+    rerank_enabled: bool = False
+    #: Candidates fetched when re-ranking is on. Re-ranking can only reorder
+    #: what retrieval returned, so it needs a wider pool than it will keep.
+    rerank_candidate_n: int = 20
+    #: Candidates surviving re-ranking, into context assembly.
+    rerank_top_k: int = 5
+    #: Lexical share of the blend. 0.0 provably reproduces vector order — the
+    #: fine-grained rollback. Must stay above 0.5: see
+    #: LexicalReranker.DEFAULT_LEXICAL_WEIGHT for why the midpoint is
+    #: degenerate rather than neutral.
+    rerank_lexical_weight: float = 0.6
 
     # Ingest pipeline
     chunk_size: int = 2000
