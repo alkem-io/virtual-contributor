@@ -59,7 +59,7 @@ async def test_filtered_query_uses_the_existing_retry_path(adapter: ChromaDBAdap
     collection = _configured_collection(adapter)
     where = {"embeddingType": {"$ne": "summary"}}
 
-    async def call_query(fn):
+    async def call_query(fn, **kwargs):
         return await asyncio.to_thread(fn)
 
     with patch.object(adapter, "_retry", new=AsyncMock(side_effect=call_query)) as retry:

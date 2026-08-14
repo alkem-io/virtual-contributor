@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import logging
-import inspect
 
 from core.config import BaseConfig
 from core.container import Container
 from core.events.input import Input
 from core.ports.knowledge_store import KnowledgeStorePort
 from core.ports.llm import LLMPort
-from core.provider_factory import create_llm_adapter
+from core.provider_factory import create_llm_adapter  # noqa: F401 - test seam
 from core.registry import PluginRegistry
 from evaluation.tracing import TracingKnowledgeStore
 
@@ -41,37 +40,36 @@ class PipelineInvoker:
         """Initialize the pipeline: container, adapters, plugin."""
         from core.adapters.chromadb import ChromaDBAdapter
 
-        # Create LLM adapter
-        self._llm_adapter = create_llm_adapter(self._config)
+        # Production owns adapter and expert dependency composition. Evaluation
+        # differs only by wrapping the already-composed store for transparent
+        # capture, preventing a paired run from silently using other settings.
+        from main import _create_adapters, _inject_answering_config, _inject_plugin_config
 
-        # Create knowledge store adapter
-        ks_adapter = ChromaDBAdapter(
-            host=self._config.vector_db_host or "localhost",
-            port=self._config.vector_db_port,
-            credentials=self._config.vector_db_credentials,
-        )
-
-        # Wrap with tracing
-        self._tracing_store = TracingKnowledgeStore(ks_adapter)
-
-        # Build container
         container = Container()
-        container.register(LLMPort, self._llm_adapter)
+        _create_adapters(self._config, container)
+        if KnowledgeStorePort not in container._bindings:
+            container.register(KnowledgeStorePort, ChromaDBAdapter(
+                host=self._config.vector_db_host or "localhost",
+                port=self._config.vector_db_port,
+            ))
+        self._llm_adapter = container._bindings.get(LLMPort)
+        self._tracing_store = TracingKnowledgeStore(container._bindings[KnowledgeStorePort])
         container.register(KnowledgeStorePort, self._tracing_store)
 
         # Discover and instantiate plugin
         registry = PluginRegistry()
         plugin_class = registry.discover(self._plugin_type)
         deps = container.resolve_for_plugin(plugin_class)
-        signature = inspect.signature(plugin_class.__init__)
-        # Container resolution supplies ports.  Evaluation constructs plugins
-        # in-process, so pass opt-in expert settings here as production does.
-        if "hierarchical_retrieval_enabled" in signature.parameters:
-            deps["hierarchical_retrieval_enabled"] = (
-                self._config.expert_hierarchical_retrieval_enabled
-            )
-        if "hierarchy_max_branches" in signature.parameters:
-            deps["hierarchy_max_branches"] = self._config.expert_hierarchy_max_branches
+        signature = _inject_plugin_config(deps, plugin_class, self._config, None, None)
+        _inject_answering_config(self._config, deps, signature)
+        if "hybrid_config" in signature.parameters:
+            deps["hybrid_config"] = self._config
+        if "rerank_candidate_n" in signature.parameters:
+            deps["rerank_candidate_n"] = self._config.rerank_candidate_n
+        if "rerank_top_k" in signature.parameters:
+            deps["rerank_top_k"] = self._config.rerank_top_k
+        if "context_observer" in signature.parameters:
+            deps["context_observer"] = self._tracing_store.capture_generation_context
         self._plugin = plugin_class(**deps)
 
         await self._plugin.startup()

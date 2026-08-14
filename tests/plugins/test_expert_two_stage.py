@@ -19,10 +19,10 @@ GRAPH = {"nodes": [{"name": "n"}], "edges": [{"from": "START", "to": "END"}]}
 
 def _entries() -> list[dict]:
     return [
-        {"id": "route-a", "document": "Alpha overview", "metadata": {"embeddingType": "overview", "spaceId": "a", "spaceName": "Alpha"}},
-        {"id": "a-1", "document": "Alpha liability detail", "metadata": {"embeddingType": "chunk", "spaceId": "a", "spaceName": "Alpha", "source": "a-1"}},
-        {"id": "a-2", "document": "Alpha evidence", "metadata": {"embeddingType": "chunk", "spaceId": "a", "source": "a-2"}},
-        {"id": "b-1", "document": "Beta liability noise", "metadata": {"embeddingType": "chunk", "spaceId": "b", "source": "b-1"}},
+        {"id": "route-a", "document": "Alpha overview", "metadata": {"embeddingType": "overview", "spaceId": "a", "subspaceId": "a-sub", "spaceName": "Alpha"}},
+        {"id": "a-1", "document": "Alpha liability detail", "metadata": {"embeddingType": "chunk", "spaceId": "a", "subspaceId": "a-sub", "spaceName": "Alpha", "source": "a-1"}},
+        {"id": "a-2", "document": "Alpha evidence", "metadata": {"embeddingType": "chunk", "spaceId": "a", "subspaceId": "a-sub", "source": "a-2"}},
+        {"id": "b-1", "document": "Beta liability noise", "metadata": {"embeddingType": "chunk", "spaceId": "a", "subspaceId": "b-sub", "source": "b-1"}},
     ]
 
 

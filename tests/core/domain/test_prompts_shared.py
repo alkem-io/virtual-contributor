@@ -120,11 +120,11 @@ def test_hierarchy_renders_space_then_nearest_subspace() -> None:
     assert block.startswith("[Document 1 · Space: Root · Subspace: Near · Post]")
 
 
-def test_hierarchy_falls_back_to_stored_identifiers() -> None:
+def test_hierarchy_never_falls_back_to_stored_identifiers() -> None:
     block = render_document_block(
         1, "passage", {"spaceId": "s-1", "subspaceId": "ss-2"}, hierarchy=True,
     )
-    assert "Space: s-1" in block and "Subspace: ss-2" in block
+    assert "s-1" not in block and "ss-2" not in block
 
 
 def test_hierarchy_metadata_is_sanitized_and_bounded() -> None:

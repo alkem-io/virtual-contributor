@@ -36,7 +36,8 @@ async def test_final_detail_context_excludes_hierarchy_routing_context() -> None
     tracing_store = TracingKnowledgeStore(delegate)
     await tracing_store.query("knowledge", ["question"], where={"embeddingType": {"$eq": "overview"}})
     await tracing_store.query("knowledge", ["question"], where={"spaceId": "s"})
-    assert tracing_store.get_final_detail_contexts() == ["detail"]
+    tracing_store.capture_generation_context(["[Document 1]\ndetail"])
+    assert tracing_store.get_final_detail_contexts() == ["[Document 1]\ndetail"]
 
 
 async def test_final_detail_context_is_flat_result_when_only_one_query() -> None:
@@ -44,4 +45,5 @@ async def test_final_detail_context_is_flat_result_when_only_one_query() -> None
     delegate.query = AsyncMock(return_value=QueryResult([["detail"]], [[{}]], [[0.1]], [["detail"]]))
     tracing_store = TracingKnowledgeStore(delegate)
     await tracing_store.query("knowledge", ["question"])
-    assert tracing_store.get_final_detail_contexts() == ["detail"]
+    tracing_store.capture_generation_context(["[Document 1]\ndetail"])
+    assert tracing_store.get_final_detail_contexts() == ["[Document 1]\ndetail"]

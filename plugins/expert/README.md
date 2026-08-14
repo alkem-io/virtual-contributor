@@ -53,6 +53,12 @@ empty scoped detail result, or a hierarchy-stage error falls back to the exact
 flat pipeline. A short non-empty scoped result is intentionally not backfilled
 from siblings. Disable the flag to roll back immediately.
 
+Stored IDs remain internal to filters and are never put in model-visible
+headers. Space and subspace display names are private, user-controlled
+metadata. Environment enablement additionally requires recorded provider
+processing/minimization approval (purpose, region, retention, training and
+subprocessor coverage) before the flag may be enabled.
+
 ## Grounded, citable answers
 
 Every surviving retrieved passage is presented to the model as a separate block:

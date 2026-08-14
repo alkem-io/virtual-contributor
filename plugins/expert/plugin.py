@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Callable
 import time
 
 from core.domain.prompts_shared import (
@@ -193,6 +193,7 @@ class ExpertPlugin:
         max_history_chars: int = DEFAULT_MAX_HISTORY_CHARS,
         hierarchical_retrieval_enabled: bool = False,
         hierarchy_max_branches: int = 3,
+        context_observer: Callable[[list[str]], None] | None = None,
     ) -> None:
         self._llm = llm
         self._knowledge_store = knowledge_store
@@ -223,6 +224,7 @@ class ExpertPlugin:
         self._max_history_chars = max_history_chars
         self._hierarchical_retrieval_enabled = hierarchical_retrieval_enabled
         self._hierarchy_max_branches = hierarchy_max_branches
+        self._context_observer = context_observer
 
     @property
     def _retrieval_n_results(self) -> int:
@@ -514,6 +516,8 @@ class ExpertPlugin:
         if not self._hierarchical_retrieval_enabled:
             return await flat()
 
+        predicate = None
+        routing_failed = False
         try:
             routing_result = await self._knowledge_store.query(
                 collection=collection,
@@ -527,8 +531,12 @@ class ExpertPlugin:
                 max_branches=self._hierarchy_max_branches,
             )
             predicate = scoped_detail_where(branches)
-            if predicate is None:
-                return await flat()
+        except Exception as exc:
+            logger.warning("Hierarchy routing fallback: error_type=%s", type(exc).__name__)
+            routing_failed = True
+        if routing_failed or predicate is None:
+            return await flat()
+        try:
             docs, result, initial_count = await self._retrieve_pipeline(
                 collection, query, profile, where=predicate, hierarchy=True,
             )
@@ -536,14 +544,9 @@ class ExpertPlugin:
             # result.  Only absence of usable detail re-enters flat retrieval.
             if docs:
                 return docs, result, initial_count
-            return await flat()
         except Exception as exc:
-            # Metadata, query text, and passage content are member data.  The
-            # stage and exception type explain the operational state safely.
-            logger.warning(
-                "Hierarchy retrieval fallback: error_type=%s", type(exc).__name__,
-            )
-            return await flat()
+            logger.warning("Hierarchy detail fallback: error_type=%s", type(exc).__name__)
+        return await flat()
 
     async def _handle_with_graph(
         self, event: Input, collection: str, profile: RetrievalProfile,
@@ -616,6 +619,8 @@ class ExpertPlugin:
                     mark_empty_retrieval()
             # #109: numbered blocks, so the model can cite [Document N].
             knowledge = join_document_blocks(docs)
+            if self._context_observer is not None:
+                self._context_observer(docs)
             # #117: captured where retrieval happens — the graph's state
             # schema is caller-supplied and drops undeclared keys, so the
             # closure, not the state, carries what was actually retrieved.
@@ -730,6 +735,7 @@ class ExpertPlugin:
         from core.tracing import mark_empty_retrieval, optional_span
 
         question = await self._resolve_question(event)
+        profile = self._resolve_profile(question)
         if profile.retrieve:
             with optional_span("vc.retrieval", kind=SpanKind.CLIENT) as span:
                 docs, result, initial_count = await self._retrieve_context(
@@ -744,6 +750,8 @@ class ExpertPlugin:
             docs = []
             result = QueryResult(documents=[[]], metadatas=[[]], distances=[[]], ids=[[]])
         knowledge = join_document_blocks(docs)
+        if self._context_observer is not None:
+            self._context_observer(docs)
 
         from plugins.expert.prompts import combined_expert_prompt
         prompt = combined_expert_prompt.format(

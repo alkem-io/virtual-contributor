@@ -70,11 +70,15 @@ def test_branch_caps_at_three() -> None:
 
 
 def test_scoped_single_branch_is_not_store_invalid_or() -> None:
-    where = scoped_detail_where([BranchRef("spaceId", "a")])
-    assert where is not None and {"spaceId": {"$eq": "a"}} in where["$and"]
+    where = scoped_detail_where([BranchRef("subspaceId", "a")])
+    assert where is not None and {"subspaceId": {"$eq": "a"}} in where["$and"]
     assert "$or" not in where["$and"][-1]
 
 
 def test_scoped_multiple_branches_uses_typed_or() -> None:
-    where = scoped_detail_where([BranchRef("spaceId", "a"), BranchRef("subspaceId", "b")])
-    assert where is not None and where["$and"][-1] == {"$or": [{"spaceId": {"$eq": "a"}}, {"subspaceId": {"$eq": "b"}}]}
+    where = scoped_detail_where([BranchRef("subspaceId", "a"), BranchRef("subspaceId", "b")])
+    assert where is not None and where["$and"][-1] == {"$or": [{"subspaceId": {"$eq": "a"}}, {"subspaceId": {"$eq": "b"}}]}
+
+
+def test_scoped_root_only_is_unusable_for_descendant_safe_routing() -> None:
+    assert scoped_detail_where([BranchRef("spaceId", "root")]) is None

@@ -218,6 +218,8 @@ def _log_config(config: BaseConfig, plugin_class: type | None = None) -> None:
         "bok_llm_base_url",
         "expert_n_results",
         "expert_min_score",
+        "expert_hierarchical_retrieval_enabled",
+        "expert_hierarchy_max_branches",
         "guidance_n_results",
         "guidance_min_score",
         "max_context_chars",

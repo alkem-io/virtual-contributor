@@ -93,6 +93,14 @@ def scoped_detail_where(branches: list[BranchRef]) -> dict | None:
 
     if not branches:
         return None
+    # A root space ID is retained on every descendant.  It therefore subsumes
+    # any specific subspace route in the same space.  Prefer the precise keys;
+    # root-only routing cannot safely distinguish root content from descendants
+    # with today's metadata, so deliberately take the flat compatibility path.
+    subspaces = [branch for branch in branches if branch.field == "subspaceId"]
+    if not subspaces:
+        return None
+    branches = subspaces
     clauses = [{branch.field: {"$eq": branch.value}} for branch in branches]
     branch_clause = clauses[0] if len(clauses) == 1 else {"$or": clauses}
     return {"$and": [*DETAIL_WHERE["$and"], branch_clause]}

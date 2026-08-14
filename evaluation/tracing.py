@@ -15,6 +15,11 @@ class TracingKnowledgeStore:
     def __init__(self, delegate: KnowledgeStorePort) -> None:
         self._delegate = delegate
         self._captured: list[QueryResult] = []
+        self._generation_contexts: list[str] = []
+
+    def capture_generation_context(self, blocks: list[str]) -> None:
+        """Capture the exact rendered blocks handed to the answering LLM."""
+        self._generation_contexts = list(blocks)
 
     async def query(
         self,
@@ -58,10 +63,9 @@ class TracingKnowledgeStore:
         generation context.  Flat retrieval naturally has one captured result.
         """
 
-        if not self._captured:
-            return []
-        return [doc for docs in self._captured[-1].documents for doc in docs]
+        return list(self._generation_contexts)
 
     def clear(self) -> None:
         """Reset captured state between test cases."""
         self._captured = []
+        self._generation_contexts = []

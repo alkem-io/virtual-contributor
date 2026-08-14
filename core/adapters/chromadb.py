@@ -81,7 +81,7 @@ class ChromaDBAdapter:
                 ids=results.get("ids", []),
             )
 
-        return await self._retry(_query)
+        return await self._retry(_query, redact_errors=where is not None)
 
     @staticmethod
     def _document_predicate(terms: list[str]) -> dict:
@@ -303,7 +303,8 @@ class ChromaDBAdapter:
                 last_exc = exc
                 if attempt < max_retries - 1:
                     delay = BASE_DELAY * (2 ** attempt)
-                    logger.warning("ChromaDB attempt %d failed, retrying: %s", attempt + 1, exc)
+                    detail = type(exc).__name__ if redact_errors else exc
+                    logger.warning("ChromaDB attempt %d failed, retrying: %s", attempt + 1, detail)
                     await asyncio.sleep(delay)
             except Exception as exc:
                 last_exc = exc

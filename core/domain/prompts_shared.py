@@ -97,8 +97,10 @@ def render_document_block(
 
     label_parts = [f"Document {number}"]
     if hierarchy:
-        space = _metadata_text(metadata, "spaceName") or _metadata_text(metadata, "spaceId")
-        subspace = _metadata_text(metadata, "subspaceName") or _metadata_text(metadata, "subspaceId")
+        # Stable hierarchy IDs are retrieval-only identifiers. Never disclose
+        # them to an answering provider when a display name is absent.
+        space = _metadata_text(metadata, "spaceName")
+        subspace = _metadata_text(metadata, "subspaceName")
         if space:
             label_parts.append(f"Space: {space}")
         if subspace:
