@@ -73,3 +73,69 @@ class TestContainer:
         container.register(LLMPort, mock1)
         container.register(LLMPort, mock2)
         assert container.resolve(LLMPort) is mock2
+
+
+class TestOptionalPortAnnotations:
+    """`Port | None` is still a request for Port.
+
+    Before this, the exact-union lookup always missed, so an optional port
+    could only be supplied by bypassing the container — which is how the
+    re-ranker came to be constructed by hand in main.py.
+    """
+
+    def test_optional_port_resolves_to_the_registered_adapter(self):
+        container = Container()
+        mock = MockLLMPort()
+        container.register(LLMPort, mock)
+
+        class OptionalLLM:
+            name = "optional-llm"
+
+            def __init__(self, llm: LLMPort | None = None):
+                self.llm = llm
+
+        assert container.resolve_for_plugin(OptionalLLM)["llm"] is mock
+
+    def test_unregistered_optional_port_is_simply_absent(self):
+        """The default must survive: this is the rollback path."""
+        container = Container()
+
+        class OptionalLLM:
+            name = "optional-llm"
+
+            def __init__(self, llm: LLMPort | None = None):
+                self.llm = llm
+
+        assert "llm" not in container.resolve_for_plugin(OptionalLLM)
+
+    def test_unresolvable_union_reports_the_port_not_an_attribute_error(self):
+        """`types.UnionType` has no __name__.
+
+        Building the error message from it raised AttributeError from inside
+        the raise, replacing a named, actionable startup error with a crash
+        that pointed at the container instead of the missing registration.
+        """
+        container = Container()
+
+        class NeedsOptionalLLM:
+            name = "needs-optional-llm"
+
+            def __init__(self, llm: LLMPort | None):  # union, no default
+                self.llm = llm
+
+        with pytest.raises(ContainerError, match="requires port"):
+            container.resolve_for_plugin(NeedsOptionalLLM)
+
+    def test_a_genuine_two_type_union_is_left_alone(self):
+        """No single port to resolve — behaviour is unchanged."""
+        container = Container()
+        container.register(LLMPort, MockLLMPort())
+        container.register(KnowledgeStorePort, MockKnowledgeStorePort())
+
+        class Ambiguous:
+            name = "ambiguous"
+
+            def __init__(self, port: LLMPort | KnowledgeStorePort | None = None):
+                self.port = port
+
+        assert "port" not in container.resolve_for_plugin(Ambiguous)

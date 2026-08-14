@@ -2,9 +2,37 @@ from __future__ import annotations
 
 import inspect
 import logging
-from typing import Any, get_type_hints
+import types
+from typing import Any, Union, get_args, get_origin, get_type_hints
 
 logger = logging.getLogger(__name__)
+
+
+def _port_of(annotation: Any) -> Any:
+    """Unwrap ``Port | None`` to ``Port``; pass anything else through.
+
+    An optional port is still a request for that port — the ``None`` only says
+    the plugin can run without it. Looking the union itself up in the bindings
+    always misses, so before this the only way to supply an optional port was
+    to bypass the container, which is how ``reranker`` came to be wired by
+    hand in ``main.py``.
+
+    Unions of two or more real types are left alone: there is no single port
+    to resolve, so the caller gets the same miss it did before.
+    """
+    if get_origin(annotation) not in (Union, types.UnionType):
+        return annotation
+    non_none = [a for a in get_args(annotation) if a is not type(None)]
+    return non_none[0] if len(non_none) == 1 else annotation
+
+
+def _describe(annotation: Any) -> str:
+    """Name an annotation for an error message.
+
+    ``types.UnionType`` has no ``__name__``, so the unresolvable-port error
+    used to die with an ``AttributeError`` that hid the real problem.
+    """
+    return getattr(annotation, "__name__", None) or str(annotation)
 
 
 class ContainerError(Exception):
@@ -47,12 +75,15 @@ class Container:
         for param_name, param_type in hints.items():
             if param_name in ("self", "return"):
                 continue
-            adapter = self._bindings.get(param_type)
+            # `Port | None` is a request for Port; the None only marks it
+            # optional. Resolve the underlying port rather than the union.
+            adapter = self._bindings.get(_port_of(param_type))
             if adapter is not None:
                 resolved[param_name] = adapter
             elif sig.parameters[param_name].default is inspect.Parameter.empty:
                 raise ContainerError(
                     f"Plugin {getattr(plugin_class, 'name', plugin_class.__name__)} "
-                    f"requires port {param_type.__name__} but no adapter is registered"
+                    f"requires port {_describe(param_type)} but no adapter "
+                    f"is registered"
                 )
         return resolved

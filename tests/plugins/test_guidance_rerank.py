@@ -189,6 +189,42 @@ class TestResilience:
 
 
 class TestDisabledIsIdentical:
+    async def test_disabled_funnel_order_matches_the_pre_feature_behaviour(
+        self,
+    ) -> None:
+        """The rollback claim in README/.env.example, on the funnel itself.
+
+        The pre-feature code deduplicated and *then* truncated
+        (`deduped = deduped[:self._n_results]`, after the dedupe loop). This
+        re-implements that exact order over the same pool and asserts the
+        disabled plugin still agrees, so a future edit that moves the cut
+        ahead of the dedupe — returning fewer distinct sources than asked
+        for — fails here rather than silently degrading grounding.
+        """
+        store = _DuplicateSourceStore()
+        plugin = _plugin(store, n_results=3, score_threshold=0.0)
+        response = await plugin.handle(make_input(message=QUESTION))
+
+        # The pre-feature funnel, replayed over the same candidates.
+        pairs = [
+            ("https://example.org/same", 0.90), ("https://example.org/same", 0.89),
+            ("https://example.org/same", 0.88), ("https://example.org/same", 0.87),
+            ("https://example.org/second", 0.70), ("https://example.org/third", 0.68),
+        ]
+        pairs.sort(key=lambda p: p[1], reverse=True)
+        seen: set[str] = set()
+        expected: list[str] = []
+        for source, _ in pairs:
+            if source not in seen:
+                seen.add(source)
+                expected.append(source)
+        expected = expected[:3]
+
+        assert [s.source for s in response.sources] == expected
+        # Three distinct pages existed, so three must come back — the property
+        # a pre-dedupe cut would break.
+        assert len(response.sources) == 3
+
     async def test_disabled_requests_n_results(self) -> None:
         store = _ThreeCollectionStore()
         plugin = _plugin(store, n_results=5, rerank_candidate_n=20)

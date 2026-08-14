@@ -16,6 +16,7 @@ from core.logging import setup_logging
 from core.ports.llm import LLMPort
 from core.ports.embeddings import EmbeddingsPort
 from core.ports.knowledge_store import KnowledgeStorePort
+from core.ports.reranker import RerankerPort
 from core.registry import PluginRegistry
 from core.router import Router
 
@@ -152,6 +153,16 @@ def _create_adapters(config: BaseConfig, container: Container) -> None:
 
     container.register(OpenAIAssistantAdapter, OpenAIAssistantAdapter())
 
+    # Re-ranker — registered only when enabled. Left unregistered, plugins
+    # keep their `reranker=None` default and never take the re-ranking path,
+    # which is what makes disabling it a true rollback rather than a second
+    # code path that merely resembles the old one.
+    if config.rerank_enabled:
+        container.register(
+            RerankerPort,
+            LexicalReranker(lexical_weight=config.rerank_lexical_weight),
+        )
+
 
 async def _run(config: BaseConfig) -> None:
     """Main async entrypoint."""
@@ -251,14 +262,12 @@ async def _run(config: BaseConfig) -> None:
             deps["score_threshold"] = config.retrieval_score_threshold
     if "max_context_chars" in sig.parameters:
         deps["max_context_chars"] = config.max_context_chars
-    # Inject the re-ranker only when enabled. Left absent, the plugins keep
-    # their `reranker=None` default and never take the re-ranking path — which
-    # is what makes disabling it a true rollback rather than a second code
-    # path that merely resembles the old one.
-    if config.rerank_enabled and "reranker" in sig.parameters:
-        deps["reranker"] = LexicalReranker(
-            lexical_weight=config.rerank_lexical_weight,
-        )
+    # The re-ranker itself now arrives via `resolve_for_plugin` above, which
+    # resolves the `RerankerPort | None` annotation to the registration made
+    # in `_create_adapters`. Only its scalar settings still need injecting,
+    # and only when it is actually present — otherwise a disabled deployment
+    # would carry re-ranking numbers it never uses.
+    if "reranker" in deps:
         if "rerank_candidate_n" in sig.parameters:
             deps["rerank_candidate_n"] = config.rerank_candidate_n
         if "rerank_top_k" in sig.parameters:

@@ -318,10 +318,15 @@ class BaseConfig(BaseSettings):
     rerank_candidate_n: int = 20
     #: Candidates surviving re-ranking, into context assembly.
     rerank_top_k: int = 5
-    #: Lexical share of the blend. 0.0 provably reproduces vector order — the
-    #: fine-grained rollback. Must stay above 0.5: see
-    #: LexicalReranker.DEFAULT_LEXICAL_WEIGHT for why the midpoint is
-    #: degenerate rather than neutral.
+    #: Lexical share of the blend. Accepted range is 0.0–1.0 inclusive; 0.0
+    #: provably reproduces vector order and is the fine-grained rollback.
+    #:
+    #: Between those ends the value is not free: to promote a worst-on-vector
+    #: passage the weight must exceed ``1 / (2 - L0)``, which is 0.5 when the
+    #: incumbent shares none of the query's wording. At exactly 0.5 the two
+    #: tie and the stable sort keeps the incumbent, so a weight in (0.0, 0.5]
+    #: is a validated setting that cannot do the thing re-ranking is for.
+    #: See LexicalReranker.DEFAULT_LEXICAL_WEIGHT for the derivation.
     rerank_lexical_weight: float = 0.6
 
     # Ingest pipeline

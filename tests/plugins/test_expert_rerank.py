@@ -127,9 +127,19 @@ class TestDisabledIsIdentical:
     async def test_disabled_preserves_store_order(self) -> None:
         store = _FixtureStore()
         plugin = _plugin(store, n_results=4, score_threshold=0.0)
-        await plugin.handle(make_input(message="how do I invite members to a space"))
+        response = await plugin.handle(
+            make_input(message="how do I invite members to a space"),
+        )
         # Nothing reordered: the store's own order survives into the answer.
-        assert store.query_calls[0][2] == 4
+        # Asserted on the sources themselves — the candidate count alone is
+        # already covered above and says nothing about ordering.
+        assert [s.uri for s in response.sources] == [
+            f"https://example.org/{i}" for i in range(4)
+        ]
+        # The passage this feature exists to promote is the term-matching one
+        # at index 2, worst on vector distance. With re-ranking off it must
+        # stay exactly where the store put it.
+        assert response.sources[2].uri == "https://example.org/2"
 
     async def test_enabling_adds_no_outbound_calls(self) -> None:
         """US4-AS4 — re-ranking is in-process; it must not add a round trip."""
