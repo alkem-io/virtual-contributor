@@ -31,6 +31,16 @@ classifier requires the *whole* message to be small talk — so it cannot contai
 a question that needs resolving. The narrower policy is roughly half as fast and
 correct, which is the trade taken here.
 
+**What the rewrite can and cannot influence.** The member controls both the
+message and the history, so they control the rewritten query — it is an
+untrusted string by construction. It changes *what* is searched for; it can
+never change *where*. The collection is derived from the event
+(``f"{bok_id}-knowledge"`` in expert, a fixed list in guidance), never from
+query text, so a crafted rewrite can only reorder results inside a collection
+the request was already authorised for. Verified by driving a fully
+attacker-controlled rewrite through expert: the query changed, the collection
+did not.
+
 Stdlib only, no I/O: the policy is supplied by the caller, and the prompt
 messages are built by each plugin so their existing wording is untouched.
 """
