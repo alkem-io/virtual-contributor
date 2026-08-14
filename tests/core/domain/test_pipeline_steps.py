@@ -3482,3 +3482,423 @@ class TestFailedReingestionLeavesBothRegimes:
         assert legacy_id not in ids, "the stale entry is swept on a clean run"
         assert len(ids) == 1, "no duplicate survives"
         assert store.collections["c"][0]["metadata"]["subspaceId"] == "sub-1"
+def _typed_doc(content: str, doc_type: str, doc_id: str = "d-1") -> Document:
+    return Document(
+        content=content,
+        metadata=DocumentMetadata(
+            document_id=doc_id, source=f"{doc_type}:{doc_id}",
+            type=doc_type, title="T",
+        ),
+    )
+
+
+class TestChunkStepIsTypeAware:
+    """Each kind of document is sized and labelled for how it is read."""
+
+    async def test_space_description_stays_whole_and_is_labelled_overview(self):
+        # 3,000 chars — the top of the range a description occupies, and far
+        # above a detail size that would otherwise cut it up.
+        doc = _typed_doc("word " * 600, "space")
+        ctx = PipelineContext(collection_name="c", documents=[doc])
+        await ChunkStep(chunk_size=500, chunk_overlap=50).execute(ctx)
+
+        assert len(ctx.chunks) == 1, "a description must answer as one passage"
+        assert ctx.chunks[0].metadata.embedding_type == "overview"
+
+    async def test_subspace_description_behaves_the_same(self):
+        doc = _typed_doc("word " * 600, "subspace")
+        ctx = PipelineContext(collection_name="c", documents=[doc])
+        await ChunkStep(chunk_size=500, chunk_overlap=50).execute(ctx)
+        assert len(ctx.chunks) == 1
+        assert ctx.chunks[0].metadata.embedding_type == "overview"
+
+    async def test_post_uses_the_detail_band_not_the_configured_default(self):
+        """A post overrides a larger default so specifics retrieve separately."""
+        doc = _typed_doc("word " * 2000, "post")   # ~10,000 chars
+        ctx = PipelineContext(collection_name="c", documents=[doc])
+        await ChunkStep(chunk_size=9000, chunk_overlap=100).execute(ctx)
+
+        assert len(ctx.chunks) > 1
+        assert all(len(c.content) <= 2000 for c in ctx.chunks)
+        assert all(c.metadata.embedding_type == "chunk" for c in ctx.chunks)
+
+    async def test_callout_inherits_the_configured_size(self):
+        """No size of its own: retuning the default must still take effect."""
+        doc = _typed_doc("word " * 400, "callout")   # ~2,000 chars
+        ctx = PipelineContext(collection_name="c", documents=[doc])
+        await ChunkStep(chunk_size=300, chunk_overlap=0).execute(ctx)
+
+        assert len(ctx.chunks) > 1, "an inherited size must actually apply"
+        assert all(c.metadata.embedding_type == "chunk" for c in ctx.chunks)
+
+    async def test_knowledge_base_content_is_not_an_overview(self):
+        """Long-form material kept whole would be a retrieval regression."""
+        doc = _typed_doc("word " * 2000, "knowledge")
+        ctx = PipelineContext(collection_name="c", documents=[doc])
+        await ChunkStep(chunk_size=500, chunk_overlap=0).execute(ctx)
+
+        assert len(ctx.chunks) > 1
+        assert all(c.metadata.embedding_type == "chunk" for c in ctx.chunks)
+
+    async def test_unknown_type_chunks_exactly_as_before(self):
+        doc = _typed_doc("word " * 400, "some-future-type")
+        ctx = PipelineContext(collection_name="c", documents=[doc])
+        await ChunkStep(chunk_size=300, chunk_overlap=0).execute(ctx)
+
+        assert len(ctx.chunks) > 1
+        assert all(c.metadata.embedding_type == "chunk" for c in ctx.chunks)
+
+    async def test_oversized_overview_splits_but_keeps_its_label(self):
+        """Above the ceiling it is split — and never downgraded to detail."""
+        doc = _typed_doc("word " * 4000, "space")   # ~20,000 chars > 8,000
+        ctx = PipelineContext(collection_name="c", documents=[doc])
+        await ChunkStep(chunk_size=2000, chunk_overlap=0).execute(ctx)
+
+        assert len(ctx.chunks) > 1
+        assert all(c.metadata.embedding_type == "overview" for c in ctx.chunks)
+
+    async def test_short_document_stays_whole_for_every_type(self):
+        """A property of each kind's resolved size, not of one small number.
+
+        Derived from the strategy table rather than hard-coded, so the test
+        tracks the table: a body at the resolved size stays whole, and one
+        comfortably above it does not. A size regression would fail here
+        instead of slipping through on a body small enough to survive any
+        threshold.
+        """
+        from core.domain.pipeline.chunk_strategy import resolve_strategy
+
+        configured = 2500
+        for doc_type in ("space", "subspace", "callout", "post", "knowledge"):
+            strategy = resolve_strategy(doc_type)
+            size = (
+                strategy.chunk_size
+                if strategy.chunk_size is not None
+                else configured
+            )
+
+            for length in (size - 1, size):
+                doc = _typed_doc("x" * length, doc_type)
+                ctx = PipelineContext(collection_name="c", documents=[doc])
+                await ChunkStep(
+                    chunk_size=configured, chunk_overlap=300,
+                ).execute(ctx)
+                assert len(ctx.chunks) == 1, f"{doc_type} at {length}"
+
+            # Negative half: comfortably above its size, it must split.
+            doc = _typed_doc("x " * size, doc_type)
+            ctx = PipelineContext(collection_name="c", documents=[doc])
+            await ChunkStep(chunk_size=configured, chunk_overlap=300).execute(ctx)
+            assert len(ctx.chunks) > 1, f"{doc_type} above {size}"
+
+    async def test_mixed_corpus_is_split_per_document(self):
+        """One run, several kinds — each sized by its own rule."""
+        docs = [
+            _typed_doc("word " * 600, "space", "sp-1"),
+            _typed_doc("word " * 2000, "post", "po-1"),
+            _typed_doc("word " * 100, "callout", "co-1"),
+        ]
+        ctx = PipelineContext(collection_name="c", documents=docs)
+        await ChunkStep(chunk_size=9000, chunk_overlap=100).execute(ctx)
+
+        by_doc: dict[str, list] = {}
+        for c in ctx.chunks:
+            by_doc.setdefault(c.metadata.document_id, []).append(c)
+
+        assert len(by_doc["sp-1"]) == 1
+        assert by_doc["sp-1"][0].metadata.embedding_type == "overview"
+        assert len(by_doc["po-1"]) > 1          # 10,000 chars at the 2,000 band
+        assert len(by_doc["co-1"]) == 1         # short, inherits 9,000
+
+    async def test_overlap_at_or_above_size_clamps_to_zero_and_warns(
+        self, caplog,
+    ):
+        """A misconfiguration must not silently multiply embedding spend.
+
+        The splitter rejects an overlap at or above the size, so it has to be
+        clamped — but to zero, the neutral value, and loudly. Clamping to some
+        invented fraction would inflate the passage count permanently, and
+        every extra passage is an extra embedding paid for on every run.
+        """
+        import logging
+
+        doc = _typed_doc("word " * 400, "callout")
+        ctx = PipelineContext(collection_name="c", documents=[doc])
+        with caplog.at_level(logging.WARNING):
+            await ChunkStep(chunk_size=200, chunk_overlap=500).execute(ctx)
+
+        assert ctx.chunks, "chunking must still produce passages"
+        assert any(
+            "overlap" in record.message.lower() for record in caplog.records
+        ), "the misconfiguration must be surfaced, not swallowed"
+
+        sane = PipelineContext(
+            collection_name="c",
+            documents=[_typed_doc("word " * 400, "callout")],
+        )
+        await ChunkStep(chunk_size=200, chunk_overlap=0).execute(sane)
+        assert len(ctx.chunks) == len(sane.chunks), (
+            "clamping must not inflate the passage count"
+        )
+
+
+class TestOverviewParticipatesInTheContentLifecycle:
+    """An overview is primary content, so it must live and die like content.
+
+    Summaries get an exemption because they are regenerated every run and
+    swept by their own naming convention. An overview has no such safety net:
+    if change detection cannot see it, it is re-embedded forever and survives
+    the deletion of the space it describes.
+    """
+
+    @staticmethod
+    def _doc(text: str, doc_id: str = "sp-1") -> Document:
+        return Document(
+            content=text,
+            metadata=DocumentMetadata(
+                document_id=doc_id, source=f"space:{doc_id}",
+                type="space", title="Root",
+            ),
+        )
+
+    async def _ingest(self, store, text, doc_id="sp-1", all_ids=None):
+        doc = self._doc(text, doc_id)
+        ctx = PipelineContext(
+            collection_name="c", documents=[doc],
+            all_document_ids=all_ids or {doc_id},
+        )
+        await ChunkStep(chunk_size=2500, chunk_overlap=300).execute(ctx)
+        await ContentHashStep().execute(ctx)
+        await ChangeDetectionStep(store).execute(ctx)
+        for c in ctx.chunks:
+            if c.embedding is None:
+                c.embedding = [0.1]
+        await StoreStep(knowledge_store_port=store).execute(ctx)
+        await OrphanCleanupStep(store).execute(ctx)
+        return ctx
+
+    async def test_unchanged_overview_is_skipped_on_re_ingest(self):
+        """Without this it is re-embedded on every run, forever."""
+        store = MockKnowledgeStorePort()
+        first = await self._ingest(store, "a description")
+        assert first.chunks_stored == 1
+        assert first.chunks[0].metadata.embedding_type == "overview"
+
+        second = await self._ingest(store, "a description")
+        assert second.chunks_skipped == 1
+        assert second.chunks_stored == 0
+
+    async def test_overview_is_content_addressed(self):
+        """Its storage id is its content hash, so identical text deduplicates."""
+        store = MockKnowledgeStorePort()
+        ctx = await self._ingest(store, "a description")
+        stored_id = store.collections["c"][0]["id"]
+        assert stored_id == ctx.chunks[0].content_hash
+
+    async def test_edited_overview_leaves_no_stale_copy(self):
+        store = MockKnowledgeStorePort()
+        await self._ingest(store, "the original description")
+        await self._ingest(store, "the edited description")
+
+        entries = store.collections["c"]
+        assert len(entries) == 1
+        assert entries[0]["document"] == "the edited description"
+
+    async def test_overview_is_swept_when_its_space_is_deleted(self):
+        """The failure that matters: retrieval must not keep answering for a
+        space that no longer exists."""
+        store = MockKnowledgeStorePort()
+        await self._ingest(store, "a description")
+
+        # Next run: sp-1 is gone upstream, a different space is present.
+        ctx = await self._ingest(
+            store, "another description", doc_id="sp-2", all_ids={"sp-2"},
+        )
+        assert "sp-1" in ctx.removed_document_ids
+        remaining = {e["metadata"]["documentId"] for e in store.collections["c"]}
+        assert "sp-1" not in remaining
+
+
+class TestOverviewCeilingBoundary:
+    """The ceiling is a deliberate bound, and it is narrower than one live default.
+
+    `ingest_space` currently constructs ChunkStep at 9,000, so a description
+    between 8,001 and 9,000 characters is one passage today and becomes two
+    under the ceiling. That is accepted: such a description is far outside the
+    500-3,000 range descriptions actually occupy, and past the length where a
+    single embedding still represents the text usefully. Pinning the ceiling to
+    "whatever the default happens to be" was rejected — that is exactly the
+    coupling an explicit table exists to break, and it inverts as soon as the
+    default drops to 2,500.
+
+    Pinned so the boundary is a recorded decision rather than a surprise.
+    """
+
+    @staticmethod
+    async def _passages(char_count: int, configured_size: int) -> int:
+        doc = Document(
+            content="x" * char_count,
+            metadata=DocumentMetadata(
+                document_id="d", source="s", type="space", title="T",
+            ),
+        )
+        ctx = PipelineContext(collection_name="c", documents=[doc])
+        await ChunkStep(chunk_size=configured_size, chunk_overlap=500).execute(ctx)
+        return len(ctx.chunks)
+
+    async def test_within_the_stated_range_stays_whole(self):
+        for size in (500, 1500, 3000):
+            assert await self._passages(size, 9000) == 1, size
+
+    async def test_at_the_ceiling_stays_whole(self):
+        assert await self._passages(8000, 9000) == 1
+
+    async def test_above_the_ceiling_splits_even_under_a_larger_default(self):
+        """The documented narrowing against the current 9,000 space default."""
+        assert await self._passages(8500, 9000) > 1
+
+    async def test_the_ceiling_is_more_permissive_once_the_default_drops(self):
+        """At 2,500 the ceiling only ever keeps MORE text whole, never less."""
+        for size in (3000, 5000, 8000):
+            assert await self._passages(size, 2500) == 1, size
+
+
+class TestLegacySummariesAreNotMistakenForContent:
+    """A legacy entry carries no label — only its id says what it is.
+
+    Treating an unlabelled entry as content is right for passages, and it is
+    what keeps the pre-label corpus sweepable. Applied to a summary it is the
+    opposite of right: the id lands in the removed-document set and the entry
+    is deleted outright. A per-document summary is regenerated only when its
+    source document changes, so that deletion is effectively permanent.
+    """
+
+    async def _cleanup_run(self, seeded_ids, present_id):
+        store = MockKnowledgeStorePort()
+        await store.ingest(
+            collection="c",
+            documents=["x"] * len(seeded_ids),
+            metadatas=[{"documentId": d} for d in seeded_ids],
+            ids=[f"legacy-{i}" for i in range(len(seeded_ids))],
+            embeddings=[[0.1]] * len(seeded_ids),
+        )
+        doc = Document(
+            content="live content",
+            metadata=DocumentMetadata(
+                document_id=present_id, source="s", type="post", title="T",
+            ),
+        )
+        ctx = PipelineContext(
+            collection_name="c", documents=[doc],
+            all_document_ids={present_id},
+        )
+        await ChunkStep(chunk_size=2500, chunk_overlap=300).execute(ctx)
+        await ContentHashStep().execute(ctx)
+        await ChangeDetectionStep(store).execute(ctx)
+        for c in ctx.chunks:
+            if c.embedding is None:
+                c.embedding = [0.4]
+        await StoreStep(knowledge_store_port=store).execute(ctx)
+        await OrphanCleanupStep(store).execute(ctx)
+        survivors = {
+            e["metadata"]["documentId"] for e in store.collections["c"]
+        }
+        return ctx, survivors
+
+    async def test_unlabelled_per_document_summary_survives(self):
+        ctx, survivors = await self._cleanup_run(
+            ["doc-1-summary", "doc-1"], "doc-1",
+        )
+        assert "doc-1-summary" not in ctx.removed_document_ids
+        assert "doc-1-summary" in survivors
+
+    async def test_unlabelled_corpus_overview_survives(self):
+        ctx, survivors = await self._cleanup_run(
+            ["body-of-knowledge-summary", "doc-1"], "doc-1",
+        )
+        assert "body-of-knowledge-summary" not in ctx.removed_document_ids
+        assert "body-of-knowledge-summary" in survivors
+
+    async def test_unlabelled_content_for_a_deleted_document_is_still_swept(self):
+        """The guard must not reopen what the widening was for."""
+        ctx, survivors = await self._cleanup_run(["gone-doc", "doc-1"], "doc-1")
+        assert "gone-doc" in ctx.removed_document_ids
+        assert "gone-doc" not in survivors
+
+
+class TestDerivedDocumentIdRecognition:
+    def test_recognises_both_summary_conventions(self):
+        from core.domain.pipeline.steps import _is_derived_document_id
+
+        assert _is_derived_document_id("doc-1-summary")
+        assert _is_derived_document_id("body-of-knowledge-summary")
+
+    def test_does_not_over_match_real_content(self):
+        from core.domain.pipeline.steps import _is_derived_document_id
+
+        for doc_id in ("doc-1", "summary", "my-summary-doc", "", None):
+            assert not _is_derived_document_id(doc_id), doc_id
+
+
+class TestLabelReachesTheStoreBoundary:
+    """Retrieval reads stored metadata, not the in-memory chunk.
+
+    Everything else asserts `chunk.metadata.embedding_type`. This asserts the
+    key retrieval actually reads, so a change to how metadata is written
+    cannot quietly stop the label from arriving.
+    """
+
+    async def test_overview_and_detail_are_distinguishable_in_the_store(self):
+        store = MockKnowledgeStorePort()
+        docs = [
+            _typed_doc("a description", "space", "sp-1"),
+            _typed_doc("word " * 2000, "post", "po-1"),
+        ]
+        ctx = PipelineContext(collection_name="c", documents=docs)
+        await ChunkStep(chunk_size=9000, chunk_overlap=100).execute(ctx)
+        await ContentHashStep().execute(ctx)
+        for c in ctx.chunks:
+            c.embedding = [0.1]
+        await StoreStep(knowledge_store_port=store).execute(ctx)
+
+        labels: dict[str, set[str]] = {}
+        for entry in store.collections["c"]:
+            meta = entry["metadata"]
+            labels.setdefault(meta["documentId"], set()).add(
+                meta["embeddingType"]
+            )
+
+        assert labels["sp-1"] == {"overview"}
+        assert labels["po-1"] == {"chunk"}
+
+
+class TestRetrievalPredicateShape:
+    """A retrieval predicate over content must be exclusion-shaped.
+
+    Pure vocabulary reasoning — no dependency on any particular filter module.
+    An inclusion-shaped predicate would silently drop every space and subspace
+    description from results, and nothing else in this suite would notice.
+    """
+
+    def test_exclusion_shape_admits_overview(self):
+        from core.domain.pipeline.chunk_strategy import (
+            CONTENT_EMBEDDING_TYPES,
+            EMBEDDING_TYPE_SUMMARY,
+        )
+
+        for label in CONTENT_EMBEDDING_TYPES:
+            assert label != EMBEDDING_TYPE_SUMMARY, (
+                f"an exclusion filter on {EMBEDDING_TYPE_SUMMARY!r} must admit "
+                f"{label!r}"
+            )
+
+    def test_inclusion_on_chunk_alone_would_drop_overviews(self):
+        """Stated as an assertion so the hazard is recorded, not folklore."""
+        from core.domain.pipeline.chunk_strategy import (
+            CONTENT_EMBEDDING_TYPES,
+            EMBEDDING_TYPE_CHUNK,
+            EMBEDDING_TYPE_OVERVIEW,
+        )
+
+        assert CONTENT_EMBEDDING_TYPES != {EMBEDDING_TYPE_CHUNK}
+        assert EMBEDDING_TYPE_OVERVIEW in CONTENT_EMBEDDING_TYPES

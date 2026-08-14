@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
+from core.domain.ingest_pipeline import Chunk
 from core.events.ingest_website import IngestWebsiteResult
 from plugins.ingest_website.crawler import CrawlError, _is_same_domain, _normalize_url, _should_skip_url, crawl
 from plugins.ingest_website.html_parser import extract_text, extract_title, remove_cross_page_boilerplate
@@ -703,3 +704,56 @@ class TestWebsiteHasNoTreePosition:
             for key, value in entry["metadata"].items():
                 assert value is not None, key
                 assert isinstance(value, (str, int)), key
+class TestWebsitePagesAreNotMistakenForSummaries:
+    """Website document ids are page URLs, not synthetic ids.
+
+    A page whose slug ends in "-summary" must still be swept when it is
+    removed upstream — otherwise it keeps answering queries for a page that no
+    longer exists, which is the failure this whole area is about.
+    """
+
+    async def test_a_summary_slugged_page_is_still_swept_when_deleted(self):
+        from core.domain.ingest_pipeline import DocumentMetadata
+        from core.domain.pipeline.engine import PipelineContext
+        from core.domain.pipeline.steps import (
+            ChangeDetectionStep,
+            OrphanCleanupStep,
+        )
+
+        store = MockKnowledgeStorePort()
+        gone = "https://example.com/2024-annual-summary"
+        kept = "https://example.com/home"
+        await store.ingest(
+            collection="c",
+            documents=["old page", "home page"],
+            metadatas=[
+                {"documentId": gone, "embeddingType": "chunk"},
+                {"documentId": kept, "embeddingType": "chunk"},
+            ],
+            ids=["a", "b"],
+            embeddings=[[0.1], [0.2]],
+        )
+
+        # Next crawl: only the home page still exists.
+        chunk = Chunk(
+            content="home page",
+            metadata=DocumentMetadata(
+                document_id=kept, source=kept, type="knowledge",
+                title="Home", embedding_type="chunk",
+            ),
+            chunk_index=0,
+            content_hash="b",
+        )
+        ctx = PipelineContext(
+            collection_name="c", documents=[], chunks=[chunk],
+            all_document_ids={kept},
+        )
+        await ChangeDetectionStep(store).execute(ctx)
+        await OrphanCleanupStep(store).execute(ctx)
+
+        assert gone in ctx.removed_document_ids
+        remaining = {
+            e["metadata"]["documentId"] for e in store.collections["c"]
+        }
+        assert gone not in remaining
+        assert kept in remaining
