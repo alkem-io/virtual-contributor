@@ -174,6 +174,15 @@ class BaseConfig(BaseSettings):
                 f"ROUTING_COMPLEX_N_RESULTS must be greater than 0, "
                 f"got {self.routing_complex_n_results}"
             )
+        # An absolute ceiling, independent of routing being on: an extra zero
+        # in an env var is a misconfiguration whether or not the feature reads
+        # it today, and the relational check below is scoped to when routing
+        # actually governs behaviour.
+        if self.routing_complex_context_chars > 10_000_000:
+            raise ValueError(
+                f"ROUTING_COMPLEX_CONTEXT_CHARS must be at most 10000000, "
+                f"got {self.routing_complex_context_chars}"
+            )
         if self.routing_complex_context_chars <= 0:
             raise ValueError(
                 f"ROUTING_COMPLEX_CONTEXT_CHARS must be greater than 0, "
@@ -195,7 +204,17 @@ class BaseConfig(BaseSettings):
                 f"ROUTING_COMPLEX_N_RESULTS must be at most 100, "
                 f"got {self.routing_complex_n_results}"
             )
-        if self.routing_complex_context_chars > 10 * self.max_context_chars:
+        # Only when routing is actually on. This one compares a routing knob
+        # against a NON-routing setting, so with routing disabled it can refuse
+        # to boot a configuration that was valid before this feature existed and
+        # that no routing code will read: MAX_CONTEXT_CHARS=2000 is fine on
+        # develop, but the shipped ROUTING_COMPLEX_CONTEXT_CHARS default of
+        # 40000 exceeds 10x it. A feature that is off by default must not be
+        # able to stop a pod.
+        if (
+            self.routing_enabled
+            and self.routing_complex_context_chars > 10 * self.max_context_chars
+        ):
             raise ValueError(
                 f"ROUTING_COMPLEX_CONTEXT_CHARS "
                 f"({self.routing_complex_context_chars}) must be at most 10x "

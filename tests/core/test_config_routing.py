@@ -166,3 +166,35 @@ class TestProfilesInheritThePluginsSettings:
         )
         assert table[RouteClass.COMPLEX].n_results >= 20
         assert table[RouteClass.SIMPLE].n_results <= 20
+
+
+class TestDisabledRoutingCannotStopThePod:
+    """A feature that is off by default must not be able to refuse a boot.
+
+    `ROUTING_COMPLEX_CONTEXT_CHARS` is compared against `MAX_CONTEXT_CHARS`,
+    which is **not** a routing setting. With routing disabled, an existing
+    deployment running `MAX_CONTEXT_CHARS=2000` — perfectly valid on develop —
+    was rejected at startup by the shipped `40000` default, even though no
+    routing code would ever read it.
+    """
+
+    def test_a_tight_context_budget_boots_when_routing_is_off(self) -> None:
+        config = _config(max_context_chars=2_000)
+        assert config.routing_enabled is False
+        assert config.max_context_chars == 2_000
+
+    def test_the_same_config_is_rejected_when_routing_is_on(self) -> None:
+        """The check is not removed — only scoped to when it governs anything."""
+        with pytest.raises(ValidationError, match="ROUTING_COMPLEX_CONTEXT_CHARS"):
+            _config(max_context_chars=2_000, routing_enabled=True)
+
+    def test_absolute_routing_validation_still_applies_when_disabled(self) -> None:
+        """Only the *relational* check is scoped. A nonsensical value on its
+        own is still a misconfiguration worth failing on."""
+        with pytest.raises(ValidationError, match="ROUTING_COMPLEX_N_RESULTS"):
+            _config(routing_complex_n_results=0)
+        with pytest.raises(ValidationError, match="ROUTING_COMPLEX_CONTEXT_CHARS"):
+            _config(routing_complex_context_chars=0)
+
+    def test_defaults_are_coherent_with_routing_enabled(self) -> None:
+        assert _config(routing_enabled=True).routing_enabled is True
