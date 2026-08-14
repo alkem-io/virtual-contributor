@@ -7,6 +7,7 @@ import logging
 from core.events.input import Input
 from core.events.response import Response, Source
 from core.ports.llm import LLMPort
+from core.ports.faithfulness import FaithfulnessValidatorPort
 from core.ports.knowledge_store import KnowledgeStorePort, QueryResult
 
 logger = logging.getLogger(__name__)
@@ -63,12 +64,42 @@ class ExpertPlugin:
         n_results: int = 5,
         score_threshold: float = 0.3,
         max_context_chars: int = 20000,
+        faithfulness_validator: FaithfulnessValidatorPort | None = None,
     ) -> None:
         self._llm = llm
         self._knowledge_store = knowledge_store
         self._n_results = n_results
         self._score_threshold = score_threshold
         self._max_context_chars = max_context_chars
+        # Absent unless validation is enabled. Its absence is the off switch.
+        self._faithfulness_validator = faithfulness_validator
+
+    def _validate_faithfulness(self, *, answer: str, context: str) -> None:
+        """Observe whether the answer was supportable. Never changes it.
+
+        Keyed off the CONTEXT STRING, never ``Response.sources``: the graph
+        path returns no sources by design, so a sources-keyed check would flag
+        every graph answer.
+
+        Wrapped defensively because this is pure observation — a fault in a
+        diagnostic must never cost a member their answer.
+        """
+        if self._faithfulness_validator is None:
+            return
+        try:
+            verdict = self._faithfulness_validator.validate(
+                answer=answer, context=context,
+            )
+            if not verdict.supported:
+                # Counts and reasons only — never the answer or the context,
+                # which are member content bound for central logging.
+                logger.warning(
+                    "Unsupported answer: plugin=expert reason=%s detail=%s "
+                    "answer_chars=%d",
+                    verdict.reason, verdict.detail, len(answer),
+                )
+        except Exception:
+            logger.warning("Faithfulness validation failed", exc_info=True)
 
     async def startup(self) -> None:
         logger.info("ExpertPlugin started")
@@ -194,6 +225,10 @@ class ExpertPlugin:
         final_state = await graph.invoke(initial_state)
 
         answer = final_state.get("final_answer", final_state.get("result", ""))
+        self._validate_faithfulness(
+            answer=answer,
+            context=final_state.get("combined_knowledge_docs", ""),
+        )
         sources = self._extract_sources(final_state)
 
         return Response(
@@ -222,6 +257,7 @@ class ExpertPlugin:
         )
 
         answer = await self._llm.invoke([{"role": "human", "content": prompt}])
+        self._validate_faithfulness(answer=answer, context=knowledge)
         sources = self._build_sources(result)
 
         return Response(

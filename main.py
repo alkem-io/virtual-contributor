@@ -10,6 +10,7 @@ import signal
 
 from core.config import BaseConfig
 from core.container import Container
+from core.domain.faithfulness import ContextSufficiencyValidator
 from core.health import HealthServer
 from core.logging import setup_logging
 from core.ports.llm import LLMPort
@@ -49,6 +50,7 @@ def _log_config(config: BaseConfig) -> None:
         "guidance_n_results",
         "guidance_min_score",
         "max_context_chars",
+        "faithfulness_validation_enabled",
         "summary_chunk_threshold",
         "pipeline_timeout",
     ]
@@ -246,6 +248,14 @@ async def _run(config: BaseConfig) -> None:
             deps["score_threshold"] = config.retrieval_score_threshold
     if "max_context_chars" in sig.parameters:
         deps["max_context_chars"] = config.max_context_chars
+    # None means disabled, and is checked before any validation code runs — so
+    # disabling is a structural absence rather than a branch inside the check.
+    if "faithfulness_validator" in sig.parameters:
+        deps["faithfulness_validator"] = (
+            ContextSufficiencyValidator()
+            if config.faithfulness_validation_enabled
+            else None
+        )
     # Inject summarization LLM for ingest plugins
     if "summarize_llm" in sig.parameters:
         deps["summarize_llm"] = summarize_llm

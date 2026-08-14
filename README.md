@@ -298,6 +298,33 @@ A separate LLM can be configured for ingest pipeline summarization. All three fi
 | `GUIDANCE_MIN_SCORE` | `0.3` | Minimum relevance score (guidance plugin) |
 | `MAX_CONTEXT_CHARS` | `20000` | Context budget — lowest-scoring chunks dropped first |
 
+### Faithfulness validation
+
+Logs a warning when an answer **asserts** something after retrieval returned
+**nothing**. That is the one case provably unsupportable without a model or
+citations: there was no evidence, so whatever was said came from elsewhere.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FAITHFULNESS_VALIDATION_ENABLED` | `false` | Enable the check |
+
+**Observation only.** The answer a member receives is never changed, delayed,
+or withheld — enabling this adds a log line and nothing else. Runs in-process:
+no model, no network call, no dependency.
+
+**What it deliberately does not do.** Checking whether the answer's words appear
+in the context was built, measured, and rejected: no threshold separates a
+fabrication from a faithful paraphrase, and because the platform answers in the
+member's language, a Dutch answer over English context scores the same as a
+lie. It would have flagged every non-English answer. So this checks *context
+sufficiency*, not content matching — which is why paraphrase and translation
+are structurally incapable of being flagged.
+
+**Honest limit.** It does not catch a fabrication built on thin-but-nonempty
+context. That needs either citation verification (which requires the model to
+be asked to cite — a separate change) or a judge. The port is shaped so either
+drops in without touching plugin code.
+
 ### Embeddings
 
 | Variable | Default | Description |

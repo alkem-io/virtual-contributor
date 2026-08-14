@@ -10,6 +10,7 @@ import re
 from core.events.input import Input
 from core.events.response import Response, Source
 from core.ports.llm import LLMPort
+from core.ports.faithfulness import FaithfulnessValidatorPort
 from core.ports.knowledge_store import KnowledgeStorePort
 
 logger = logging.getLogger(__name__)
@@ -40,12 +41,41 @@ class GuidancePlugin:
         n_results: int = 5,
         score_threshold: float = 0.3,
         max_context_chars: int = 20000,
+        faithfulness_validator: FaithfulnessValidatorPort | None = None,
     ) -> None:
         self._llm = llm
         self._knowledge_store = knowledge_store
         self._n_results = n_results
         self._score_threshold = score_threshold
+        # Absent unless validation is enabled. Its absence is the off switch.
+        self._faithfulness_validator = faithfulness_validator
         self._max_context_chars = max_context_chars
+
+    def _validate_faithfulness(self, *, answer: str, context: str) -> None:
+        """Observe whether the answer was supportable. Never changes it.
+
+        Guidance represents "nothing retrieved" as a sentinel string rather
+        than an empty one, which the detector handles explicitly — checking
+        only for emptiness would silently do nothing here.
+
+        Wrapped defensively: a fault in a diagnostic must never cost a member
+        their answer.
+        """
+        if self._faithfulness_validator is None:
+            return
+        try:
+            verdict = self._faithfulness_validator.validate(
+                answer=answer, context=context,
+            )
+            if not verdict.supported:
+                # Counts and reasons only — never member content.
+                logger.warning(
+                    "Unsupported answer: plugin=guidance reason=%s detail=%s "
+                    "answer_chars=%d",
+                    verdict.reason, verdict.detail, len(answer),
+                )
+        except Exception:
+            logger.warning("Faithfulness validation failed", exc_info=True)
 
     async def startup(self) -> None:
         logger.info("GuidancePlugin started")
@@ -161,6 +191,7 @@ class GuidancePlugin:
                 context=context, question=question, language=language
             ),
         }])
+        self._validate_faithfulness(answer=answer, context=context)
 
         # Try to parse JSON response for source scores
         parsed_sources = self._parse_json_sources(answer)
