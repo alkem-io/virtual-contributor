@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from enum import Enum
 
 import logging
@@ -16,6 +17,12 @@ class LLMProvider(str, Enum):
     mistral = "mistral"
     openai = "openai"
     anthropic = "anthropic"
+
+
+# Ceiling for ingest chunk sizing. Well above any benchmarked optimum
+# (512-1024 tokens ~= 2000-4000 chars) but low enough that a mistyped value
+# fails at startup rather than during a multi-hour ingest run.
+MAX_CHUNK_SIZE = 100_000
 
 
 class BaseConfig(BaseSettings):
@@ -46,6 +53,16 @@ class BaseConfig(BaseSettings):
 
     # Pipeline timeout (seconds) — outer timeout wrapping plugin.handle()
     pipeline_timeout: int = 3600
+
+    # Tracing — intentionally separate from standard OTEL_* environment names.
+    # The exporter is configured only from these explicit service settings.
+    tracing_enabled: bool = False
+    tracing_otlp_endpoint: str | None = None
+    tracing_otlp_headers: str | None = None
+    tracing_service_name: str | None = None
+    tracing_sample_ratio: float = 1.0
+    tracing_capture_content: bool = True
+    tracing_content_max_chars: int = 1000
 
     # ChromaDB / Vector DB
     vector_db_host: str | None = None
@@ -114,6 +131,26 @@ class BaseConfig(BaseSettings):
             raise ValueError(
                 f"PIPELINE_TIMEOUT must be greater than 0, got {self.pipeline_timeout}"
             )
+        if not 0.0 <= self.tracing_sample_ratio <= 1.0:
+            raise ValueError(
+                "TRACING_SAMPLE_RATIO must be between 0.0 and 1.0, "
+                f"got {self.tracing_sample_ratio}"
+            )
+        if self.tracing_content_max_chars <= 0:
+            raise ValueError(
+                "TRACING_CONTENT_MAX_CHARS must be greater than 0, "
+                f"got {self.tracing_content_max_chars}"
+            )
+        if self.tracing_otlp_headers:
+            valid_headers = 0
+            for item in self.tracing_otlp_headers.split(","):
+                key, separator, _ = item.partition("=")
+                if separator and key.strip():
+                    valid_headers += 1
+            if valid_headers == 0:
+                raise ValueError(
+                    "TRACING_OTLP_HEADERS must contain at least one key=value pair"
+                )
 
         # Vector DB distance function validation
         valid_distance_fns = {"cosine", "l2", "ip"}
@@ -137,6 +174,23 @@ class BaseConfig(BaseSettings):
                 f"SUMMARIZE_LLM_TEMPERATURE must be between 0.0 and 2.0, "
                 f"got {self.summarize_llm_temperature}"
             )
+        # Query rewrite validation. A ratio <= 1.0 would reject every rewrite
+        # longer than the original — which is what resolving a follow-up
+        # against its history normally produces — so the gate would silently
+        # discard all of them and always fall back.
+        # `inf`, `nan` and absurd finite values all pass a bare `> 1.0` check
+        # and silently disable the bound this feature exists to enforce. `nan`
+        # is the worst: every comparison against it is False, so the length
+        # check is not merely large but structurally unreachable, while startup
+        # logs a plausible-looking value.
+        if not math.isfinite(self.query_rewrite_max_expansion_ratio) or not (
+            1.0 < self.query_rewrite_max_expansion_ratio <= 100.0
+        ):
+            raise ValueError(
+                f"QUERY_REWRITE_MAX_EXPANSION_RATIO must be a finite value in "
+                f"(1.0, 100.0], got {self.query_rewrite_max_expansion_ratio}"
+            )
+
         if self.summarize_llm_timeout is not None and self.summarize_llm_timeout <= 0:
             raise ValueError(
                 f"SUMMARIZE_LLM_TIMEOUT must be greater than 0, "
@@ -161,6 +215,145 @@ class BaseConfig(BaseSettings):
                 f"GUIDANCE_MIN_SCORE must be between 0.0 and 1.0, got {self.guidance_min_score}"
             )
 
+        # Hybrid retrieval validation — rejected at startup rather than
+        # degrading retrieval quietly at query time.
+        if self.hybrid_rrf_k <= 0:
+            raise ValueError(
+                f"HYBRID_RRF_K must be greater than 0, got {self.hybrid_rrf_k}"
+            )
+        if not math.isfinite(self.hybrid_dense_weight) or not math.isfinite(
+            self.hybrid_lexical_weight
+        ):
+            # NaN compares false against everything, so it would slip past the
+            # bounds below and then make every ordering comparison arbitrary.
+            raise ValueError(
+                "HYBRID_DENSE_WEIGHT and HYBRID_LEXICAL_WEIGHT must be finite "
+                f"numbers, got {self.hybrid_dense_weight} and "
+                f"{self.hybrid_lexical_weight}"
+            )
+        if self.hybrid_dense_weight < 0:
+            raise ValueError(
+                f"HYBRID_DENSE_WEIGHT must not be negative, "
+                f"got {self.hybrid_dense_weight}"
+            )
+        if self.hybrid_lexical_weight < 0:
+            raise ValueError(
+                f"HYBRID_LEXICAL_WEIGHT must not be negative, "
+                f"got {self.hybrid_lexical_weight}"
+            )
+        if self.hybrid_dense_weight == 0 and self.hybrid_lexical_weight == 0:
+            raise ValueError(
+                "HYBRID_DENSE_WEIGHT and HYBRID_LEXICAL_WEIGHT must not both "
+                "be 0 — every result would score 0 and ordering would be "
+                "arbitrary"
+            )
+        if self.hybrid_max_terms <= 0:
+            raise ValueError(
+                f"HYBRID_MAX_TERMS must be greater than 0, "
+                f"got {self.hybrid_max_terms}"
+            )
+        if self.hybrid_min_term_len <= 0:
+            raise ValueError(
+                f"HYBRID_MIN_TERM_LEN must be greater than 0, "
+                f"got {self.hybrid_min_term_len}"
+            )
+
+        # Re-ranking validation. Fail at startup naming the variable: a bad
+        # value here would otherwise surface as quietly worse answers, with
+        # nothing in the logs to connect them to a config change.
+        if self.rerank_top_k <= 0:
+            raise ValueError(
+                f"RERANK_TOP_K must be greater than 0, got {self.rerank_top_k}"
+            )
+        if self.rerank_candidate_n <= 0:
+            raise ValueError(
+                f"RERANK_CANDIDATE_N must be greater than 0, "
+                f"got {self.rerank_candidate_n}"
+            )
+        if self.rerank_candidate_n < self.rerank_top_k:
+            # Keeping fewer candidates than we keep results is incoherent —
+            # re-ranking would have nothing to choose between.
+            raise ValueError(
+                f"RERANK_CANDIDATE_N ({self.rerank_candidate_n}) must be at "
+                f"least RERANK_TOP_K ({self.rerank_top_k})"
+            )
+        # NaN and inf are covered by this same check, not by a separate
+        # isfinite guard: every comparison against NaN is False, so `not
+        # (0.0 <= nan <= 1.0)` is True and NaN is rejected here. Both are
+        # asserted in the config tests so this stays true.
+        if not (0.0 <= self.rerank_lexical_weight <= 1.0):
+            raise ValueError(
+                f"RERANK_LEXICAL_WEIGHT must be between 0.0 and 1.0, "
+                f"got {self.rerank_lexical_weight}"
+            )
+
+        # Routing validation. Fail at startup naming the variable: a bad value
+        # here would surface as quietly worse answers with nothing in the logs
+        # connecting them to a config change.
+        if self.routing_simple_n_results <= 0:
+            raise ValueError(
+                f"ROUTING_SIMPLE_N_RESULTS must be greater than 0, "
+                f"got {self.routing_simple_n_results}"
+            )
+        if self.routing_complex_n_results <= 0:
+            raise ValueError(
+                f"ROUTING_COMPLEX_N_RESULTS must be greater than 0, "
+                f"got {self.routing_complex_n_results}"
+            )
+        # An absolute ceiling, independent of routing being on: an extra zero
+        # in an env var is a misconfiguration whether or not the feature reads
+        # it today, and the relational check below is scoped to when routing
+        # actually governs behaviour.
+        if self.routing_complex_context_chars > 10_000_000:
+            raise ValueError(
+                f"ROUTING_COMPLEX_CONTEXT_CHARS must be at most 10000000, "
+                f"got {self.routing_complex_context_chars}"
+            )
+        if self.routing_complex_context_chars <= 0:
+            raise ValueError(
+                f"ROUTING_COMPLEX_CONTEXT_CHARS must be greater than 0, "
+                f"got {self.routing_complex_context_chars}"
+            )
+        if self.routing_simple_n_results > self.retrieval_n_results:
+            # Documented in .env.example and on the field itself: a simple
+            # query must never become slower than it is today. Enforced here
+            # so the promise is not merely written down.
+            raise ValueError(
+                f"ROUTING_SIMPLE_N_RESULTS ({self.routing_simple_n_results}) "
+                f"must not exceed RETRIEVAL_N_RESULTS "
+                f"({self.retrieval_n_results})"
+            )
+        if self.routing_complex_n_results > 100:
+            # An extra zero in an env var should not start the pod and then
+            # degrade it under load.
+            raise ValueError(
+                f"ROUTING_COMPLEX_N_RESULTS must be at most 100, "
+                f"got {self.routing_complex_n_results}"
+            )
+        # Only when routing is actually on. This one compares a routing knob
+        # against a NON-routing setting, so with routing disabled it can refuse
+        # to boot a configuration that was valid before this feature existed and
+        # that no routing code will read: MAX_CONTEXT_CHARS=2000 is fine on
+        # develop, but the shipped ROUTING_COMPLEX_CONTEXT_CHARS default of
+        # 40000 exceeds 10x it. A feature that is off by default must not be
+        # able to stop a pod.
+        if (
+            self.routing_enabled
+            and self.routing_complex_context_chars > 10 * self.max_context_chars
+        ):
+            raise ValueError(
+                f"ROUTING_COMPLEX_CONTEXT_CHARS "
+                f"({self.routing_complex_context_chars}) must be at most 10x "
+                f"MAX_CONTEXT_CHARS ({self.max_context_chars})"
+            )
+        if self.routing_complex_n_results < self.routing_simple_n_results:
+            # Incoherent: the route meant to see more would see less.
+            raise ValueError(
+                f"ROUTING_COMPLEX_N_RESULTS ({self.routing_complex_n_results}) "
+                f"must be at least ROUTING_SIMPLE_N_RESULTS "
+                f"({self.routing_simple_n_results})"
+            )
+
         # Context budget validation
         if self.max_context_chars <= 0:
             raise ValueError(
@@ -177,6 +370,36 @@ class BaseConfig(BaseSettings):
             raise ValueError(
                 f"SUMMARY_CHUNK_THRESHOLD must be greater than 0, "
                 f"got {self.summary_chunk_threshold}"
+            )
+
+        # Ingest sizing validation
+        if self.chunk_size <= 0:
+            raise ValueError(
+                f"CHUNK_SIZE must be greater than 0, got {self.chunk_size}"
+            )
+        if self.chunk_overlap < 0:
+            raise ValueError(
+                f"CHUNK_OVERLAP must be greater than or equal to 0, "
+                f"got {self.chunk_overlap}"
+            )
+        if self.chunk_overlap > self.chunk_size // 2:
+            # Not just `>= chunk_size`: overlap approaching the chunk size
+            # amplifies embedding volume super-linearly (overlap 2499 against
+            # size 2500 embeds ~238x the corpus), and startup is the only
+            # place that can catch it — the ingest run itself has a 3h budget.
+            raise ValueError(
+                f"CHUNK_OVERLAP must not exceed half of CHUNK_SIZE, got "
+                f"{self.chunk_overlap} > {self.chunk_size // 2} "
+                f"(CHUNK_SIZE={self.chunk_size})"
+            )
+        if self.chunk_size > MAX_CHUNK_SIZE:
+            raise ValueError(
+                f"CHUNK_SIZE must not exceed {MAX_CHUNK_SIZE}, "
+                f"got {self.chunk_size}"
+            )
+        if self.summary_length <= 0:
+            raise ValueError(
+                f"SUMMARY_LENGTH must be greater than 0, got {self.summary_length}"
             )
 
         # Partial summarize config warning
@@ -212,6 +435,17 @@ class BaseConfig(BaseSettings):
             raise ValueError(
                 f"BOK_LLM_TIMEOUT must be greater than 0, "
                 f"got {self.bok_llm_timeout}"
+            )
+
+        # Answering generation validation. This setting is intentionally
+        # separate from LLM_TEMPERATURE: it applies only at answer call sites
+        # and is opt-in so existing deployments retain provider defaults.
+        if self.answering_llm_temperature is not None and not (
+            0.0 <= self.answering_llm_temperature <= 2.0
+        ):
+            raise ValueError(
+                "ANSWERING_LLM_TEMPERATURE must be between 0.0 and 2.0, "
+                f"got {self.answering_llm_temperature}"
             )
 
         # Partial BoK config warning
@@ -263,11 +497,27 @@ class BaseConfig(BaseSettings):
     bok_llm_temperature: float | None = None
     bok_llm_timeout: int | None = None
 
+    # Answering generation — opt-in per-call override for retrieval-backed
+    # answering only. Unset preserves the shared LLM adapter's existing
+    # provider defaults for answering, ingestion, and summarization.
+    answering_llm_temperature: float | None = None
+    answering_chain_of_thought_enabled: bool = True
+
     # Retrieval — per-plugin parameters
     expert_n_results: int = 5
     expert_min_score: float = 0.3
     guidance_n_results: int = 5
     guidance_min_score: float = 0.3
+
+    # Hybrid retrieval — a lexical arm alongside the embedding arm, fused by
+    # reciprocal rank. Off by default: it changes what every answer is grounded
+    # in, so it is opted into rather than inherited.
+    hybrid_retrieval_enabled: bool = False
+    hybrid_dense_weight: float = 1.0
+    hybrid_lexical_weight: float = 1.0
+    hybrid_rrf_k: int = 60
+    hybrid_max_terms: int = 8
+    hybrid_min_term_len: int = 3
 
     # Context budget
     max_context_chars: int = 20000
@@ -275,17 +525,70 @@ class BaseConfig(BaseSettings):
     # Summarization threshold
     summary_chunk_threshold: int = 4
 
+    # Faithfulness validation — off by default. It only observes: an answer is
+    # never changed, delayed, or withheld by it. Disabled, no validator is
+    # constructed at all.
+    faithfulness_validation_enabled: bool = False
+
     # Retrieval — deprecated global fields (kept for backward compat)
     retrieval_n_results: int = 5
     retrieval_score_threshold: float = 0.3
+
+    # Re-ranking — off by default. It changes what every answer is grounded
+    # in, so it is opted into rather than inherited. Disabling it restores
+    # prior behaviour exactly: the same n_results is requested and no
+    # re-ranking code runs at all.
+    rerank_enabled: bool = False
+    #: Candidates fetched when re-ranking is on. Re-ranking can only reorder
+    #: what retrieval returned, so it needs a wider pool than it will keep.
+    rerank_candidate_n: int = 20
+    #: Candidates surviving re-ranking, into context assembly.
+    rerank_top_k: int = 5
+    #: Lexical share of the blend. Accepted range is 0.0–1.0 inclusive; 0.0
+    #: provably reproduces vector order and is the fine-grained rollback.
+    #:
+    #: Between those ends the value is not free: to promote a worst-on-vector
+    #: passage the weight must exceed ``1 / (2 - L0)``, which is 0.5 when the
+    #: incumbent shares none of the query's wording. At exactly 0.5 the two
+    #: tie and the stable sort keeps the incumbent, so a weight in (0.0, 0.5]
+    #: is a validated setting that cannot do the thing re-ranking is for.
+    #: See LexicalReranker.DEFAULT_LEXICAL_WEIGHT for the derivation.
+    rerank_lexical_weight: float = 0.6
+    # Adaptive routing — off by default. It changes how much evidence every
+    # answer is built from, and can skip retrieval entirely, so it is opted
+    # into rather than inherited. Disabled, the plugins take their existing
+    # code path with their existing constants.
+    routing_enabled: bool = False
+    #: Retrieval width for a direct lookup. Must not exceed the default, so a
+    #: simple query never becomes slower than it is today.
+    routing_simple_n_results: int = 3
+    #: Width and budget for a comparative or multi-hop question. The budget
+    #: moves with the width on purpose: at a 9000-char chunk size the default
+    #: 20000-char budget admits only 2 chunks, so widening retrieval alone
+    #: would deliver exactly the same context.
+    routing_complex_n_results: int = 10
+    routing_complex_context_chars: int = 40_000
 
     # Ingest pipeline
     chunk_size: int = 2000
     chunk_overlap: int = 400
     ingest_batch_size: int = 5
-    summary_length: int = 10000
+    summary_length: int = 2500
     summarize_concurrency: int = 8
     summarize_enabled: bool = True
+
+    # Query rewrite — gating and output validation (workspace#049)
+    # Both default to develop's behaviour: no gate, and a ratio permissive
+    # enough that only a model which started explaining is rejected.
+    query_rewrite_gating_enabled: bool = False
+    query_rewrite_max_expansion_ratio: float = 8.0
+    # Turn and character bounds on the history embedded in a rewrite prompt.
+    # `history_length` exists on ExpertConfig/OpenAIAssistantConfig only, so it
+    # cannot serve guidance or generic; these live on the base so every plugin
+    # that rewrites is bounded. A plugin that also defines `history_length`
+    # takes the smaller of the two — see main.py.
+    query_rewrite_max_history_turns: int = 20
+    query_rewrite_max_history_chars: int = 12000
 
     # Health
     health_port: int = 8080
@@ -300,8 +603,8 @@ class IngestSpaceConfig(BaseConfig):
     )
     auth_admin_email: str = ""
     auth_admin_password: str = ""
-    chunk_size: int = 9000
-    chunk_overlap: int = 500
+    chunk_size: int = 2500
+    chunk_overlap: int = 300
 
 
 class IngestWebsiteConfig(BaseConfig):

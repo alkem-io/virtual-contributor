@@ -6,6 +6,7 @@ import hashlib
 import html as _html
 import logging
 import re
+from dataclasses import dataclass, replace
 
 from core.domain.ingest_pipeline import Document, DocumentMetadata, DocumentType
 from plugins.ingest_space.link_extractor import extract_text
@@ -179,6 +180,75 @@ async def read_body_of_knowledge(
     return await read_space_tree(graphql_client, bok_id)
 
 
+#: Display names are capped before storage — they are provenance labels, not
+#: content, and the store keeps every metadata value small (FR-011/FR-012).
+_NAME_MAX_CHARS = 200
+
+#: Tier assigned to contributions (posts, whiteboards, links), which sit below
+#: whichever node owns their callout.
+_CONTRIBUTION_DEPTH = 3
+
+
+def _clean_name(raw: str | None) -> str | None:
+    """HTML-strip and cap a display name; blank becomes unknown (``None``).
+
+    Display names are user-controlled and are stored under a new metadata key
+    that later work will filter on and may render, so a name that is nothing
+    but markup is treated as unknown rather than stored verbatim — there is no
+    fallback to the raw value. Stripping runs twice because entity decoding can
+    turn ``&lt;b&gt;`` back into live markup.
+    """
+    if not raw:
+        return None
+    cleaned = _strip_html(_strip_html(raw)).strip()
+    if not cleaned:
+        return None
+    return cleaned[:_NAME_MAX_CHARS]
+
+
+@dataclass(frozen=True)
+class _Position:
+    """Where a document sits in the space tree.
+
+    ``subspace_*`` always names the **nearest containing** subspace, so a
+    second-level subspace's own content reports itself, not its first-level
+    ancestor. ``depth`` is the tier of the owning node; contributions override
+    it to ``_CONTRIBUTION_DEPTH``.
+    """
+
+    space_id: str | None = None
+    space_name: str | None = None
+    subspace_id: str | None = None
+    subspace_name: str | None = None
+    callout_id: str | None = None
+    depth: int = 0
+
+    def for_node(
+        self, node_id: str | None, node_name: str | None, depth: int,
+    ) -> _Position:
+        """Descend to a tree node: the root sets space, deeper sets subspace.
+
+        A missing identity is carried as unknown rather than raising, so one
+        malformed node costs only its own position, not the whole ingestion.
+        """
+        name = _clean_name(node_name)
+        if depth == 0:
+            return replace(
+                self, space_id=node_id or None, space_name=name, depth=0,
+            )
+        return replace(
+            self, subspace_id=node_id or None, subspace_name=name, depth=depth,
+        )
+
+    def for_callout(self, callout_id: str | None) -> _Position:
+        """A callout keeps its owner's tier and names itself (FR-005)."""
+        return replace(self, callout_id=callout_id or None)
+
+    def for_contribution(self) -> _Position:
+        """A contribution keeps its callout and drops to the leaf tier."""
+        return replace(self, depth=_CONTRIBUTION_DEPTH)
+
+
 def _append_unique(
     documents: list[Document],
     seen: set[str],
@@ -189,6 +259,7 @@ def _append_unique(
     doc_type: str,
     title: str,
     uri: str | None = None,
+    position: _Position | None = None,
 ) -> bool:
     """Append a Document if its stripped content is non-empty and new."""
     cleaned = _strip_html(content)
@@ -198,6 +269,7 @@ def _append_unique(
     if key in seen:
         return False
     seen.add(key)
+    pos = position or _Position()
     documents.append(Document(
         content=cleaned,
         metadata=DocumentMetadata(
@@ -206,6 +278,12 @@ def _append_unique(
             type=doc_type,
             title=_strip_html(title) or title,
             uri=uri or None,
+            space_id=pos.space_id,
+            space_name=pos.space_name,
+            subspace_id=pos.subspace_id,
+            subspace_name=pos.subspace_name,
+            callout_id=pos.callout_id,
+            depth=pos.depth,
         ),
     ))
     return True
@@ -220,16 +298,33 @@ async def _process_space(
     stats: dict,
     depth: int,
     top_doc_type: str | None = None,
+    position: _Position | None = None,
 ) -> None:
     """Process a space node and its children recursively.
 
     `top_doc_type` overrides the doc type used for the depth-0 document
     (so knowledge bases can be tagged as KNOWLEDGE instead of SPACE).
+
+    `position` accumulates the tree position: the depth-0 node becomes the
+    space, each deeper node becomes the nearest containing subspace.
     """
+    space_id = space.get("id")
+    if not space_id:
+        # No stable identity means the node's documents could never be
+        # change-detected or orphan-swept, so skip it and its subtree rather
+        # than emit entries that can only accumulate. One malformed node
+        # costs its own content, not the whole ingestion.
+        logger.warning("Skipping space node with no id at depth %d", depth)
+        return
+
     profile = space.get("profile") or {}
     space_name = profile.get("displayName", "") or ""
     description = profile.get("description", "") or ""
     space_url = profile.get("url", "") or None
+
+    node_position = (position or _Position()).for_node(
+        space_id, space_name, depth,
+    )
 
     if description:
         if depth == 0 and top_doc_type is not None:
@@ -242,11 +337,12 @@ async def _process_space(
         _append_unique(
             documents, seen,
             content=f"{space_name}\n\n{description}",
-            document_id=space["id"],
-            source=f"space:{space['id']}",
+            document_id=space_id,
+            source=f"space:{space_id}",
             doc_type=doc_type_value,
             title=space_name,
             uri=space_url,
+            position=node_position,
         )
 
     # Process callouts
@@ -256,6 +352,7 @@ async def _process_space(
         await _process_callout(
             callout, documents, seen,
             graphql_client=graphql_client, stats=stats,
+            position=node_position,
         )
 
     # Recurse into subspaces
@@ -263,6 +360,7 @@ async def _process_space(
         await _process_space(
             subspace, documents, seen,
             graphql_client=graphql_client, stats=stats, depth=depth + 1,
+            position=node_position,
         )
 
 
@@ -273,22 +371,39 @@ async def _process_callout(
     *,
     graphql_client,
     stats: dict,
+    position: _Position | None = None,
 ) -> None:
-    """Process a callout and its contributions."""
+    """Process a callout and its contributions.
+
+    The callout keeps the tier of the node that owns it and names itself;
+    its contributions inherit that and drop to the contribution tier.
+    """
+    callout_id = callout.get("id")
+    if not callout_id:
+        # As for spaces: without a stable identity these documents could never
+        # be change-detected or swept, so skip the callout and its
+        # contributions instead of failing the whole ingestion.
+        logger.warning("Skipping callout with no id")
+        return
+
     framing = (callout.get("framing") or {}).get("profile") or {}
     callout_name = framing.get("displayName", "") or ""
     callout_desc = framing.get("description", "") or ""
     callout_url = framing.get("url", "") or None
 
+    callout_position = (position or _Position()).for_callout(callout_id)
+    contribution_position = callout_position.for_contribution()
+
     if callout_desc:
         _append_unique(
             documents, seen,
             content=f"{callout_name}\n\n{callout_desc}",
-            document_id=callout["id"],
-            source=f"callout:{callout['id']}",
+            document_id=callout_id,
+            source=f"callout:{callout_id}",
             doc_type=DocumentType.CALLOUT.value,
             title=callout_name,
             uri=callout_url,
+            position=callout_position,
         )
 
     # Build callout context to prepend to contributions
@@ -322,6 +437,7 @@ async def _process_callout(
                     doc_type=DocumentType.POST.value,
                     title=post_title,
                     uri=post_profile.get("url") or None,
+                    position=contribution_position,
                 )
 
         # Whiteboards
@@ -346,6 +462,7 @@ async def _process_callout(
                     doc_type=DocumentType.WHITEBOARD.value,
                     title=wb_title,
                     uri=wb_profile.get("url") or None,
+                    position=contribution_position,
                 )
 
         # Links — fetch the body and extract text so the actual
@@ -406,4 +523,5 @@ async def _process_callout(
                     doc_type=DocumentType.LINK.value,
                     title=link_title,
                     uri=uri or link_profile.get("url") or None,
+                    position=contribution_position,
                 )

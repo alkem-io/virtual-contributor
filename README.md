@@ -161,7 +161,7 @@ virtual-contributor/
 │   └── plugins/                       # Plugin unit tests
 │
 ├── specs/                             # Feature specifications (001-025)
-├── docs/adr/                          # Architecture Decision Records (0001-0011)
+├── docs/adr/                          # Architecture Decision Records (0001–0013)
 ├── main.py                            # Single entry point
 ├── Dockerfile                         # Distroless build: 3.13-slim-trixie builder -> distroless/python3-debian13
 ├── docker/
@@ -298,6 +298,102 @@ A separate LLM can be configured for ingest pipeline summarization. All three fi
 | `GUIDANCE_MIN_SCORE` | `0.3` | Minimum relevance score (guidance plugin) |
 | `MAX_CONTEXT_CHARS` | `20000` | Context budget — lowest-scoring chunks dropped first |
 
+### Re-ranking
+
+Re-orders retrieved chunks before context assembly, blending vector similarity
+with lexical overlap against the query's own terms. Runs in-process: no network
+call, no extra dependency, ~0.7 ms for a top-20 re-rank.
+
+**Off by default** — it changes what every answer is grounded in, so it is
+opted into rather than inherited. Turning it off restores prior behaviour
+exactly: the same number of results is requested and no re-ranking code runs.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `RERANK_ENABLED` | `false` | Enable the re-ranking stage |
+| `RERANK_CANDIDATE_N` | `20` | Candidates fetched when enabled (must be ≥ `RERANK_TOP_K`) |
+| `RERANK_TOP_K` | `5` | Candidates kept after re-ranking |
+| `RERANK_LEXICAL_WEIGHT` | `0.6` | Lexical share of the blend; `0.0` provably reproduces vector order |
+
+Two rollbacks, coarse and fine: `RERANK_ENABLED=false` removes the stage
+entirely, and `RERANK_LEXICAL_WEIGHT=0.0` leaves it wired but reproduces vector
+ordering exactly.
+
+Keep the weight above `0.5`. Scores are normalised across the candidate pool,
+so the best-vector candidate sits at `1.0` and the worst at `0.0`; at exactly
+`0.5` a chunk that matches the query's wording but has the worst vector
+distance ties with the incumbent and loses — which is the case re-ranking
+exists to fix.
+
+Re-ranking is a *ranking* signal only. Whether a chunk is relevant enough to
+use is still judged on its vector score, because the blended score is relative
+to the pool rather than absolute.
+### Adaptive Routing
+
+Classifies each question and scales retrieval to it: small talk skips retrieval
+entirely, direct lookups retrieve narrowly, comparative questions retrieve more
+and get a wider context budget.
+
+Classification is **rule-based and in-process** — no model, no network call, no
+new dependency, sub-millisecond. An LLM classifier was rejected on arithmetic:
+it would cost a round trip on *every* question including the simple ones it
+exists to speed up, needing (at 350ms) 39% of all traffic on the cheap path
+just to break even. That share has never been measured here.
+
+**Off by default.** Disabled, both plugins take their existing code path with
+their existing constants.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ROUTING_ENABLED` | `false` | Enable adaptive routing |
+| `ROUTING_SIMPLE_N_RESULTS` | `3` | Width for direct lookups (must be ≤ the default width) |
+| `ROUTING_COMPLEX_N_RESULTS` | `10` | Width for comparative / multi-hop questions |
+| `ROUTING_COMPLEX_CONTEXT_CHARS` | `40000` | Context budget for those questions |
+
+The complex budget is widened alongside the width **on purpose**. At the
+deployed 9000-character chunk size, the default 20000-character budget already
+admits only two chunks — so widening retrieval without widening the budget
+would fetch more evidence and then discard it, producing a route that looks
+implemented and changes nothing.
+
+The rules are deliberately lopsided. Only one mistake is user-visible — routing
+a real question to skip retrieval answers it ungrounded — so that is the only
+route with a hard gate: the whole message must match an anchored small-talk
+list, carry no question mark, and be at most six words. Everything else falls
+through to retrieval, so every misclassification degrades to "retrieve anyway".
+### Faithfulness validation
+
+Logs a warning when an answer **asserts** something after retrieval returned
+**nothing**. That is the one case provably unsupportable without a model or
+citations: there was no evidence, so whatever was said came from elsewhere.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FAITHFULNESS_VALIDATION_ENABLED` | `false` | Enable the check |
+
+**Observation only.** The answer a member receives is never changed, delayed,
+or withheld — enabling this adds a log line and nothing else. Runs in-process:
+no model, no network call, no dependency.
+
+**What it deliberately does not do.** Checking whether the answer's words appear
+in the context was built, measured, and rejected: no threshold separates a
+fabrication from a faithful paraphrase, and because the platform answers in the
+member's language, a Dutch answer over English context scores the same as a
+lie. It would have flagged every non-English answer. So this checks *context
+sufficiency*, not content matching — which is why paraphrase and translation
+are structurally incapable of being flagged.
+
+**Honest limit.** It does not catch a fabrication built on thin-but-nonempty
+context. That needs either citation verification (which requires the model to
+be asked to cite — a separate change) or a judge.
+
+**Citation verification** is a string check against the context, so it can
+occupy this port directly. **A judge cannot.** `validate()` is synchronous by
+design and runs on the response path, so an implementation that calls a model
+would block the event loop for every message this worker is serving — not just
+its own. A judge belongs out of band: the port is the seam for recording the
+verdict, not for fetching it.
+
 ### Embeddings
 
 | Variable | Default | Description |
@@ -313,7 +409,7 @@ A separate LLM can be configured for ingest pipeline summarization. All three fi
 | `CHUNK_SIZE` | `2000` | Characters per chunk |
 | `CHUNK_OVERLAP` | `400` | Overlap between chunks |
 | `BATCH_SIZE` | `20` | Embedding batch size |
-| `SUMMARY_LENGTH` | `10000` | Max summary length |
+| `SUMMARY_LENGTH` | `2500` | Max summary length |
 | `SUMMARY_CHUNK_THRESHOLD` | `4` | Minimum chunks to trigger summarization |
 | `PROCESS_PAGES_LIMIT` | `20` | Max pages to crawl (ingest-website) |
 
@@ -356,7 +452,7 @@ Web crawler that fetches pages from a base URL (configurable page limit), extrac
 
 ### Ingest Space (`PLUGIN_TYPE=ingest-space`)
 
-Fetches the Alkemio space tree via GraphQL, parses attached files (PDF, DOCX, XLSX), and runs the ingest pipeline with larger chunk sizes (9000 characters). The collection is named `{body_of_knowledge_id}-{purpose}`.
+Fetches the Alkemio space tree via GraphQL, parses attached files (PDF, DOCX, XLSX), and runs the ingest pipeline with space-specific 2,500-character chunks. The collection is named `{body_of_knowledge_id}-{purpose}`.
 
 ## Ingest Pipeline
 
@@ -591,6 +687,37 @@ Detailed design rationale is documented in `docs/adr/`:
 | [0009](docs/adr/0009-configurable-summarization-llm.md) | Configurable summarization LLM with per-plugin retrieval parameters |
 | [0010](docs/adr/0010-pipeline-step-safety.md) | Pipeline destructive step safety via duck-typed gating |
 | [0011](docs/adr/0011-pipeline-reliability.md) | Pipeline reliability — thread pool sizing, partial failure resilience |
+| [0012](docs/adr/0012-opentelemetry-pipeline-tracing.md) | Module-local OpenTelemetry pipeline tracing |
+
+## Tracing & Observability
+
+Pipeline tracing ships dark. It emits OTLP/HTTP traces only when an explicit
+internal endpoint is configured; ambient `OTEL_*` exporter and sampler settings
+are never used.
+
+| Variable | Default | Purpose |
+|---|---:|---|
+| `TRACING_ENABLED` | `false` | Enable tracing only with an endpoint |
+| `TRACING_OTLP_ENDPOINT` | unset | Full internal OTLP/HTTP trace URL |
+| `TRACING_OTLP_HEADERS` | unset | Comma-separated `key=value` authentication headers |
+| `TRACING_SERVICE_NAME` | plugin-derived | Service resource name |
+| `TRACING_SAMPLE_RATIO` | `1.0` | Trace sampling ratio, from 0 through 1 |
+| `TRACING_CAPTURE_CONTENT` | `true` | Include bounded prompts, answers, and messages |
+| `TRACING_CONTENT_MAX_CHARS` | `1000` | Maximum characters per content attribute |
+
+For local self-hosted Langfuse, point the service at its OTLP endpoint:
+
+```bash
+export TRACING_ENABLED=true
+export TRACING_OTLP_ENDPOINT="http://localhost:3000/api/public/otel/v1/traces"
+export TRACING_OTLP_HEADERS="Authorization=Basic ${AUTH}"
+PLUGIN_TYPE=guidance poetry run python main.py
+```
+
+The same explicit endpoint/header configuration works with self-hosted Grafana
+Tempo or Elastic APM OTLP receivers. Never set an endpoint you do not control:
+trace content can include user messages and retrieved context.
+| [0013](docs/adr/0013-grounded-citable-generation-prompts.md) | Grounded, citable generation prompts |
 
 ## Feature Specifications
 

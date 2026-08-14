@@ -24,12 +24,47 @@ class DocumentType(str, Enum):
 
 @dataclass
 class DocumentMetadata:
+    """Descriptor carried by a document (and its chunks) through ingestion.
+
+    The hierarchy fields record *where in a space tree* the content came from,
+    so retrieval can be scoped to a space or subspace.
+
+    ``depth`` is the tier in the space tree, not the distance from the root
+    through every node kind: 0 = ingest root (space or knowledge base),
+    1 = first-level subspace, 2 = second-level subspace, 3 = contribution
+    (post, whiteboard, link). A callout carries the depth of the node that
+    *owns* it rather than a tier of its own; it is identified by
+    ``callout_id`` and by its document type.
+
+    ``subspace_id``/``subspace_name`` name the **nearest containing**
+    subspace. For a second-level subspace's own content that is itself; for
+    content beneath it, it is the subspace that contains that content — never
+    the first-level ancestor.
+
+    **Defaults are not a sentinel value.** The five identifier fields default
+    to ``None``, which ``position_metadata`` omits from what is stored. But
+    ``depth`` defaults to ``0``, and ``0`` is a *meaningful* tier above — the
+    ingest root — so it cannot double as "unknown". What separates the two
+    cases is ``has_position``: content with no tree position (website
+    ingestion) stores no position fields **at all**, including ``depth``.
+    Position is all-or-nothing, which is what keeps the stored metadata and
+    the change-detection fingerprint in agreement.
+
+    Existing construction sites that pass none of these keep working untouched.
+    """
+
     document_id: str
     source: str
     type: str = "knowledge"
     title: str = ""
     embedding_type: str = "knowledge"
     uri: str | None = None
+    space_id: str | None = None
+    space_name: str | None = None
+    subspace_id: str | None = None
+    subspace_name: str | None = None
+    callout_id: str | None = None
+    depth: int = 0
 
 
 @dataclass

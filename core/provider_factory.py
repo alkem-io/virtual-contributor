@@ -66,6 +66,15 @@ def create_llm_adapter(
         kwargs["extra_body"] = {
             "chat_template_kwargs": {"enable_thinking": False}
         }
+    # The disabled path remains byte-for-byte the previous constructor
+    # configuration. Callback construction covers direct PromptGraph calls too.
+    if config.tracing_enabled:
+        from core.tracing import tracing_is_configured
+
+        if tracing_is_configured():
+            from core.tracing_callbacks import VCTracingCallbackHandler
+
+            kwargs["callbacks"] = [VCTracingCallbackHandler(config)]
 
     llm = model_cls(**kwargs)
 

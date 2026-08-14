@@ -103,6 +103,28 @@ This repo uses [Conventional Commits](https://www.conventionalcommits.org/) for 
 
 Scopes are optional: `feat(ingest): add retry logic`. All commits merged to `main` are analyzed — the highest bump wins.
 
+## Embedding types
+
+Stored passages carry an `embeddingType`. It is not a label for display — six
+pipeline behaviours branch on it (fingerprinting, both halves of change
+detection, storage identity, orphan cleanup, corpus-summary input).
+
+| Value | Meaning |
+|---|---|
+| `chunk` | primary content, split from a source document |
+| `overview` | primary content kept whole — a space or subspace description |
+| `summary` | a derived artifact, regenerated from other content |
+
+Two rules follow, and both have bitten:
+
+- **Ask "is this content?" through `is_content()`** (`core/domain/pipeline/chunk_strategy.py`),
+  never by comparing to `"chunk"`. A content passage that fails that test is
+  never fingerprinted, so it is re-embedded on every run and is never removed
+  when its source document is deleted.
+- **A retrieval predicate over content must be exclusion-shaped** (`!= "summary"`),
+  never inclusion-shaped (`== "chunk"`). An inclusion filter silently drops
+  every space and subspace description from results.
+
 ## Key Design Decisions
 
 - `docs/adr/` contains Architecture Decision Records (microkernel, plugin contract, unified LLM adapter, content hash dedup).
@@ -110,3 +132,4 @@ Scopes are optional: `feat(ingest): add retry logic`. All commits merged to `mai
 - LLM retries: 3 attempts with exponential backoff (1s base).
 - RAG context budget: `max_context_chars` (default 20000) drops lowest-scoring chunks first.
 - Content deduplication: SHA-256 hashes on chunks, with change detection and orphan cleanup during ingest.
+- Factual retrieval policy: expert and guidance pass the legacy-safe `FACTUAL_WHERE` from `core/domain/retrieval_filters.py`; the neutral knowledge-store port remains unfiltered when `where=None`, while `SUMMARIES_WHERE` supports explicit summary retrieval.

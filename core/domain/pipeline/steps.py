@@ -10,6 +10,12 @@ from dataclasses import dataclass, replace
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from core.domain.ingest_pipeline import Chunk, DocumentMetadata
+from core.domain.pipeline.chunk_strategy import (
+    EMBEDDING_TYPE_CHUNK,
+    ChunkStrategy,
+    is_content,
+    resolve_strategy,
+)
 from core.domain.pipeline.engine import PipelineContext
 from core.domain.pipeline.prompts import (
     BOK_MAP_TEMPLATE,
@@ -26,6 +32,143 @@ from core.ports.knowledge_store import KnowledgeStorePort
 from core.ports.llm import LLMPort
 
 logger = logging.getLogger(__name__)
+
+
+#: Document id of the whole-corpus overview, written by
+#: ``BodyOfKnowledgeSummaryStep``.
+_BOK_SUMMARY_DOCUMENT_ID = "body-of-knowledge-summary"
+
+#: Suffix ``DocumentSummaryStep`` appends when deriving a per-document summary.
+_SUMMARY_DOCUMENT_ID_SUFFIX = "-summary"
+
+
+def _is_derived_document_id(document_id: str | None) -> bool:
+    """Whether an id belongs to a generated summary rather than real content.
+
+    Summaries are identified by their label, but a legacy entry written before
+    that label existed carries no label at all — only its synthetic id gives it
+    away. Both conventions are checked here so the two summarisation steps and
+    this classification cannot drift apart.
+    """
+    if not document_id:
+        return False
+    return (
+        document_id == _BOK_SUMMARY_DOCUMENT_ID
+        or document_id.endswith(_SUMMARY_DOCUMENT_ID_SUFFIX)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Hierarchy metadata
+# ---------------------------------------------------------------------------
+
+#: snake_case attribute -> stored camelCase key, for the five optional
+#: identity/name fields. ``depth`` is handled separately: it is an int that is
+#: always written.
+_HIERARCHY_STRING_KEYS: tuple[tuple[str, str], ...] = (
+    ("space_id", "spaceId"),
+    ("space_name", "spaceName"),
+    ("subspace_id", "subspaceId"),
+    ("subspace_name", "subspaceName"),
+    ("callout_id", "calloutId"),
+)
+
+
+def has_position(metadata: DocumentMetadata) -> bool:
+    """Whether this content sits anywhere in a space tree.
+
+    Position is **all-or-nothing**: content with no tree position (website
+    ingestion) stores no position fields at all and is excluded from the
+    fingerprint's position segments. The two must agree — if the fingerprint
+    ignored position while the metadata still wrote ``depth``, an unchanged
+    entry would keep its old id, the store would skip the write, and the
+    ``depth`` would be silently discarded. That is precisely the failure this
+    feature exists to fix, so the same predicate governs both.
+    """
+    return bool(
+        metadata.space_id
+        or metadata.subspace_id
+        or metadata.callout_id
+        or metadata.depth
+    )
+
+
+def hierarchy_metadata(metadata: DocumentMetadata) -> dict:
+    """Render a document's tree position as storable metadata.
+
+    The store accepts only scalar values and rejects ``None``, failing the
+    whole batch it belongs to — so an unknown field is **omitted** rather than
+    written as ``None`` or a blank sentinel.
+
+    ``depth`` is written whenever the content has a position at all, including
+    its falsy ``0`` (a root space, a root-level callout) — guarding it with a
+    truthiness test would drop it from exactly those entries. Content with no
+    position whatsoever stores no position fields, matching what the
+    fingerprint sees, so nothing can be silently discarded.
+
+    Every path that writes to the knowledge store goes through here, so a new
+    field cannot be added to one writer and forgotten in another.
+    """
+    if not has_position(metadata):
+        return {}
+    rendered: dict = {}
+    for attr, key in _HIERARCHY_STRING_KEYS:
+        value = getattr(metadata, attr, None)
+        if not value:
+            continue
+        # Enforce the whole scalar contract, not just the None half: a nested
+        # value would be rejected by the store and take its entire batch with
+        # it, so drop it here and say so rather than lose up to 50 chunks.
+        if not isinstance(value, (str, int, float, bool)):
+            logger.warning(
+                "Dropping non-scalar %s on document %s: %r",
+                key, getattr(metadata, "document_id", "?"), type(value).__name__,
+            )
+            continue
+        rendered[key] = value
+    # depth is never dropped: a positioned entry missing it would be invisible
+    # to a depth filter, which is the silent gap the contract exists to
+    # prevent — and it would go missing precisely when something upstream is
+    # already wrong. Anything unusable is coerced to the root tier, loudly.
+    # bool is excluded deliberately: it is a subclass of int, and storing True
+    # would fail a `{"depth": 1}` equality filter.
+    depth = getattr(metadata, "depth", None)
+    if isinstance(depth, int) and not isinstance(depth, bool):
+        rendered["depth"] = depth
+    elif isinstance(depth, float):
+        rendered["depth"] = int(depth)
+    else:
+        logger.warning(
+            "Unusable depth on document %s (%s); storing 0",
+            getattr(metadata, "document_id", "?"), type(depth).__name__,
+        )
+        rendered["depth"] = 0
+    return rendered
+
+
+def _root_position(context: PipelineContext) -> tuple[str | None, str | None]:
+    """Identify the ingest root from the documents already collected.
+
+    Every document in one ingestion shares the same root, so any document
+    carrying it answers the question. Prefer a depth-0 entry, which is the
+    root's own description, and otherwise take the first document that names
+    a space at all — content-only ingestions (a space with no description)
+    still resolve correctly. Returns ``(None, None)`` when there is no tree
+    position anywhere, which is the website case.
+    """
+    fallback: tuple[str | None, str | None] = (None, None)
+    for source in (context.documents, context.chunks):
+        for item in source:
+            meta = item.metadata
+            space_id = getattr(meta, "space_id", None)
+            if not space_id:
+                continue
+            name = getattr(meta, "space_name", None)
+            if getattr(meta, "depth", None) == 0:
+                return space_id, name
+            if fallback == (None, None):
+                fallback = (space_id, name)
+    return fallback
 
 
 # ---------------------------------------------------------------------------
@@ -206,7 +349,17 @@ async def _refine_summarize(
 # ---------------------------------------------------------------------------
 
 class ChunkStep:
-    """Split documents into chunks with embeddingType='chunk'."""
+    """Split documents, sizing and labelling each by what kind of content it is.
+
+    A space description is a broad, self-contained statement of what a space is
+    for; cut in half, neither half answers anything. A long post is the
+    opposite — it holds many specifics that retrieve better separately. So the
+    splitter is chosen per document kind rather than once for the corpus.
+
+    The per-kind sizes are *overrides*: a kind with no size of its own uses
+    whatever this step was constructed with, so retuning the global default
+    still takes effect everywhere it should.
+    """
 
     def __init__(
         self,
@@ -220,19 +373,57 @@ class ChunkStep:
     def name(self) -> str:
         return "chunk"
 
-    async def execute(self, context: PipelineContext) -> None:
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=self._chunk_size,
-            chunk_overlap=self._chunk_overlap,
+    def _splitter_for(
+        self, strategy: ChunkStrategy,
+    ) -> RecursiveCharacterTextSplitter:
+        size = (
+            strategy.chunk_size
+            if strategy.chunk_size is not None
+            else self._chunk_size
         )
+        overlap = (
+            strategy.chunk_overlap
+            if strategy.chunk_overlap is not None
+            else self._chunk_overlap
+        )
+        # An overlap at or above the size is a misconfiguration the splitter
+        # rejects outright. Clamp to zero — the neutral value, since the
+        # configured one is meaningless — but say so loudly: silently running
+        # at some invented overlap would multiply passages, and every extra
+        # passage is an extra embedding paid for indefinitely.
+        if overlap >= size:
+            logger.warning(
+                "Chunk overlap %d is not below chunk size %d; using 0. "
+                "Check the configured chunk sizing.",
+                overlap, size,
+            )
+            overlap = 0
+        return RecursiveCharacterTextSplitter(
+            chunk_size=size, chunk_overlap=overlap,
+        )
+
+    async def execute(self, context: PipelineContext) -> None:
+        splitters: dict[tuple[int | None, int | None], RecursiveCharacterTextSplitter] = {}
 
         for doc in context.documents:
             try:
+                strategy = resolve_strategy(doc.metadata.type)
+                key = (strategy.chunk_size, strategy.chunk_overlap)
+                splitter = splitters.get(key)
+                if splitter is None:
+                    splitter = self._splitter_for(strategy)
+                    splitters[key] = splitter
+
                 text_chunks = splitter.split_text(doc.content)
                 if not text_chunks:
                     continue
                 for i, text in enumerate(text_chunks):
-                    meta = replace(doc.metadata, embedding_type="chunk")
+                    # A document above its ceiling is still split, and every
+                    # resulting passage keeps its kind's label — an overview
+                    # never silently downgrades to a detail passage.
+                    meta = replace(
+                        doc.metadata, embedding_type=strategy.embedding_type,
+                    )
                     context.chunks.append(
                         Chunk(content=text, metadata=meta, chunk_index=i)
                     )
@@ -256,15 +447,46 @@ class ContentHashStep:
 
     async def execute(self, context: PipelineContext) -> None:
         for chunk in context.chunks:
-            if chunk.metadata.embedding_type != "chunk":
+            if not is_content(chunk.metadata.embedding_type):
                 continue
-            canonical = "\0".join([
+            # Both the tree position and the passage label participate in the
+            # fingerprint, and the fingerprint is the storage id. Either one
+            # omitted means an entry already in the corpus keeps its old value
+            # forever: the text is unchanged, so the id is unchanged, so the
+            # write is skipped and the new value is computed and discarded.
+            #
+            # Display names are deliberately excluded — a rename would otherwise
+            # re-embed an entire space for a label change. Names are
+            # display-only; scoped retrieval filters on identities.
+            #
+            # Position is all-or-nothing. Content with no tree position at all
+            # — website ingestion — stores no position fields and so keeps the
+            # fingerprint it had before: there is nothing new to land, so
+            # skipping the rewrite discards nothing.
+            #
+            # A plain chunk appends no label, keeping its current fingerprint,
+            # so only passages whose label actually changes are rewritten
+            # rather than the whole corpus. An absent label is the pre-label
+            # spelling of "chunk" and is treated the same way.
+            meta = chunk.metadata
+            segments = [
                 chunk.content,
-                chunk.metadata.title,
-                chunk.metadata.source,
-                chunk.metadata.type,
-                chunk.metadata.document_id,
-            ])
+                meta.title,
+                meta.source,
+                meta.type,
+                meta.document_id,
+            ]
+            if has_position(meta):
+                segments += [
+                    meta.space_id or "",
+                    meta.subspace_id or "",
+                    meta.callout_id or "",
+                    str(meta.depth),
+                ]
+            label = meta.embedding_type or EMBEDDING_TYPE_CHUNK
+            if label != EMBEDDING_TYPE_CHUNK:
+                segments.append(label)
+            canonical = "\0".join(segments)
             chunk.content_hash = hashlib.sha256(
                 canonical.encode("utf-8")
             ).hexdigest()
@@ -301,7 +523,7 @@ class ChangeDetectionStep:
             context.changed_document_ids.clear()
             context.chunks_skipped = 0
             for chunk in context.chunks:
-                if chunk.metadata.embedding_type == "chunk":
+                if is_content(chunk.metadata.embedding_type):
                     chunk.embedding = None
 
     async def _detect(self, context: PipelineContext) -> None:
@@ -309,7 +531,7 @@ class ChangeDetectionStep:
         current_doc_ids: set[str] = set()
         chunks_by_doc: dict[str, list] = {}
         for chunk in context.chunks:
-            if chunk.metadata.embedding_type != "chunk":
+            if not is_content(chunk.metadata.embedding_type):
                 continue
             doc_id = chunk.metadata.document_id
             current_doc_ids.add(doc_id)
@@ -323,9 +545,23 @@ class ChangeDetectionStep:
         existing_doc_ids: set[str] = set()
         if all_existing.metadatas:
             for meta in all_existing.metadatas:
-                if meta.get("embeddingType") != "chunk":
-                    continue
                 doc_id_val = meta.get("documentId")
+                label = meta.get("embeddingType")
+                # These ids feed the removed-document set, and anything landing
+                # there is deleted outright. An unlabelled entry is treated as
+                # content, which is the safe default in general — but it cannot
+                # distinguish a passage from a summary, and deleting a summary
+                # is effectively permanent (one is regenerated only when its
+                # source document changes). So where, and only where, the label
+                # is missing, fall back to the synthetic id conventions.
+                #
+                # Scoped to the unlabelled case deliberately: document ids on
+                # the website path are page URLs, so a page whose slug happens
+                # to end in "-summary" would otherwise never be swept.
+                if label is None and _is_derived_document_id(doc_id_val):
+                    continue
+                if not is_content(label):
+                    continue
                 if doc_id_val:
                     existing_doc_ids.add(doc_id_val)
 
@@ -411,7 +647,7 @@ class DocumentSummaryStep:
     def __init__(
         self,
         llm_port: LLMPort,
-        summary_length: int = 10000,
+        summary_length: int = 2500,
         concurrency: int = 8,
         chunk_threshold: int = 4,
         embeddings_port: EmbeddingsPort | None = None,
@@ -541,12 +777,24 @@ class DocumentSummaryStep:
                             ),
                         )
                     source_meta = doc_chunks[0].metadata
+                    # A summary must report the same tree position as the
+                    # document it summarises, so retrieval scoped to a space
+                    # or subspace finds the summary alongside its content.
+                    # NB: this is a field-by-field rebuild, so every field
+                    # must be copied deliberately — `uri` is knowingly not
+                    # carried here, matching existing behaviour.
                     summary_meta = DocumentMetadata(
-                        document_id=f"{doc_id}-summary",
+                        document_id=f"{doc_id}{_SUMMARY_DOCUMENT_ID_SUFFIX}",
                         source=source_meta.source,
                         type=source_meta.type,
                         title=source_meta.title,
                         embedding_type="summary",
+                        space_id=source_meta.space_id,
+                        space_name=source_meta.space_name,
+                        subspace_id=source_meta.subspace_id,
+                        subspace_name=source_meta.subspace_name,
+                        callout_id=source_meta.callout_id,
+                        depth=source_meta.depth,
                     )
                     summary_chunk = Chunk(
                         content=summary, metadata=summary_meta, chunk_index=0,
@@ -637,7 +885,7 @@ class BodyOfKnowledgeSummaryStep:
     def __init__(
         self,
         llm_port: LLMPort,
-        summary_length: int = 10000,
+        summary_length: int = 2500,
         max_section_chars: int = 30000,
         knowledge_store_port: "KnowledgeStorePort | None" = None,
         embeddings_port: "EmbeddingsPort | None" = None,
@@ -771,12 +1019,18 @@ class BodyOfKnowledgeSummaryStep:
                 concurrency=5,
                 reduce_fanin=10,
             )
+            root_id, root_name = _root_position(context)
             bok_meta = DocumentMetadata(
-                document_id="body-of-knowledge-summary",
+                document_id=_BOK_SUMMARY_DOCUMENT_ID,
                 source="generated",
                 type="bodyOfKnowledgeSummary",
                 title="Body of Knowledge Overview",
                 embedding_type="summary",
+                # The overview spans the whole body, so it belongs to the
+                # ingest root and to no subspace or callout in particular.
+                space_id=root_id,
+                space_name=root_name,
+                depth=0,
             )
             bok_chunk = Chunk(content=bok_summary, metadata=bok_meta, chunk_index=0)
 
@@ -798,6 +1052,10 @@ class BodyOfKnowledgeSummaryStep:
                             "title": bok_meta.title,
                             "embeddingType": bok_meta.embedding_type,
                             "chunkIndex": 0,
+                            # This inline write bypasses StoreStep, so the
+                            # position must be rendered here too — through the
+                            # same helper, so the two paths cannot diverge.
+                            **hierarchy_metadata(bok_meta),
                         }],
                         ids=[f"{bok_meta.document_id}-0"],
                         embeddings=[embeddings[0]],
@@ -904,7 +1162,7 @@ class StoreStep:
             metadatas = []
             ids = []
             for c in batch:
-                if c.metadata.embedding_type == "chunk" and c.content_hash:
+                if is_content(c.metadata.embedding_type) and c.content_hash:
                     # Content-addressable: use content hash as storage ID
                     storage_id = c.content_hash
                 elif c.metadata.embedding_type == "summary":
@@ -923,6 +1181,7 @@ class StoreStep:
                 }
                 if getattr(c.metadata, "uri", None):
                     meta_entry["uri"] = c.metadata.uri
+                meta_entry.update(hierarchy_metadata(c.metadata))
                 metadatas.append(meta_entry)
                 ids.append(storage_id)
             batch_embeddings = [c.embedding for c in batch]
@@ -999,7 +1258,7 @@ class OrphanCleanupStep:
                 # Also delete the document's summary chunks
                 await self._store.delete(
                     collection=context.collection_name,
-                    where={"documentId": f"{doc_id}-summary"},
+                    where={"documentId": f"{doc_id}{_SUMMARY_DOCUMENT_ID_SUFFIX}"},
                 )
                 deleted += 1
             except Exception as exc:
@@ -1014,4 +1273,3 @@ class OrphanCleanupStep:
                 len(context.orphan_ids),
                 len(context.removed_document_ids),
             )
-

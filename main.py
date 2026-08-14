@@ -3,36 +3,208 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
+import unicodedata
 import os
 import signal
+from typing import Any
+from contextlib import nullcontext
+from urllib.parse import urlsplit, urlunsplit
 
-from core.config import BaseConfig
+from pydantic_settings import BaseSettings
+
+from core.config import BaseConfig, IngestSpaceConfig
 from core.container import Container
+from core.domain.rerank import LexicalReranker
+from core.domain.rule_classifier import RuleQueryClassifier
+from core.domain.faithfulness import ContextSufficiencyValidator
 from core.health import HealthServer
 from core.logging import setup_logging
 from core.ports.llm import LLMPort
 from core.ports.embeddings import EmbeddingsPort
 from core.ports.knowledge_store import KnowledgeStorePort
+from core.ports.reranker import RerankerPort
 from core.registry import PluginRegistry
 from core.router import Router
 
 logger = logging.getLogger(__name__)
 
 
-def _mask_sensitive(name: str, value) -> str:
+def _mask_sensitive(name: str, value: object) -> str:
     """Mask API key values for logging."""
     if value is None:
         return "None"
     s = str(value)
-    if "api_key" in name:
+    if "api_key" in name or "headers" in name:
         return s[:3] + "****" if len(s) > 3 else "****"
+    if name.endswith(("_endpoint", "_url")):
+        parsed = urlsplit(s)
+        if parsed.username is not None or parsed.password is not None:
+            host = parsed.hostname or ""
+            if parsed.port is not None:
+                host = f"{host}:{parsed.port}"
+            return urlunsplit(parsed._replace(netloc=f"***@{host}"))
     return s
 
 
-def _log_config(config: BaseConfig) -> None:
-    """Log all configurable summarization/retrieval fields at startup."""
+def _build_routing_table(
+    config: BaseConfig,
+    *,
+    n_results: int,
+    score_threshold: float,
+    max_context_chars: int,
+) -> dict:
+    """Turn routing config into the per-route retrieval profiles.
+
+    The plugin's OWN effective settings are passed in, not read from the
+    deprecated globals. This matters: production sets `EXPERT_MIN_SCORE` and
+    `GUIDANCE_MIN_SCORE` to 0.1 and never sets `RETRIEVAL_SCORE_THRESHOLD`, so
+    building from the global would silently impose 0.3 on every routed query —
+    tripling a threshold nobody configured, the moment routing was switched on.
+
+    The moderate route deliberately mirrors those same settings: an
+    unrecognised question falls back to it, and that fallback has to behave
+    exactly as the plugin does today.
+    """
+    from core.domain.routing import RetrievalProfile
+    from core.ports.query_router import RouteClass
+
+    default_threshold = score_threshold
+    return {
+        RouteClass.CONVERSATIONAL: RetrievalProfile(
+            retrieve=False,
+            n_results=n_results,
+            score_threshold=default_threshold,
+            max_context_chars=max_context_chars,
+        ),
+        RouteClass.SIMPLE: RetrievalProfile(
+            retrieve=True,
+            # Never wider than what the plugin would have used anyway — a
+            # simple query must not become slower than it is today.
+            n_results=min(config.routing_simple_n_results, n_results),
+            score_threshold=default_threshold,
+            max_context_chars=max_context_chars,
+        ),
+        RouteClass.MODERATE: RetrievalProfile(
+            retrieve=True,
+            n_results=n_results,
+            score_threshold=default_threshold,
+            max_context_chars=max_context_chars,
+        ),
+        RouteClass.COMPLEX: RetrievalProfile(
+            retrieve=True,
+            # At least as wide as today, and never narrower: a complex
+            # question must not see less than an unrouted one.
+            n_results=max(config.routing_complex_n_results, n_results),
+            score_threshold=default_threshold,
+            max_context_chars=max(
+                config.routing_complex_context_chars, max_context_chars,
+            ),
+        ),
+    }
+
+
+#: Acknowledgements that classify CONVERSATIONAL but may mean "yes, do it".
+#:
+#: The classifier deliberately excludes bare "yes", "no" and "sure" from its
+#: conversational set, on the stated grounds that after *"Shall I list the
+#: templates in this space?"* they are the shortest way to say *do it*. That
+#: reasoning applies verbatim to these, which it does include. Skipping them
+#: searches the vector store for the literal string "ok" instead of the offer
+#: the member just accepted — a regression against develop, which rewrites it.
+#:
+#: Excluding them costs nothing: they fall through to being rewritten, exactly
+#: as today. The gate only ever needs to be *right* about what it skips.
+_AMBIGUOUS_ACKNOWLEDGEMENTS = frozenset({
+    "ok", "okay", "k", "kk", "alright", "all right", "right",
+    "will do", "later", "got it", "gotcha", "noted", "understood",
+    "sounds good", "fine", "cool", "yep", "yeah", "yup",
+})
+
+
+class _ConversationalSkipPolicy:
+    """Skip the rewrite only for turns that are entirely small talk.
+
+    Wraps the adaptive-query classifier without the plugins knowing it exists.
+
+    **Only CONVERSATIONAL is safe, and not even all of it.** Skipping SIMPLE as
+    well looks tempting — it is roughly twice as fast — but SIMPLE covers
+    anaphoric follow-ups like "show me those" and "the name of the lead", which
+    are meaningless without the preceding turn: 9 of a 12-turn corpus broke.
+    And within CONVERSATIONAL, the acknowledgements above are held back
+    because they can be an affirmative answer to a question the VC just asked.
+
+    What remains — "thanks", "cheers", "bye" — asserts that the member wants
+    nothing looked up, which is what makes dropping the history safe.
+    """
+
+    def __init__(self, classifier: object, conversational: object) -> None:
+        self._classifier = classifier
+        self._conversational = conversational
+
+    @staticmethod
+    def _normalise(message: str) -> str:
+        """Strip trailing punctuation of any kind before the membership test.
+
+        A literal `!.?` set misses "ok," and "ok…" — and the whole point of the
+        hold-back list is that it must not be trivially side-stepped by how
+        someone happens to punctuate.
+        """
+        stripped = message.strip().lower()
+        while stripped and unicodedata.category(stripped[-1]).startswith("P"):
+            stripped = stripped[:-1].rstrip()
+        return stripped
+
+    def should_skip_rewrite(self, message: str) -> bool:
+        if self._normalise(message) in _AMBIGUOUS_ACKNOWLEDGEMENTS:
+            return False
+        try:
+            return self._classifier.classify(message).route is self._conversational
+        except Exception as exc:
+            # Never let the optimisation break the request it was optimising.
+            logger.warning(
+                "Rewrite policy failed, not skipping: error_type=%s", type(exc).__name__
+            )
+            return False
+
+
+def _build_rewrite_policy() -> object | None:
+    """Build the gate policy if the classifier is available, else None.
+
+    The classifier ships on a separate, unmerged PR that sits in a multi-way
+    pile-up on these same files. Guarding the import means this feature builds
+    and runs on develop today and starts gating the moment that lands — with no
+    merge-order dependency in either direction. Returning None disables only the
+    skip: every turn is rewritten, exactly as before.
+    """
+    try:
+        from core.domain.rule_classifier import RuleQueryClassifier
+        from core.ports.query_router import RouteClass
+    except ImportError:
+        logger.info(
+            "Query-rewrite gating requested but the query classifier is not "
+            "available in this build; every turn with history will be rewritten"
+        )
+        return None
+    return _ConversationalSkipPolicy(RuleQueryClassifier(), RouteClass.CONVERSATIONAL)
+
+
+def _log_config(config: BaseConfig, plugin_class: type | None = None) -> None:
+    """Log all configurable summarization/retrieval fields at startup.
+
+    Ingest sizing is logged only for plugins that actually consume it — the
+    log is the permanent detector for a silent sizing no-op, so reporting
+    values a pipeline ignores would recreate exactly the false confidence it
+    exists to prevent.
+    """
+    sizing_fields = {"chunk_size", "chunk_overlap", "summary_length"}
+    consumed = (
+        set(inspect.signature(plugin_class.__init__).parameters)
+        if plugin_class is not None
+        else sizing_fields
+    )
     fields = [
         "summarize_llm_provider",
         "summarize_llm_model",
@@ -49,12 +221,135 @@ def _log_config(config: BaseConfig) -> None:
         "guidance_n_results",
         "guidance_min_score",
         "max_context_chars",
+        "answering_llm_temperature",
+        "answering_chain_of_thought_enabled",
+        "hybrid_retrieval_enabled",
+        "rerank_enabled",
+        "rerank_candidate_n",
+        "rerank_top_k",
+        "rerank_lexical_weight",
+        "routing_enabled",
+        "routing_simple_n_results",
+        "routing_complex_n_results",
+        "routing_complex_context_chars",
+        "faithfulness_validation_enabled",
+        "query_rewrite_gating_enabled",
+        "query_rewrite_max_expansion_ratio",
         "summary_chunk_threshold",
+        "chunk_size",
+        "chunk_overlap",
+        "summary_length",
         "pipeline_timeout",
+        "llm_base_url",
+        "vector_db_host",
+        "tracing_enabled",
+        "tracing_otlp_endpoint",
+        "tracing_otlp_headers",
+        "tracing_service_name",
+        "tracing_sample_ratio",
+        "tracing_capture_content",
+        "tracing_content_max_chars",
     ]
     for name in fields:
+        if name in sizing_fields and name not in consumed:
+            continue
         value = getattr(config, name, None)
         logger.info("Config: %s=%s", name.upper(), _mask_sensitive(name, value))
+
+
+class _PluginTypeProbe(BaseSettings):
+    """Reads only PLUGIN_TYPE, with the same env/.env binding as BaseConfig.
+
+    Deliberately field-minimal: constructing a full BaseConfig to learn the
+    plugin type would validate the ingest-space environment against the
+    *shared* sizing defaults and abort startup on a legal configuration.
+    """
+
+    # Derived, not duplicated: if BaseConfig's env binding ever changes
+    # (env_prefix, case_sensitive, secrets_dir), the probe must follow it or
+    # plugin-type resolution silently diverges from the config it selects.
+    model_config = BaseConfig.model_config
+
+    plugin_type: str = ""
+
+
+def _load_config() -> BaseConfig:
+    """Load plugin-specific configuration when it has intentional overrides.
+
+    The plugin type is read straight from the environment rather than from a
+    probe ``BaseConfig()``: constructing the base class would validate the
+    ingest-space environment against the *shared* defaults, so a legal
+    ``CHUNK_OVERLAP`` between BaseConfig's chunk_size and IngestSpaceConfig's
+    would abort startup with an error naming a size the operator never set.
+    """
+    # Resolve plugin_type through a minimal model that shares BaseConfig's
+    # env_file binding: a raw os.environ read would miss a PLUGIN_TYPE set in
+    # .env (a documented local-dev path) and silently load the wrong sizing.
+    plugin_type = _PluginTypeProbe().plugin_type
+    if plugin_type.lower() == "ingest-space":
+        return IngestSpaceConfig()
+    return BaseConfig()
+
+
+def _inject_plugin_config(
+    deps: dict[str, Any],
+    plugin_class: type,
+    config: BaseConfig,
+    summarize_llm: LLMPort | None,
+    bok_llm: LLMPort | None,
+) -> inspect.Signature:
+    """Inject configuration fields declared by a plugin constructor."""
+    sig = inspect.signature(plugin_class.__init__)
+    plugin_name = config.plugin_type.lower().replace("-", "_") if config.plugin_type else ""
+
+    # Inject per-plugin retrieval config
+    if "n_results" in sig.parameters:
+        if plugin_name == "expert":
+            deps["n_results"] = config.expert_n_results
+        elif plugin_name == "guidance":
+            deps["n_results"] = config.guidance_n_results
+        else:
+            deps["n_results"] = config.retrieval_n_results
+    if "score_threshold" in sig.parameters:
+        if plugin_name == "expert":
+            deps["score_threshold"] = config.expert_min_score
+        elif plugin_name == "guidance":
+            deps["score_threshold"] = config.guidance_min_score
+        else:
+            deps["score_threshold"] = config.retrieval_score_threshold
+    if "max_context_chars" in sig.parameters:
+        deps["max_context_chars"] = config.max_context_chars
+
+    # Inject summarization configuration for ingest plugins
+    if "summarize_llm" in sig.parameters:
+        deps["summarize_llm"] = summarize_llm
+    if "bok_llm" in sig.parameters:
+        deps["bok_llm"] = bok_llm
+    if "chunk_threshold" in sig.parameters:
+        deps["chunk_threshold"] = config.summary_chunk_threshold
+    if "summarize_enabled" in sig.parameters:
+        deps["summarize_enabled"] = config.summarize_enabled
+    if "summarize_concurrency" in sig.parameters:
+        deps["summarize_concurrency"] = config.summarize_concurrency
+    if "ingest_batch_size" in sig.parameters:
+        deps["ingest_batch_size"] = config.ingest_batch_size
+    if "chunk_size" in sig.parameters:
+        deps["chunk_size"] = config.chunk_size
+    if "chunk_overlap" in sig.parameters:
+        deps["chunk_overlap"] = config.chunk_overlap
+    if "summary_length" in sig.parameters:
+        deps["summary_length"] = config.summary_length
+
+    return sig
+def _inject_answering_config(
+    config: BaseConfig, deps: dict[str, object], signature: inspect.Signature
+) -> None:
+    """Inject answering-only settings only into plugins that declare them."""
+
+    if "answering_temperature" in signature.parameters:
+        deps["answering_temperature"] = config.answering_llm_temperature
+    if "chain_of_thought_enabled" in signature.parameters:
+        deps["chain_of_thought_enabled"] = config.answering_chain_of_thought_enabled
 
 
 def _resolve_plugin_llm_config(config: BaseConfig) -> BaseConfig:
@@ -131,21 +426,304 @@ def _create_adapters(config: BaseConfig, container: Container) -> None:
         from core.adapters.chromadb import ChromaDBAdapter
 
         embeddings_adapter = container._bindings.get(EmbeddingsPort)
-        container.register(
-            KnowledgeStorePort,
-            ChromaDBAdapter(
-                host=config.vector_db_host,
-                port=config.vector_db_port,
-                credentials=config.vector_db_credentials,
-                embeddings=embeddings_adapter,
-                distance_fn=config.vector_db_distance_fn,
-            ),
+        knowledge_store: KnowledgeStorePort = ChromaDBAdapter(
+            host=config.vector_db_host,
+            port=config.vector_db_port,
+            credentials=config.vector_db_credentials,
+            embeddings=embeddings_adapter,
+            distance_fn=config.vector_db_distance_fn,
         )
+        if config.tracing_enabled:
+            from core.tracing import tracing_is_configured
+
+            if tracing_is_configured():
+                from core.tracing_knowledge_store import TracedKnowledgeStore
+
+                knowledge_store = TracedKnowledgeStore(knowledge_store)
+        container.register(KnowledgeStorePort, knowledge_store)
 
     # OpenAI Assistants (always available — per-request API keys)
     from core.adapters.openai_assistant import OpenAIAssistantAdapter
 
     container.register(OpenAIAssistantAdapter, OpenAIAssistantAdapter())
+
+    # Re-ranker — registered only when enabled. Left unregistered, plugins
+    # keep their `reranker=None` default and never take the re-ranking path,
+    # which is what makes disabling it a true rollback rather than a second
+    # code path that merely resembles the old one.
+    if config.rerank_enabled:
+        container.register(
+            RerankerPort,
+            LexicalReranker(lexical_weight=config.rerank_lexical_weight),
+        )
+
+
+async def _shutdown_tracing_bounded() -> None:
+    """Flush tracing without allowing an unreachable collector to delay exit.
+
+    A daemon thread (not asyncio.to_thread) bounds PROCESS exit, not just the
+    event loop: to_thread uses a non-daemon executor worker, which keeps the
+    interpreter alive until the SDK's unbounded flush finishes — measured
+    10-40s against a dead collector, overshooting k8s' 30s grace period.
+    """
+    import threading
+
+    from core.tracing import shutdown_tracing
+
+    flusher = threading.Thread(target=shutdown_tracing, daemon=True, name="tracing-flush")
+    flusher.start()
+    deadline = 5.0
+    while flusher.is_alive() and deadline > 0:
+        await asyncio.sleep(0.1)
+        deadline -= 0.1
+    if flusher.is_alive():
+        logger.warning("Tracing shutdown exceeded 5s; closing transport anyway")
+
+
+def build_message_handler(
+    *,
+    config: BaseConfig,
+    plugin: object,
+    router: Router,
+    transport: object,
+    active_tasks: set,
+):
+    """Build the production on_message handler (module-level so tests can
+    drive the REAL wiring — root spans, failure taxonomy, both ACK paths —
+    instead of re-implementing it)."""
+
+    def _is_ingest_event(event: object) -> bool:
+        """Return True for ingest event types that should use early ACK."""
+        from core.events.ingest_space import IngestBodyOfKnowledge
+        from core.events.ingest_website import IngestWebsite
+        return isinstance(event, (IngestWebsite, IngestBodyOfKnowledge))
+
+    async def _publish_result(envelope: dict) -> None:
+        """Publish a result envelope to the result queue."""
+        await transport.publish(
+            config.rabbitmq_exchange,
+            config.rabbitmq_result_routing_key,
+            json.dumps(envelope).encode("utf-8"),
+        )
+
+    async def _run_pipeline(event: object) -> None:
+        """Run plugin.handle() with timeout and publish result."""
+        from core.tracing import (
+            FailureMode,
+            LLMInvocationTimeoutError,
+            classify_failure,
+            handle_span,
+            record_failure,
+            tracing_is_configured,
+        )
+
+        context = handle_span(config, event, plugin.name) if tracing_is_configured() else nullcontext(None)
+        with context as root:
+            try:
+                response = await asyncio.wait_for(
+                    plugin.handle(event),
+                    timeout=config.pipeline_timeout,
+                )
+                envelope = router.build_response_envelope(response, event)
+                await _publish_result(envelope)
+                if root is not None:
+                    from opentelemetry import trace
+
+                    root.set_status(trace.Status(trace.StatusCode.OK))
+            except LLMInvocationTimeoutError as exc:
+                logger.error(
+                    "LLM provider timed out for event type %s", type(event).__name__
+                )
+                if root is not None:
+                    record_failure(root, exc, FailureMode.llm_error, config=config)
+                from core.events.response import Response
+                error_response = Response(result=f"Error: {exc}")
+                envelope = router.build_response_envelope(error_response, event)
+                await _publish_result(envelope)
+            except asyncio.TimeoutError as exc:
+                logger.error(
+                    "Pipeline timed out after %ds for event type %s",
+                    config.pipeline_timeout,
+                    type(event).__name__,
+                )
+                if root is not None:
+                    record_failure(root, exc, FailureMode.timeout, config=config)
+                from core.events.response import Response
+                error_response = Response(result=f"Error: pipeline timed out after {config.pipeline_timeout}s")
+                envelope = router.build_response_envelope(error_response, event)
+                await _publish_result(envelope)
+            except Exception as exc:
+                logger.exception("Pipeline failed for event type %s: %s", type(event).__name__, exc)
+                if root is not None:
+                    record_failure(root, exc, classify_failure(exc), config=config)
+                from core.events.response import Response
+                error_response = Response(result=f"Error: {exc}")
+                envelope = router.build_response_envelope(error_response, event)
+                await _publish_result(envelope)
+
+    def _task_done(task: asyncio.Task) -> None:
+        """Remove completed task from the active set."""
+        active_tasks.discard(task)
+
+    # Message handler — receives both body and raw message for ACK control
+    async def on_message(
+        body: dict,
+        message: object,
+    ) -> None:
+        event = None
+        try:
+            event = router.parse_event(body)
+
+            if _is_ingest_event(event):
+                # Early ACK: acknowledge before processing starts
+                await message.ack()  # type: ignore[union-attr]
+                logger.info(
+                    "Early-ACKed ingest message, scheduling async pipeline for %s",
+                    type(event).__name__,
+                )
+                task = asyncio.create_task(_run_pipeline(event))
+                active_tasks.add(task)
+                task.add_done_callback(_task_done)
+            else:
+                # Engine query: late ACK — process synchronously, then ACK
+                from core.tracing import (
+                    FailureMode,
+                    LLMInvocationTimeoutError,
+                    classify_failure,
+                    handle_span,
+                    record_failure,
+                    tracing_is_configured,
+                )
+
+                context = handle_span(config, event, plugin.name) if tracing_is_configured() else nullcontext(None)
+                published = False
+                with context as root:
+                    try:
+                        response = await asyncio.wait_for(
+                            plugin.handle(event),
+                            timeout=config.pipeline_timeout,
+                        )
+                        envelope = router.build_response_envelope(response, event)
+                        await _publish_result(envelope)
+                        published = True
+                        await message.ack()  # type: ignore[union-attr]
+                        if root is not None:
+                            from opentelemetry import trace
+
+                            root.set_status(trace.Status(trace.StatusCode.OK))
+                    except LLMInvocationTimeoutError as exc:
+                        logger.error(
+                            "LLM provider timed out for %s", type(event).__name__
+                        )
+                        if root is not None:
+                            record_failure(root, exc, FailureMode.llm_error, config=config)
+                        await _retry_or_reject(
+                            message, body,
+                            event=event,
+                            error_text=f"Error: {exc}",
+                        )
+                    except asyncio.TimeoutError as exc:
+                        logger.error(
+                            "Handler timed out after %ds for %s",
+                            config.pipeline_timeout,
+                            type(event).__name__,
+                        )
+                        if root is not None:
+                            record_failure(root, exc, FailureMode.timeout, config=config)
+                        await _retry_or_reject(
+                            message, body,
+                            event=event,
+                            error_text=(
+                                f"Error: handler timed out after "
+                                f"{config.pipeline_timeout}s"
+                            ),
+                        )
+                    except Exception as exc:
+                        logger.exception("Error handling engine query: %s", exc)
+                        if root is not None:
+                            record_failure(root, exc, classify_failure(exc), config=config)
+                        # If the answer already reached the result queue and only
+                        # the ACK failed (e.g. a dropped channel), requeuing here
+                        # would re-run the plugin and deliver a second reply for
+                        # one user request. Leave redelivery to the broker.
+                        if not published:
+                            await _retry_or_reject(
+                                message, body,
+                                event=event,
+                                error_text=f"Error: {exc}",
+                            )
+        except Exception as exc:
+            # parse_event failed — reject the message
+            logger.exception("Failed to parse message: %s", exc)
+            await _retry_or_reject(message, body)
+
+    async def _retry_or_reject(
+        message: object,
+        body: dict,
+        *,
+        event: object | None = None,
+        error_text: str | None = None,
+    ) -> None:
+        """Requeue for another attempt or publish a final error.
+
+        Intermediate retries stay silent — publishing on every attempt
+        would spam the room with failure messages.  Only on the last
+        attempt do we emit ``error_text`` as the response so the user
+        gets closure.
+        """
+        headers = getattr(message, "headers", None) or {}
+        retry_count = int(headers.get("x-retry-count", 0))
+        max_retries = config.rabbitmq_max_retries
+
+        if retry_count < max_retries - 1:
+            logger.warning(
+                "Message failed (attempt %d/%d), requeuing",
+                retry_count + 1, max_retries,
+            )
+            new_headers = dict(headers)
+            new_headers["x-retry-count"] = retry_count + 1
+            try:
+                await transport.republish_with_headers(
+                    config.rabbitmq_input_queue,
+                    json.dumps(body).encode("utf-8"),
+                    new_headers,
+                )
+            except Exception as pub_exc:
+                logger.error("Failed to republish retry message: %s", pub_exc)
+                # Republish failed — the message will be lost after reject.
+                # Publish the error response now so the user isn't left hanging.
+                if event is not None and error_text:
+                    try:
+                        from core.events.response import Response
+                        error_response = Response(result=error_text)
+                        envelope = router.build_response_envelope(
+                            error_response, event,
+                        )
+                        await _publish_result(envelope)
+                    except Exception:
+                        logger.error("Failed to publish fallback error response")
+            await message.reject(requeue=False)  # type: ignore[union-attr]
+        else:
+            logger.error(
+                "Message failed after %d attempts, discarding",
+                max_retries,
+            )
+            if event is not None and error_text:
+                try:
+                    from core.events.response import Response
+                    error_response = Response(result=error_text)
+                    envelope = router.build_response_envelope(
+                        error_response, event,
+                    )
+                    await _publish_result(envelope)
+                except Exception as pub_exc:
+                    logger.error(
+                        "Failed to publish terminal error response: %s",
+                        pub_exc,
+                    )
+            await message.reject(requeue=False)  # type: ignore[union-attr]
+
+    return on_message
 
 
 async def _run(config: BaseConfig) -> None:
@@ -226,8 +804,14 @@ async def _run(config: BaseConfig) -> None:
 
     # Construct plugin with dependencies
     deps = container.resolve_for_plugin(plugin_class)
+    sig = _inject_plugin_config(
+        deps,
+        plugin_class,
+        config,
+        summarize_llm,
+        bok_llm,
+    )
     # Inject per-plugin retrieval config
-    import inspect
     sig = inspect.signature(plugin_class.__init__)
     plugin_name = config.plugin_type.lower().replace("-", "_") if config.plugin_type else ""
     if "n_results" in sig.parameters:
@@ -246,6 +830,64 @@ async def _run(config: BaseConfig) -> None:
             deps["score_threshold"] = config.retrieval_score_threshold
     if "max_context_chars" in sig.parameters:
         deps["max_context_chars"] = config.max_context_chars
+    _inject_answering_config(config, deps, sig)
+    # The whole config object, so the retrieval helper reads the hybrid
+    # settings from one place rather than each plugin re-listing them.
+    if "hybrid_config" in sig.parameters:
+        deps["hybrid_config"] = config
+    # The re-ranker itself now arrives via `resolve_for_plugin` above, which
+    # resolves the `RerankerPort | None` annotation to the registration made
+    # in `_create_adapters`. Only its scalar settings still need injecting,
+    # and only when it is actually present — otherwise a disabled deployment
+    # would carry re-ranking numbers it never uses.
+    if "reranker" in deps:
+        if "rerank_candidate_n" in sig.parameters:
+            deps["rerank_candidate_n"] = config.rerank_candidate_n
+        if "rerank_top_k" in sig.parameters:
+            deps["rerank_top_k"] = config.rerank_top_k
+    # Inject the classifier only when routing is enabled. Left absent, the
+    # plugins keep their `query_router=None` default and take their existing
+    # code path — which is what makes disabling this a true rollback rather
+    # than a routing table that merely happens to agree with today.
+    if config.routing_enabled and "query_router" in sig.parameters:
+        deps["query_router"] = RuleQueryClassifier()
+        if "routing_table" in sig.parameters:
+            deps["routing_table"] = _build_routing_table(
+                config,
+                n_results=deps.get("n_results", config.retrieval_n_results),
+                score_threshold=deps.get(
+                    "score_threshold", config.retrieval_score_threshold,
+                ),
+                max_context_chars=deps.get(
+                    "max_context_chars", config.max_context_chars,
+                ),
+            )
+    # None means disabled, and is checked before any validation code runs — so
+    # disabling is a structural absence rather than a branch inside the check.
+    if "faithfulness_validator" in sig.parameters:
+        deps["faithfulness_validator"] = (
+            ContextSufficiencyValidator()
+            if config.faithfulness_validation_enabled
+            else None
+        )
+    # Inject the query-rewrite gate
+    if "max_expansion_ratio" in sig.parameters:
+        deps["max_expansion_ratio"] = config.query_rewrite_max_expansion_ratio
+    if "max_history_turns" in sig.parameters:
+        # Honour a plugin's own `history_length` when it declares one — it is
+        # that plugin's statement about how much history is meaningful, and it
+        # should never be exceeded by the rewrite prompt.
+        plugin_history = getattr(config, "history_length", None)
+        turns = config.query_rewrite_max_history_turns
+        deps["max_history_turns"] = (
+            min(turns, plugin_history) if plugin_history else turns
+        )
+    if "max_history_chars" in sig.parameters:
+        deps["max_history_chars"] = config.query_rewrite_max_history_chars
+    if "rewrite_policy" in sig.parameters and config.query_rewrite_gating_enabled:
+        policy = _build_rewrite_policy()
+        if policy is not None:
+            deps["rewrite_policy"] = policy
     # Inject summarization LLM for ingest plugins
     if "summarize_llm" in sig.parameters:
         deps["summarize_llm"] = summarize_llm
@@ -303,170 +945,13 @@ async def _run(config: BaseConfig) -> None:
     # Track in-flight pipeline tasks for graceful shutdown
     active_tasks: set[asyncio.Task] = set()
 
-    def _is_ingest_event(event: object) -> bool:
-        """Return True for ingest event types that should use early ACK."""
-        from core.events.ingest_space import IngestBodyOfKnowledge
-        from core.events.ingest_website import IngestWebsite
-        return isinstance(event, (IngestWebsite, IngestBodyOfKnowledge))
-
-    async def _publish_result(envelope: dict) -> None:
-        """Publish a result envelope to the result queue."""
-        await transport.publish(
-            config.rabbitmq_exchange,
-            config.rabbitmq_result_routing_key,
-            json.dumps(envelope).encode("utf-8"),
-        )
-
-    async def _run_pipeline(event: object) -> None:
-        """Run plugin.handle() with timeout and publish result."""
-        try:
-            response = await asyncio.wait_for(
-                plugin.handle(event),
-                timeout=config.pipeline_timeout,
-            )
-            envelope = router.build_response_envelope(response, event)
-            await _publish_result(envelope)
-        except asyncio.TimeoutError:
-            logger.error(
-                "Pipeline timed out after %ds for event type %s",
-                config.pipeline_timeout,
-                type(event).__name__,
-            )
-            from core.events.response import Response
-            error_response = Response(result=f"Error: pipeline timed out after {config.pipeline_timeout}s")
-            envelope = router.build_response_envelope(error_response, event)
-            await _publish_result(envelope)
-        except Exception as exc:
-            logger.exception("Pipeline failed for event type %s: %s", type(event).__name__, exc)
-            from core.events.response import Response
-            error_response = Response(result=f"Error: {exc}")
-            envelope = router.build_response_envelope(error_response, event)
-            await _publish_result(envelope)
-
-    def _task_done(task: asyncio.Task) -> None:
-        """Remove completed task from the active set."""
-        active_tasks.discard(task)
-
-    # Message handler — receives both body and raw message for ACK control
-    async def on_message(
-        body: dict,
-        message: object,
-    ) -> None:
-        event = None
-        try:
-            event = router.parse_event(body)
-
-            if _is_ingest_event(event):
-                # Early ACK: acknowledge before processing starts
-                await message.ack()  # type: ignore[union-attr]
-                logger.info(
-                    "Early-ACKed ingest message, scheduling async pipeline for %s",
-                    type(event).__name__,
-                )
-                task = asyncio.create_task(_run_pipeline(event))
-                active_tasks.add(task)
-                task.add_done_callback(_task_done)
-            else:
-                # Engine query: late ACK — process synchronously, then ACK
-                try:
-                    response = await asyncio.wait_for(
-                        plugin.handle(event),
-                        timeout=config.pipeline_timeout,
-                    )
-                    envelope = router.build_response_envelope(response, event)
-                    await _publish_result(envelope)
-                    await message.ack()  # type: ignore[union-attr]
-                except asyncio.TimeoutError:
-                    logger.error(
-                        "Handler timed out after %ds for %s",
-                        config.pipeline_timeout,
-                        type(event).__name__,
-                    )
-                    await _retry_or_reject(
-                        message, body,
-                        event=event,
-                        error_text=(
-                            f"Error: handler timed out after "
-                            f"{config.pipeline_timeout}s"
-                        ),
-                    )
-                except Exception as exc:
-                    logger.exception("Error handling engine query: %s", exc)
-                    await _retry_or_reject(
-                        message, body,
-                        event=event,
-                        error_text=f"Error: {exc}",
-                    )
-        except Exception as exc:
-            # parse_event failed — reject the message
-            logger.exception("Failed to parse message: %s", exc)
-            await _retry_or_reject(message, body)
-
-    async def _retry_or_reject(
-        message: object,
-        body: dict,
-        *,
-        event: object | None = None,
-        error_text: str | None = None,
-    ) -> None:
-        """Requeue for another attempt or publish a final error.
-
-        Intermediate retries stay silent — publishing on every attempt
-        would spam the room with failure messages.  Only on the last
-        attempt do we emit ``error_text`` as the response so the user
-        gets closure.
-        """
-        headers = getattr(message, "headers", None) or {}
-        retry_count = int(headers.get("x-retry-count", 0))
-        max_retries = config.rabbitmq_max_retries
-
-        if retry_count < max_retries - 1:
-            logger.warning(
-                "Message failed (attempt %d/%d), requeuing",
-                retry_count + 1, max_retries,
-            )
-            new_headers = dict(headers)
-            new_headers["x-retry-count"] = retry_count + 1
-            try:
-                await transport.republish_with_headers(
-                    config.rabbitmq_input_queue,
-                    json.dumps(body).encode("utf-8"),
-                    new_headers,
-                )
-            except Exception as pub_exc:
-                logger.error("Failed to republish retry message: %s", pub_exc)
-                # Republish failed — the message will be lost after reject.
-                # Publish the error response now so the user isn't left hanging.
-                if event is not None and error_text:
-                    try:
-                        from core.events.response import Response
-                        error_response = Response(result=error_text)
-                        envelope = router.build_response_envelope(
-                            error_response, event,
-                        )
-                        await _publish_result(envelope)
-                    except Exception:
-                        logger.error("Failed to publish fallback error response")
-            await message.reject(requeue=False)  # type: ignore[union-attr]
-        else:
-            logger.error(
-                "Message failed after %d attempts, discarding",
-                max_retries,
-            )
-            if event is not None and error_text:
-                try:
-                    from core.events.response import Response
-                    error_response = Response(result=error_text)
-                    envelope = router.build_response_envelope(
-                        error_response, event,
-                    )
-                    await _publish_result(envelope)
-                except Exception as pub_exc:
-                    logger.error(
-                        "Failed to publish terminal error response: %s",
-                        pub_exc,
-                    )
-            await message.reject(requeue=False)  # type: ignore[union-attr]
+    on_message = build_message_handler(
+        config=config,
+        plugin=plugin,
+        router=router,
+        transport=transport,
+        active_tasks=active_tasks,
+    )
 
     # Start consuming with message handle exposed for ACK control
     await transport.consume_with_message(config.rabbitmq_input_queue, on_message)
@@ -514,6 +999,7 @@ async def _run(config: BaseConfig) -> None:
 
     await health.stop()
     await plugin.shutdown()
+    await _shutdown_tracing_bounded()
     await transport.close()
     logger.info("Shutdown complete")
 
@@ -521,10 +1007,18 @@ async def _run(config: BaseConfig) -> None:
 def main() -> None:
     import concurrent.futures
 
-    config = BaseConfig()
+    config = _load_config()
     setup_logging(level=config.log_level, plugin_type=config.plugin_type)
+    from core.tracing import configure_tracing
+
+    configure_tracing(config)
     logger.info("Starting virtual-contributor engine with plugin: %s", config.plugin_type)
-    _log_config(config)
+    # Resolve the plugin class up front so sizing is logged only where consumed.
+    try:
+        logged_plugin_class: type | None = PluginRegistry().discover(config.plugin_type)
+    except Exception:  # discovery errors surface later in _run with full context
+        logged_plugin_class = None
+    _log_config(config, logged_plugin_class)
 
     # Expand default thread pool to prevent deadlocks when multiple
     # concurrent pipelines use asyncio.to_thread for sync LLM calls
@@ -537,6 +1031,15 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        # Crash-path flush: shutdown_on_exit=False removed the SDK atexit
+        # hook (it unbounded process exit against a dead collector), so an
+        # exception escaping _run would otherwise drop the last ~1s of
+        # buffered spans — the very spans describing the crash. Same 5s
+        # daemon-thread bound as the graceful path.
+        try:
+            loop.run_until_complete(_shutdown_tracing_bounded())
+        except Exception:
+            logger.warning("Crash-path tracing flush failed", exc_info=True)
         loop.close()
 
 

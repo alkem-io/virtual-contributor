@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import pytest
 
+from core.domain.retrieval_filters import FACTUAL_WHERE
 from core.events.response import Response
+from core.domain.prompts_shared import (
+    render_document_block,
+    rendered_document_budget_size,
+)
 from core.ports.knowledge_store import QueryResult
 from plugins.expert.plugin import ExpertPlugin
 from tests.conftest import MockLLMPort, MockKnowledgeStorePort, make_input
@@ -29,9 +34,10 @@ class TestExpertPlugin:
         await plugin.handle(event)
         # Should have queried the knowledge store
         assert len(plugin._knowledge_store.query_calls) == 1
-        collection, _, n_results = plugin._knowledge_store.query_calls[0]
+        collection, _, n_results, where = plugin._knowledge_store.query_calls[0]
         assert collection == "bok-123-knowledge"
         assert n_results == 5
+        assert where == FACTUAL_WHERE
 
     async def test_response_has_sources(self, plugin):
         event = make_input(bodyOfKnowledgeID="bok-123")
@@ -47,7 +53,7 @@ class TestExpertPlugin:
     async def test_default_collection_when_no_bok(self, plugin):
         event = make_input()
         await plugin.handle(event)
-        collection, _, _ = plugin._knowledge_store.query_calls[0]
+        collection, _, _, _ = plugin._knowledge_store.query_calls[0]
         assert collection == "default-knowledge"
 
     async def test_extract_sources_with_no_sources_in_state(self, plugin):
@@ -86,18 +92,18 @@ class TestExpertPlugin:
         assert sources[0].score is None
 
     async def test_source_prefix_formatting(self, plugin):
-        """Knowledge string should have [source:N] prefixes."""
+        """Knowledge string should have 1-based labelled document blocks."""
         event = make_input(bodyOfKnowledgeID="bok-123")
         await plugin.handle(event)
         llm_prompt = plugin._llm.calls[-1][0]["content"]
-        assert "[source:0]" in llm_prompt
-        assert "[source:1]" in llm_prompt
+        assert "[Document 1 · test · origin: test]" in llm_prompt
+        assert "[Document 2 · test · origin: test]" in llm_prompt
 
     async def test_low_score_chunks_filtered_out(self):
         """Chunks below the score threshold should be excluded."""
         class LowScoreKS(MockKnowledgeStorePort):
-            async def query(self, collection, query_texts, n_results=10):
-                self.query_calls.append((collection, query_texts, n_results))
+            async def query(self, collection, query_texts, n_results=10, where=None):
+                self.query_calls.append((collection, query_texts, n_results, where))
                 return QueryResult(
                     documents=[["relevant doc", "irrelevant doc"]],
                     metadatas=[[{"source": "a"}, {"source": "b"}]],
@@ -114,6 +120,128 @@ class TestExpertPlugin:
         # Only the high-score source should survive
         assert len(result.sources) == 1
         assert result.sources[0].source == "a"
+
+    async def test_factual_filter_spends_retrieval_budget_on_chunks(self):
+        store = MockKnowledgeStorePort()
+        await store.ingest(
+            "bok-123-knowledge",
+            ["chunk one", "summary", "legacy chunk", "chunk two"],
+            [
+                {"embeddingType": "chunk", "type": "knowledge", "source": "one"},
+                {"embeddingType": "summary", "type": "knowledge", "source": "summary"},
+                {"type": "knowledge", "source": "legacy"},
+                {"embeddingType": "chunk", "type": "knowledge", "source": "two"},
+            ],
+            ["chunk-1", "summary-1", "legacy-1", "chunk-2"],
+        )
+        plugin = ExpertPlugin(
+            llm=MockLLMPort(response="Expert answer"), knowledge_store=store, n_results=3
+        )
+
+        await plugin.handle(make_input(bodyOfKnowledgeID="bok-123"))
+
+        assert store.query_calls[0][3] == FACTUAL_WHERE
+        prompt = plugin._llm.calls[-1][0]["content"]
+        assert "summary" not in prompt
+        assert all(doc in prompt for doc in ["chunk one", "legacy chunk", "chunk two"])
+
+    async def test_legacy_and_overview_entries_partition_for_expert_retrieval(self):
+        store = MockKnowledgeStorePort()
+        await store.ingest(
+            "bok-123-knowledge",
+            [
+                "E1 chunk",
+                "E2 summary",
+                "E3 overview",
+                "E4 chunk",
+                "E5 summary",
+                "E6 overview",
+                "E7 overview",
+                "E8 legacy",
+                "E9 old overview",
+            ],
+            [
+                {"embeddingType": "chunk", "type": "knowledge"},
+                {"embeddingType": "summary", "type": "knowledge"},
+                {"embeddingType": "summary", "type": "bodyOfKnowledgeSummary"},
+                {"embeddingType": "chunk", "type": "knowledge"},
+                {"embeddingType": "summary", "type": "knowledge"},
+                {"type": "bodyOfKnowledgeSummary"},
+                {"embeddingType": "summary", "type": "bodyOfKnowledgeSummary"},
+                {"type": "knowledge"},
+                {"type": "bodyOfKnowledgeSummary"},
+            ],
+            [f"e{i}" for i in range(1, 10)],
+        )
+        plugin = ExpertPlugin(llm=MockLLMPort(), knowledge_store=store, n_results=5)
+
+        await plugin.handle(make_input(bodyOfKnowledgeID="bok-123"))
+
+        prompt = plugin._llm.calls[-1][0]["content"]
+        assert all(entry in prompt for entry in ["E1 chunk", "E4 chunk", "E8 legacy"])
+        assert all(
+            entry not in prompt
+            for entry in [
+                "E2 summary",
+                "E3 overview",
+                "E5 summary",
+                "E6 overview",
+                "E7 overview",
+                "E9 old overview",
+            ]
+        )
+
+    async def test_only_summaries_yield_empty_context_without_error_for_expert(self):
+        """FR-010: a fully-filtered retrieval degrades gracefully — no exception,
+        the summaries never reach the prompt, and the query provably ran filtered."""
+        store = MockKnowledgeStorePort()
+        await store.ingest(
+            "bok-123-knowledge",
+            ["document summary", "overview"],
+            [
+                {"embeddingType": "summary", "type": "knowledge"},
+                {"embeddingType": "summary", "type": "bodyOfKnowledgeSummary"},
+            ],
+            ["summary", "overview"],
+        )
+        plugin = ExpertPlugin(llm=MockLLMPort(), knowledge_store=store)
+
+        result = await plugin.handle(make_input(bodyOfKnowledgeID="bok-123"))
+
+        assert result.result == "Mock LLM response"
+        # The retrieval genuinely executed with the factual filter:
+        assert store.query_calls and store.query_calls[-1][3] == FACTUAL_WHERE
+        # ...and none of the summary content leaked into the LLM prompt:
+        prompt = plugin._llm.calls[-1][0]["content"]
+        assert "document summary" not in prompt
+        assert "overview" not in prompt
+    async def test_context_budget_counts_rendered_document_labels(self):
+        """Rendered labels are charged before deciding which chunks survive."""
+        class NearBudgetStore(MockKnowledgeStorePort):
+            async def query(self, collection, query_texts, n_results=10, where=None):
+                self.query_calls.append((collection, query_texts, n_results))
+                return QueryResult(
+                    documents=[["A" * 20, "B" * 20]],
+                    metadatas=[[{"source": "a"}, {"source": "b"}]],
+                    distances=[[0.1, 0.2]],
+                    ids=[["a", "b"]],
+                )
+
+        first_content = "A" * 20
+        first_block = render_document_block(1, first_content, {"source": "a"})
+        context_budget = rendered_document_budget_size(first_block, first_content)
+        plugin = ExpertPlugin(
+            llm=MockLLMPort(),
+            knowledge_store=NearBudgetStore(),
+            max_context_chars=context_budget,
+        )
+
+        response = await plugin.handle(make_input(bodyOfKnowledgeID="bok-123"))
+        prompt = plugin._llm.calls[-1][0]["content"]
+
+        assert "A" * 20 in prompt
+        assert "B" * 20 not in prompt
+        assert [source.source for source in response.sources] == ["a"]
 
     async def test_startup_shutdown(self, plugin):
         await plugin.startup()
@@ -184,3 +312,70 @@ class TestExpertPlugin:
 
         # Verify the final response used the graph answer
         assert result.result == "Graph answer"
+
+    async def test_graph_retrieval_uses_the_factual_filter(self):
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        retrieve_node = None
+
+        async def fake_invoke(_initial_state):
+            assert retrieve_node is not None
+            await retrieve_node({"current_question": "A question"})
+            return {"final_answer": "Graph answer"}
+
+        mock_graph = MagicMock()
+        def capture_retrieve(*_args, **kwargs):
+            nonlocal retrieve_node
+            retrieve_node = kwargs["special_nodes"]["retrieve"]
+            return mock_graph
+
+        mock_graph.compile = MagicMock(side_effect=capture_retrieve)
+        mock_graph.invoke = AsyncMock(side_effect=fake_invoke)
+
+        with patch("core.domain.prompt_graph.PromptGraph") as prompt_graph:
+            prompt_graph.from_definition.return_value = mock_graph
+            store = MockKnowledgeStorePort()
+            plugin = ExpertPlugin(llm=MockLLMPort(), knowledge_store=store)
+            event = make_input(
+                promptGraph={
+                    "nodes": [{"name": "n1"}],
+                    "edges": [{"from": "START", "to": "END"}],
+                }
+            )
+            await plugin.handle(event)
+
+        assert store.query_calls[0][3] == FACTUAL_WHERE
+
+class TestContextBudgetSizing:
+    """Pin the retrieval benefit of the tuned space chunk size."""
+
+    @staticmethod
+    def _query_result(documents: list[str]) -> QueryResult:
+        return QueryResult(
+            documents=[documents],
+            metadatas=[[{"source": f"source-{index}"} for index in range(len(documents))]],
+            distances=[[0.1] * len(documents)],
+            ids=[[f"id-{index}" for index in range(len(documents))]],
+        )
+
+    def test_default_budget_keeps_five_new_sized_passages_but_not_old_sized_ones(self):
+        plugin = ExpertPlugin(
+            llm=MockLLMPort(response="Expert answer"),
+            knowledge_store=MockKnowledgeStorePort(),
+        )
+        new_sized_docs = ["n" * 2500 for _ in range(5)]
+        old_sized_docs = ["o" * 9000 for _ in range(5)]
+
+        kept_new, _ = plugin._enforce_context_budget(
+            new_sized_docs,
+            self._query_result(new_sized_docs),
+        )
+        kept_old, _ = plugin._enforce_context_budget(
+            old_sized_docs,
+            self._query_result(old_sized_docs),
+        )
+
+        assert plugin._n_results == 5
+        assert plugin._max_context_chars == 20000
+        assert len(kept_new) == 5
+        assert len(kept_old) == 2

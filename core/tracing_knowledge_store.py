@@ -1,0 +1,117 @@
+"""Knowledge-store decorator which adds non-invasive retrieval spans."""
+
+from __future__ import annotations
+
+from typing import Any
+
+from opentelemetry import trace
+from opentelemetry.trace import SpanKind
+
+from core.ports.knowledge_store import GetResult, KnowledgeStorePort, QueryResult
+from core.tracing import FailureMode, get_tracer, record_failure
+
+
+class TracedKnowledgeStore:
+    """Runtime OTel decorator for a KnowledgeStorePort.
+
+    This is distinct from ``evaluation.tracing.TracingKnowledgeStore``, which
+    remains the evaluation harness's capture-only wrapper.
+    """
+
+    def __init__(self, delegate: KnowledgeStorePort) -> None:
+        self._delegate = delegate
+
+    @staticmethod
+    def _query_attributes(span: Any, collection: str, n_results: int, result: QueryResult) -> None:
+        returned = len(result.documents[0]) if result.documents else 0
+        span.set_attribute("vc.retrieval.collection", collection)
+        span.set_attribute("vc.retrieval.n_requested", n_results)
+        span.set_attribute("vc.retrieval.n_returned", returned)
+        distances = result.distances[0] if result.distances else []
+        # #114: a literally-matched passage has distance None — it has no
+        # semantic score, and 1.0 - None would raise TypeError here, failing
+        # the retrieval it was meant to observe. Score stats cover only the
+        # semantically-matched subset.
+        scored = [d for d in distances if d is not None]
+        if scored:
+            scores = [1.0 - distance for distance in scored]
+            span.set_attribute("vc.retrieval.score_max", max(scores))
+            span.set_attribute("vc.retrieval.score_min", min(scores))
+            span.set_attribute("vc.retrieval.score_mean", sum(scores) / len(scores))
+
+    async def query(
+        self,
+        collection: str,
+        query_texts: list[str],
+        n_results: int = 10,
+        where: dict | None = None,
+    ) -> QueryResult:
+        # `where` MUST be forwarded. This wrapper is transparent by contract:
+        # dropping the metadata filter here would silently disable #107's
+        # scoped retrieval for every caller that goes through tracing, with no
+        # error — the query would just quietly return unfiltered results.
+        current = trace.get_current_span()
+        if getattr(current, "name", None) == "vc.retrieval":
+            result = await self._delegate.query(collection, query_texts, n_results, where)
+            self._query_attributes(current, collection, n_results, result)
+            return result
+        # record_exception/set_status_on_exception disabled: record_failure()
+        # is the single content-gated writer of error context (SEC-4).
+        with get_tracer().start_as_current_span(
+            "vc.retrieval",
+            kind=SpanKind.CLIENT,
+            record_exception=False,
+            set_status_on_exception=False,
+        ) as span:
+            try:
+                result = await self._delegate.query(collection, query_texts, n_results, where)
+                self._query_attributes(span, collection, n_results, result)
+                return result
+            except Exception as exc:
+                record_failure(span, exc, FailureMode.unknown)
+                raise
+
+    async def ingest(self, collection: str, documents: list[str], metadatas: list[dict], ids: list[str], embeddings: list[list[float]] | None = None) -> None:
+        await self._operation("ingest", collection, len(documents), self._delegate.ingest(collection, documents, metadatas, ids, embeddings))
+
+    async def delete_collection(self, collection: str) -> None:
+        await self._operation("delete_collection", collection, None, self._delegate.delete_collection(collection))
+
+    async def query_lexical(
+        self,
+        collection: str,
+        terms: list[str],
+        n_results: int = 10,
+        where: dict | None = None,
+    ) -> QueryResult:
+        # Without this passthrough the wrapper no longer satisfies
+        # KnowledgeStorePort (which gained query_lexical in #114), and worse:
+        # hybrid_retrieval detects the lexical arm by getattr, so a traced
+        # store would silently lose lexical retrieval and log a capability
+        # warning on every request.
+        return await self._operation(
+            "query_lexical", collection, n_results,
+            self._delegate.query_lexical(collection, terms, n_results, where),
+        )
+
+    async def get(self, collection: str, ids: list[str] | None = None, where: dict | None = None, include: list[str] | None = None) -> GetResult:
+        return await self._operation("get", collection, len(ids) if ids else None, self._delegate.get(collection, ids, where, include))
+
+    async def delete(self, collection: str, ids: list[str] | None = None, where: dict | None = None) -> None:
+        await self._operation("delete", collection, len(ids) if ids else None, self._delegate.delete(collection, ids, where))
+
+    async def _operation(self, operation: str, collection: str, count: int | None, awaitable: Any) -> Any:
+        with get_tracer().start_as_current_span(
+            f"vc.store.{operation}",
+            kind=SpanKind.CLIENT,
+            record_exception=False,
+            set_status_on_exception=False,
+        ) as span:
+            span.set_attribute("vc.retrieval.collection", collection)
+            if count is not None:
+                span.set_attribute("vc.store.n_items", count)
+            try:
+                return await awaitable
+            except Exception as exc:
+                record_failure(span, exc, FailureMode.unknown)
+                raise

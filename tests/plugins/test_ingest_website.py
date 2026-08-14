@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
+from core.domain.ingest_pipeline import Chunk
 from core.events.ingest_website import IngestWebsiteResult
 from plugins.ingest_website.crawler import CrawlError, _is_same_domain, _normalize_url, _should_skip_url, crawl
 from plugins.ingest_website.html_parser import extract_text, extract_title, remove_cross_page_boilerplate
@@ -458,6 +459,39 @@ class TestIngestWebsitePlugin:
         # (websites are URL-identified, not UUID-keyed) — lock in the contract.
         assert result.body_of_knowledge_id == ""
 
+    async def test_chunking_unchanged_and_summary_length_is_shared(self, plugin):
+        """Website CHUNKING is untouched at 2,000/400 (this feature is
+        space-scoped for chunk sizing), while SUMMARY_LENGTH is a shared
+        setting: story #12's rationale — a summary is embedded as one passage,
+        so an oversized one is maximally diluted — applies to every ingest
+        path, so website summaries follow the new 2,500 default too."""
+        mock_pages = [
+            {
+                "url": "https://example.com",
+                "html": "<p>Content for ingestion test.</p>",
+            },
+        ]
+
+        with (
+            patch("plugins.ingest_website.plugin.crawl", return_value=mock_pages),
+            patch("plugins.ingest_website.plugin.IngestEngine") as mock_engine,
+        ):
+            mock_engine.return_value.run = AsyncMock(
+                return_value=MagicMock(success=True, errors=[]),
+            )
+            await plugin.handle(make_ingest_website())
+
+        batch_steps = mock_engine.call_args.kwargs["batch_steps"]
+        chunk_step = batch_steps[0]
+        assert chunk_step._chunk_size == 2000
+        assert chunk_step._chunk_overlap == 400
+        # Shared summary sizing: deliberate, and enforced rather than incidental.
+        summary_steps = [
+            step for step in batch_steps if hasattr(step, "_summary_length")
+        ]
+        assert summary_steps, "expected a summary step in the website pipeline"
+        assert all(step._summary_length == 2500 for step in summary_steps)
+
     async def test_empty_crawl_runs_cleanup(self):
         """When crawl returns [], cleanup deletes pre-existing chunks."""
         store = MockKnowledgeStorePort()
@@ -642,3 +676,165 @@ class TestIngestWebsiteSummarizationBehavior:
         finalize_names = [type(s).__name__ for s in call_kwargs.kwargs["finalize_steps"]]
         assert "DocumentSummaryStep" not in batch_names
         assert "BodyOfKnowledgeSummaryStep" not in finalize_names
+
+
+class TestWebsiteHasNoTreePosition:
+    """Website ingestion shares the storage path but has no space tree.
+
+    It must complete unchanged: no fabricated position, no errors, and — the
+    failure mode that matters — no None values reaching a store that rejects
+    them and fails the whole batch.
+    """
+
+    async def test_website_entries_carry_no_position_fields_at_all(self):
+        store = MockKnowledgeStorePort()
+        plugin = IngestWebsitePlugin(
+            llm=MockLLMPort(),
+            embeddings=MockEmbeddingsPort(),
+            knowledge_store=store,
+        )
+        event = make_ingest_website()
+        mock_pages = [
+            {"url": "https://example.com",
+             "html": "<p>Some substantial page content for ingestion.</p>"},
+        ]
+
+        with patch("plugins.ingest_website.plugin.crawl", return_value=mock_pages):
+            result = await plugin.handle(event)
+
+        assert isinstance(result, IngestWebsiteResult)
+        entries = store.collections["example.com-knowledge"]
+        assert entries, "website ingestion stored nothing"
+        for entry in entries:
+            meta = entry["metadata"]
+            assert "spaceId" not in meta
+            assert "spaceName" not in meta
+            assert "subspaceId" not in meta
+            assert "subspaceName" not in meta
+            assert "calloutId" not in meta
+            # Position is all-or-nothing: no depth either. Writing a depth the
+            # fingerprint ignores would mean an unchanged page keeps its old
+            # id, the write is skipped, and the depth is silently discarded.
+            assert "depth" not in meta
+
+    async def test_website_metadata_has_no_none_values(self):
+        store = MockKnowledgeStorePort()
+        plugin = IngestWebsitePlugin(
+            llm=MockLLMPort(),
+            embeddings=MockEmbeddingsPort(),
+            knowledge_store=store,
+        )
+        event = make_ingest_website()
+        mock_pages = [
+            {"url": "https://example.com",
+             "html": "<p>Some substantial page content for ingestion.</p>"},
+        ]
+
+        with patch("plugins.ingest_website.plugin.crawl", return_value=mock_pages):
+            await plugin.handle(event)
+
+        for entry in store.collections["example.com-knowledge"]:
+            for key, value in entry["metadata"].items():
+                assert value is not None, key
+                assert isinstance(value, (str, int)), key
+class TestWebsitePagesAreNotMistakenForSummaries:
+    """Website document ids are page URLs, not synthetic ids.
+
+    A page whose slug ends in "-summary" must still be swept when it is
+    removed upstream — otherwise it keeps answering queries for a page that no
+    longer exists, which is the failure this whole area is about.
+    """
+
+    async def test_a_summary_slugged_page_is_still_swept_when_deleted(self):
+        from core.domain.ingest_pipeline import DocumentMetadata
+        from core.domain.pipeline.engine import PipelineContext
+        from core.domain.pipeline.steps import (
+            ChangeDetectionStep,
+            OrphanCleanupStep,
+        )
+
+        store = MockKnowledgeStorePort()
+        gone = "https://example.com/2024-annual-summary"
+        kept = "https://example.com/home"
+        await store.ingest(
+            collection="c",
+            documents=["old page", "home page"],
+            metadatas=[
+                {"documentId": gone, "embeddingType": "chunk"},
+                {"documentId": kept, "embeddingType": "chunk"},
+            ],
+            ids=["a", "b"],
+            embeddings=[[0.1], [0.2]],
+        )
+
+        # Next crawl: only the home page still exists.
+        chunk = Chunk(
+            content="home page",
+            metadata=DocumentMetadata(
+                document_id=kept, source=kept, type="knowledge",
+                title="Home", embedding_type="chunk",
+            ),
+            chunk_index=0,
+            content_hash="b",
+        )
+        ctx = PipelineContext(
+            collection_name="c", documents=[], chunks=[chunk],
+            all_document_ids={kept},
+        )
+        await ChangeDetectionStep(store).execute(ctx)
+        await OrphanCleanupStep(store).execute(ctx)
+
+        assert gone in ctx.removed_document_ids
+        remaining = {
+            e["metadata"]["documentId"] for e in store.collections["c"]
+        }
+        assert gone not in remaining
+        assert kept in remaining
+class TestSizingConfigReachesWebsiteIngestion:
+    """`main.py` injects by signature, so a parameter this plugin does not
+    declare is silently never passed.
+
+    `ingest_space` declared `chunk_size`, `chunk_overlap` and `summary_length`;
+    `ingest_website` did not — so its chunking and *both* summary steps used
+    constructor defaults no matter what an operator configured. The existing
+    test only checked the shared default, which is identical either way.
+    """
+
+    @pytest.mark.parametrize(
+        "parameter", ["chunk_size", "chunk_overlap", "summary_length"]
+    )
+    def test_the_plugin_declares_the_sizing_parameter(self, parameter: str) -> None:
+        import inspect
+
+        from plugins.ingest_website.plugin import IngestWebsitePlugin
+
+        assert parameter in inspect.signature(IngestWebsitePlugin.__init__).parameters
+
+    def test_both_ingest_plugins_accept_the_same_sizing_knobs(self) -> None:
+        """A knob honoured by one ingest path and ignored by the other is worse
+        than one honoured by neither — it looks configured and is not."""
+        import inspect
+
+        from plugins.ingest_space.plugin import IngestSpacePlugin
+        from plugins.ingest_website.plugin import IngestWebsitePlugin
+
+        knobs = {"chunk_size", "chunk_overlap", "summary_length"}
+        website = set(inspect.signature(IngestWebsitePlugin.__init__).parameters)
+        space = set(inspect.signature(IngestSpacePlugin.__init__).parameters)
+        assert knobs <= website
+        assert knobs <= space
+
+    def test_a_non_default_summary_length_is_stored(self) -> None:
+        from plugins.ingest_website.plugin import IngestWebsitePlugin
+
+        plugin = IngestWebsitePlugin(
+            llm=MockLLMPort(response="s"),
+            embeddings=MockEmbeddingsPort(),
+            knowledge_store=MockKnowledgeStorePort(),
+            summary_length=9_999,
+            chunk_size=1_234,
+            chunk_overlap=56,
+        )
+        assert plugin._summary_length == 9_999
+        assert plugin._chunk_size == 1_234
+        assert plugin._chunk_overlap == 56

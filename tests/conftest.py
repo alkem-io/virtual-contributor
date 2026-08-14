@@ -26,9 +26,11 @@ class MockLLMPort:
     def __init__(self, response: str = "Mock LLM response") -> None:
         self.response = response
         self.calls: list[list[dict]] = []
+        self.call_kwargs: list[dict] = []
 
-    async def invoke(self, messages: list[dict]) -> str:
+    async def invoke(self, messages: list[dict], **kwargs) -> str:
         self.calls.append(messages)
+        self.call_kwargs.append(kwargs)
         return self.response
 
     async def stream(self, messages: list[dict]) -> AsyncIterator[str]:
@@ -60,6 +62,7 @@ class MockKnowledgeStorePort:
     def __init__(self) -> None:
         self.collections: dict[str, list[dict]] = {}
         self.query_calls: list[tuple] = []
+        self.lexical_calls: list[tuple] = []
         self.deleted: list[str] = []
 
     async def query(
@@ -67,13 +70,90 @@ class MockKnowledgeStorePort:
         collection: str,
         query_texts: list[str],
         n_results: int = 10,
+        where: dict | None = None,
     ) -> QueryResult:
-        self.query_calls.append((collection, query_texts, n_results))
+        self.query_calls.append((collection, query_texts, n_results, where))
+        items = self.collections.get(collection, [])
+        if items:
+            matched = [
+                item
+                for item in items
+                if where is None or self._matches_where(item["metadata"], where)
+            ][:n_results]
+            return QueryResult(
+                documents=[[item["document"] for item in matched]],
+                metadatas=[[item["metadata"] for item in matched]],
+                distances=[[0.1 + 0.1 * i for i in range(len(matched))]],
+                ids=[[item["id"] for item in matched]],
+            )
+        # Canned fallback for unseeded collections. The canned docs carry
+        # G1-legacy-shaped metadata (no embeddingType/type keys), and the
+        # filter IS evaluated against them — a query whose filter excludes
+        # them returns Chroma's real empty-inner-list shape instead of
+        # silently skipping filter evaluation.
+        canned_metadata = {"source": "test"}
+        if where is not None and not self._matches_where(canned_metadata, where):
+            return QueryResult(documents=[[]], metadatas=[[]], distances=[[]], ids=[[]])
         return QueryResult(
             documents=[["doc1", "doc2"]],
-            metadatas=[[{"source": "test"}, {"source": "test"}]],
+            metadatas=[[canned_metadata, dict(canned_metadata)]],
             distances=[[0.1, 0.2]],
             ids=[["id1", "id2"]],
+        )
+
+    @staticmethod
+    def _matches_where(metadata: dict, where: dict) -> bool:
+        """Evaluate the Chroma filter subset used by retrieval filter tests.
+
+        Chroma >=0.5.12 treats a missing metadata key as matching ``$ne``.
+        """
+        if "$and" in where:
+            return all(MockKnowledgeStorePort._matches_where(metadata, clause) for clause in where["$and"])
+        if "$or" in where:
+            return any(MockKnowledgeStorePort._matches_where(metadata, clause) for clause in where["$or"])
+
+        if len(where) != 1:
+            raise ValueError("Mock query filters must contain one metadata field")
+        key, condition = next(iter(where.items()))
+        if not isinstance(condition, dict) or len(condition) != 1:
+            raise ValueError("Mock query filter condition must contain one operator")
+        operator, expected = next(iter(condition.items()))
+        actual = metadata.get(key)
+        if operator == "$eq":
+            return key in metadata and actual == expected
+        if operator == "$ne":
+            return key not in metadata or actual != expected
+        raise ValueError(f"Unsupported mock query filter operator: {operator}")
+    async def query_lexical(
+        self,
+        collection: str,
+        terms: list[str],
+        n_results: int = 10,
+        where: dict | None = None,
+    ) -> QueryResult:
+        """In-memory stand-in: case-insensitive substring match, no scoring.
+
+        Mirrors the real adapter's shape — a match is a yes/no, so every
+        distance is None.
+        """
+        self.lexical_calls.append((collection, terms, n_results, where))
+        if not terms:
+            return QueryResult(
+                documents=[[]], metadatas=[[]], distances=[[]], ids=[[]],
+            )
+
+        lowered = [t.casefold() for t in terms]
+        matched = [
+            entry for entry in self.collections.get(collection, [])
+            if any(t in entry.get("document", "").casefold() for t in lowered)
+            and (where is None or self._matches_where(entry.get("metadata", {}), where))
+        ][:n_results]
+
+        return QueryResult(
+            documents=[[e.get("document", "") for e in matched]],
+            metadatas=[[e.get("metadata", {}) for e in matched]],
+            distances=[[None] * len(matched)],
+            ids=[[e["id"] for e in matched]],
         )
 
     async def ingest(
@@ -263,3 +343,37 @@ def make_ingest_body_of_knowledge(**overrides) -> IngestBodyOfKnowledge:
     }
     defaults.update(overrides)
     return IngestBodyOfKnowledge.model_validate(defaults)
+
+
+@pytest.fixture
+def traced_exporter():
+    """An isolated in-memory exporter for tracing contract tests."""
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    from core.config import BaseConfig
+    from core.tracing import configure_tracing, reset_tracing_for_tests
+
+    exporter = InMemorySpanExporter()
+    config = BaseConfig(
+        llm_base_url="http://local-model",
+        tracing_enabled=True,
+        tracing_otlp_endpoint="http://collector.internal/v1/traces",
+    )
+    configure_tracing(config, span_exporter=exporter)
+    try:
+        yield exporter
+    finally:
+        reset_tracing_for_tests()
+
+
+@pytest.fixture
+def traced_config():
+    """A real tracing config for root-span tests."""
+    from core.config import BaseConfig
+
+    return BaseConfig(
+        llm_base_url="http://local-model",
+        tracing_enabled=True,
+        tracing_otlp_endpoint="http://collector.internal/v1/traces",
+        tracing_content_max_chars=100,
+    )
