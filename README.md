@@ -294,9 +294,31 @@ A separate LLM can be configured for ingest pipeline summarization. All three fi
 |----------|---------|-------------|
 | `EXPERT_N_RESULTS` | `5` | Number of chunks to retrieve (expert plugin) |
 | `EXPERT_MIN_SCORE` | `0.3` | Minimum relevance score (expert plugin) |
+| `EXPERT_HIERARCHICAL_RETRIEVAL_ENABLED` | `false` | Opt-in expert overview/summary route then branch-scoped detail retrieval |
+| `EXPERT_HIERARCHY_MAX_BRANCHES` | `3` | Maximum relevant nearest branches selected (must be 2 or 3) |
 | `GUIDANCE_N_RESULTS` | `5` | Number of chunks per collection (guidance plugin) |
 | `GUIDANCE_MIN_SCORE` | `0.3` | Minimum relevance score (guidance plugin) |
 | `MAX_CONTEXT_CHARS` | `20000` | Context budget — lowest-scoring chunks dropped first |
+
+### Hierarchical expert retrieval
+
+This expert-only enhancement is **off by default**. When enabled, it densely
+routes a question over `overview` and `summary` entries, selects up to three
+relevant typed branches, and runs the existing hybrid/re-rank/threshold/top-K
+pipeline against detail in those branches. Context keeps its numbered document
+blocks and adds safe Space/Subspace provenance.
+
+`subspaceId` is the nearest stored subspace, not a full ancestor chain. The
+feature therefore does not infer subtree membership. A short non-empty scoped
+result remains scoped; a missing route, missing hierarchy keys, empty scoped
+result, or hierarchy-stage failure uses the unchanged flat path. Roll back by
+setting `EXPERT_HIERARCHICAL_RETRIEVAL_ENABLED=false`.
+
+Enable only after the image is deployed with the flag off, selected spaces are
+re-ingested with overview/summary and hierarchy metadata, and a human has run
+paired flat/on RAGAS evaluation on the same reviewed query set. The repository
+tests include only a deterministic structural precision proxy, not live RAGAS
+precision evidence. `SUMMARIZE_ENABLED` remains unchanged.
 
 ### Re-ranking
 

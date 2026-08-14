@@ -210,6 +210,11 @@ class BaseConfig(BaseSettings):
             raise ValueError(
                 f"EXPERT_MIN_SCORE must be between 0.0 and 1.0, got {self.expert_min_score}"
             )
+        if not 2 <= self.expert_hierarchy_max_branches <= 3:
+            raise ValueError(
+                "EXPERT_HIERARCHY_MAX_BRANCHES must be between 2 and 3, "
+                f"got {self.expert_hierarchy_max_branches}"
+            )
         if not (0.0 <= self.guidance_min_score <= 1.0):
             raise ValueError(
                 f"GUIDANCE_MIN_SCORE must be between 0.0 and 1.0, got {self.guidance_min_score}"
@@ -506,6 +511,10 @@ class BaseConfig(BaseSettings):
     # Retrieval — per-plugin parameters
     expert_n_results: int = 5
     expert_min_score: float = 0.3
+    # Hierarchy routing is opt-in because existing collections may not yet
+    # carry overview entries or the stored nearest-subspace keys.
+    expert_hierarchical_retrieval_enabled: bool = False
+    expert_hierarchy_max_branches: int = 3
     guidance_n_results: int = 5
     guidance_min_score: float = 0.3
 

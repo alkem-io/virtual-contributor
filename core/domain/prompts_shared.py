@@ -21,6 +21,10 @@ _METADATA_VALUE_LIMITS = {
     "type": 200,
     "uri": 300,
     "source": 300,
+    "spaceName": 200,
+    "subspaceName": 200,
+    "spaceId": 200,
+    "subspaceId": 200,
 }
 
 GROUNDING_INSTRUCTIONS = """Grounding requirements:
@@ -71,7 +75,8 @@ def _metadata_text(metadata: Mapping[str, object], key: str) -> str:
 
 
 def render_document_block(
-    number: int, content: str, metadata: Mapping[str, object] | None = None
+    number: int, content: str, metadata: Mapping[str, object] | None = None,
+    *, hierarchy: bool = False,
 ) -> str:
     """Render one retrieved passage as a labelled, verbatim document block.
 
@@ -90,7 +95,15 @@ def render_document_block(
     origin = uri or source
     identity = title or uri or source or "Untitled"
 
-    label_parts = [f"Document {number}", identity]
+    label_parts = [f"Document {number}"]
+    if hierarchy:
+        space = _metadata_text(metadata, "spaceName") or _metadata_text(metadata, "spaceId")
+        subspace = _metadata_text(metadata, "subspaceName") or _metadata_text(metadata, "subspaceId")
+        if space:
+            label_parts.append(f"Space: {space}")
+        if subspace:
+            label_parts.append(f"Subspace: {subspace}")
+    label_parts.append(identity)
     if kind:
         label_parts.append(kind)
     if origin:

@@ -25,3 +25,23 @@ async def test_query_forwards_where_and_captures_filtered_context() -> None:
     assert result is filtered_result
     delegate.query.assert_awaited_once_with("knowledge", ["question"], 5, where=where)
     assert tracing_store.get_retrieved_contexts() == ["eligible chunk"]
+
+
+async def test_final_detail_context_excludes_hierarchy_routing_context() -> None:
+    delegate = MagicMock()
+    delegate.query = AsyncMock(side_effect=[
+        QueryResult([["overview"]], [[{}]], [[0.1]], [["route"]]),
+        QueryResult([["detail"]], [[{}]], [[0.1]], [["detail"]]),
+    ])
+    tracing_store = TracingKnowledgeStore(delegate)
+    await tracing_store.query("knowledge", ["question"], where={"embeddingType": {"$eq": "overview"}})
+    await tracing_store.query("knowledge", ["question"], where={"spaceId": "s"})
+    assert tracing_store.get_final_detail_contexts() == ["detail"]
+
+
+async def test_final_detail_context_is_flat_result_when_only_one_query() -> None:
+    delegate = MagicMock()
+    delegate.query = AsyncMock(return_value=QueryResult([["detail"]], [[{}]], [[0.1]], [["detail"]]))
+    tracing_store = TracingKnowledgeStore(delegate)
+    await tracing_store.query("knowledge", ["question"])
+    assert tracing_store.get_final_detail_contexts() == ["detail"]

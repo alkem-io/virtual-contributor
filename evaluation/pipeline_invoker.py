@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import inspect
 
 from core.config import BaseConfig
 from core.container import Container
@@ -62,6 +63,15 @@ class PipelineInvoker:
         registry = PluginRegistry()
         plugin_class = registry.discover(self._plugin_type)
         deps = container.resolve_for_plugin(plugin_class)
+        signature = inspect.signature(plugin_class.__init__)
+        # Container resolution supplies ports.  Evaluation constructs plugins
+        # in-process, so pass opt-in expert settings here as production does.
+        if "hierarchical_retrieval_enabled" in signature.parameters:
+            deps["hierarchical_retrieval_enabled"] = (
+                self._config.expert_hierarchical_retrieval_enabled
+            )
+        if "hierarchy_max_branches" in signature.parameters:
+            deps["hierarchy_max_branches"] = self._config.expert_hierarchy_max_branches
         self._plugin = plugin_class(**deps)
 
         await self._plugin.startup()
@@ -100,7 +110,7 @@ class PipelineInvoker:
 
         response = await self._plugin.handle(event)
 
-        retrieved_contexts = self._tracing_store.get_retrieved_contexts()
+        retrieved_contexts = self._tracing_store.get_final_detail_contexts()
 
         sources = []
         for src in response.sources:

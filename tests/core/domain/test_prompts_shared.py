@@ -113,6 +113,42 @@ def test_context_budget_charges_rendered_label_utf8_bytes() -> None:
     )
 
 
+def test_hierarchy_renders_space_then_nearest_subspace() -> None:
+    block = render_document_block(
+        1, "passage", {"spaceName": "Root", "subspaceName": "Near", "title": "Post"}, hierarchy=True,
+    )
+    assert block.startswith("[Document 1 · Space: Root · Subspace: Near · Post]")
+
+
+def test_hierarchy_falls_back_to_stored_identifiers() -> None:
+    block = render_document_block(
+        1, "passage", {"spaceId": "s-1", "subspaceId": "ss-2"}, hierarchy=True,
+    )
+    assert "Space: s-1" in block and "Subspace: ss-2" in block
+
+
+def test_hierarchy_metadata_is_sanitized_and_bounded() -> None:
+    block = render_document_block(
+        1, "passage", {"spaceName": "[evil]\n" + "x" * 300}, hierarchy=True,
+    )
+    assert "[evil]" not in block and block.count("\n") == 1
+    label = block.split("\n", 1)[0]
+    assert len(label) < 260 and "x" * 201 not in block
+
+
+def test_hierarchy_keeps_document_number_and_verbatim_content() -> None:
+    content = "exact\n body"
+    block = render_document_block(2, content, {"spaceName": "A"}, hierarchy=True)
+    assert block.startswith("[Document 2") and block.endswith(content)
+
+
+def test_hierarchy_changes_budget_by_its_rendered_utf8_label() -> None:
+    content = "x"
+    flat = render_document_block(1, content, {"title": "café"})
+    hierarchy = render_document_block(1, content, {"title": "café", "spaceName": "é"}, hierarchy=True)
+    assert rendered_document_budget_size(hierarchy, content) > rendered_document_budget_size(flat, content)
+
+
 def test_citation_instruction_uses_the_same_document_number_scheme() -> None:
     block = render_document_block(1, "passage", {"title": "One"})
 

@@ -65,6 +65,37 @@ class TestExpertMinScore:
         assert config_high.expert_min_score == 1.0
 
 
+class TestExpertHierarchyConfiguration:
+    def test_hierarchy_defaults_are_safe(self) -> None:
+        config = BaseConfig(llm_api_key="key")
+        assert config.expert_hierarchical_retrieval_enabled is False
+        assert config.expert_hierarchy_max_branches == 3
+
+    @pytest.mark.parametrize("value", [2, 3])
+    def test_hierarchy_accepts_documented_bounds(self, value: int) -> None:
+        assert BaseConfig(llm_api_key="key", expert_hierarchy_max_branches=value).expert_hierarchy_max_branches == value
+
+    @pytest.mark.parametrize("value", [1, 4])
+    def test_hierarchy_rejects_outside_documented_bounds(self, value: int) -> None:
+        with pytest.raises(ValueError, match="EXPERT_HIERARCHY_MAX_BRANCHES"):
+            BaseConfig(llm_api_key="key", expert_hierarchy_max_branches=value)
+
+    def test_hierarchy_constructor_aware_injection(self) -> None:
+        from main import _inject_plugin_config
+
+        class Plugin:
+            def __init__(self, *, hierarchical_retrieval_enabled=False, hierarchy_max_branches=0) -> None:
+                pass
+
+        config = BaseConfig(
+            llm_api_key="key", plugin_type="expert",
+            expert_hierarchical_retrieval_enabled=True, expert_hierarchy_max_branches=2,
+        )
+        deps: dict = {}
+        _inject_plugin_config(deps, Plugin, config, None, None)
+        assert deps == {"hierarchical_retrieval_enabled": True, "hierarchy_max_branches": 2}
+
+
 class TestGuidanceMinScore:
     """Test guidance_min_score validation."""
 

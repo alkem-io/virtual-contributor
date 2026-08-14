@@ -319,6 +319,12 @@ def _inject_plugin_config(
             deps["score_threshold"] = config.retrieval_score_threshold
     if "max_context_chars" in sig.parameters:
         deps["max_context_chars"] = config.max_context_chars
+    if "hierarchical_retrieval_enabled" in sig.parameters:
+        deps["hierarchical_retrieval_enabled"] = (
+            config.expert_hierarchical_retrieval_enabled
+        )
+    if "hierarchy_max_branches" in sig.parameters:
+        deps["hierarchy_max_branches"] = config.expert_hierarchy_max_branches
 
     # Inject summarization configuration for ingest plugins
     if "summarize_llm" in sig.parameters:

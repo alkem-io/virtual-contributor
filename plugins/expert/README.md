@@ -37,6 +37,22 @@ Factual retrieval uses the shared legacy-safe `FACTUAL_WHERE` predicate from
 `core.domain.retrieval_filters`, excluding summaries while retaining unmarked
 legacy content. `SUMMARIES_WHERE` remains available for explicit overview retrieval.
 
+### Optional two-stage hierarchy retrieval
+
+With `EXPERT_HIERARCHICAL_RETRIEVAL_ENABLED=false` (the default), expert makes
+the current single flat retrieval call. When explicitly enabled, Stage 1 makes
+a dense query over `overview`, `summary`, and legacy body-of-knowledge summary
+entries; Stage 2 applies the current hybrid/rerank/threshold/top-K/budget path
+to detail matching one to three selected `spaceId`/nearest `subspaceId` keys.
+The rendered `[Document N]` blocks retain their numbering and add sanitized
+Space/Subspace provenance.
+
+The stored `subspaceId` is only the nearest subspace; it is not an ancestor
+chain, so this feature never claims subtree expansion. No usable route, an
+empty scoped detail result, or a hierarchy-stage error falls back to the exact
+flat pipeline. A short non-empty scoped result is intentionally not backfilled
+from siblings. Disable the flag to roll back immediately.
+
 ## Grounded, citable answers
 
 Every surviving retrieved passage is presented to the model as a separate block:
@@ -91,11 +107,19 @@ cue routing is outside this plugin's scope.
 |----------|---------|-------------|
 | `EXPERT_N_RESULTS` | `5` | Number of chunks to retrieve |
 | `EXPERT_MIN_SCORE` | `0.3` | Minimum relevance score threshold |
+| `EXPERT_HIERARCHICAL_RETRIEVAL_ENABLED` | `false` | Enable the opt-in overview/summary route and scoped detail stage |
+| `EXPERT_HIERARCHY_MAX_BRANCHES` | `3` | Route cap; only `2` or `3` are valid settings |
 | `MAX_CONTEXT_CHARS` | `20000` | Context budget — lowest-scoring chunks dropped first |
 | `ANSWERING_LLM_TEMPERATURE` | unset | Optional per-answer temperature, validated from `0.0` to `2.0` |
 | `ANSWERING_CHAIN_OF_THOUGHT_ENABLED` | `true` | Enables conditional private reasoning for complex simple-RAG questions |
 
 Per-plugin LLM overrides are supported via `EXPERT_LLM_*` prefix.
+
+Before enabling this option in an environment, deploy it false, re-ingest the
+target spaces so their entries carry overview and hierarchy metadata, then run
+the paired flat/on RAGAS evaluation on one reviewed query set. The unit suite's
+deterministic precision proxy is structural evidence only; it is not a live
+context-precision result. `SUMMARIZE_ENABLED` is not changed by this feature.
 
 For factual knowledge-base answering, use `ANSWERING_LLM_TEMPERATURE` in the
 **0.0–0.3** range. Raising it can make wording more varied, but trades away

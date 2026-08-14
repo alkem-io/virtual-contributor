@@ -50,6 +50,18 @@ class TracingKnowledgeStore:
                 contexts.extend(doc_list)
         return contexts
 
+    def get_final_detail_contexts(self) -> list[str]:
+        """Return only the final store result used for answer detail.
+
+        Hierarchy routing makes an orienting query before detail retrieval.
+        RAGAS must score the latter, rather than treating routing overviews as
+        generation context.  Flat retrieval naturally has one captured result.
+        """
+
+        if not self._captured:
+            return []
+        return [doc for docs in self._captured[-1].documents for doc in docs]
+
     def clear(self) -> None:
         """Reset captured state between test cases."""
         self._captured = []
