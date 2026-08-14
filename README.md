@@ -298,6 +298,37 @@ A separate LLM can be configured for ingest pipeline summarization. All three fi
 | `GUIDANCE_MIN_SCORE` | `0.3` | Minimum relevance score (guidance plugin) |
 | `MAX_CONTEXT_CHARS` | `20000` | Context budget — lowest-scoring chunks dropped first |
 
+### Re-ranking
+
+Re-orders retrieved chunks before context assembly, blending vector similarity
+with lexical overlap against the query's own terms. Runs in-process: no network
+call, no extra dependency, ~0.7 ms for a top-20 re-rank.
+
+**Off by default** — it changes what every answer is grounded in, so it is
+opted into rather than inherited. Turning it off restores prior behaviour
+exactly: the same number of results is requested and no re-ranking code runs.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `RERANK_ENABLED` | `false` | Enable the re-ranking stage |
+| `RERANK_CANDIDATE_N` | `20` | Candidates fetched when enabled (must be ≥ `RERANK_TOP_K`) |
+| `RERANK_TOP_K` | `5` | Candidates kept after re-ranking |
+| `RERANK_LEXICAL_WEIGHT` | `0.6` | Lexical share of the blend; `0.0` provably reproduces vector order |
+
+Two rollbacks, coarse and fine: `RERANK_ENABLED=false` removes the stage
+entirely, and `RERANK_LEXICAL_WEIGHT=0.0` leaves it wired but reproduces vector
+ordering exactly.
+
+Keep the weight above `0.5`. Scores are normalised across the candidate pool,
+so the best-vector candidate sits at `1.0` and the worst at `0.0`; at exactly
+`0.5` a chunk that matches the query's wording but has the worst vector
+distance ties with the incumbent and loses — which is the case re-ranking
+exists to fix.
+
+Re-ranking is a *ranking* signal only. Whether a chunk is relevant enough to
+use is still judged on its vector score, because the blended score is relative
+to the pool rather than absolute.
+
 ### Embeddings
 
 | Variable | Default | Description |

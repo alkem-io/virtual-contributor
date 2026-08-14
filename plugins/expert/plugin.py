@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from typing import Any
+import time
 
 from core.domain.prompts_shared import (
     STEP_BY_STEP_ANSWER_INSTRUCTIONS,
@@ -20,8 +21,72 @@ from core.events.response import Response, Source
 from core.domain.retrieval_filters import FACTUAL_WHERE
 from core.ports.llm import LLMPort
 from core.ports.knowledge_store import KnowledgeStorePort, QueryResult
+from core.ports.reranker import RerankerPort
 
 logger = logging.getLogger(__name__)
+
+
+def _apply_rerank(
+    reranker: RerankerPort,
+    query: str,
+    result: QueryResult,
+) -> QueryResult:
+    """Re-order a result set, keeping its four parallel lists in step.
+
+    The re-ranker returns a permutation of indices, and every list a caller
+    holds must be permuted the same way. Getting this wrong would not raise —
+    it would attribute one passage's text to another passage's source URL and
+    cite it confidently, which is worse than an error.
+
+    **Reorders only; never truncates.** Cutting to top-K here would hand the
+    relevance threshold a pre-filtered list, and re-ranking legitimately lifts
+    term-matching passages that are *below* the threshold. Those would then
+    occupy the whole top-K and be discarded by the threshold immediately
+    after, leaving the answer with fewer sources than it had before
+    re-ranking — or none at all, silently ungrounded. Truncation belongs
+    after the threshold, where the caller does it.
+
+    Distances are carried through **unmodified**, only reordered. The blended
+    ranking score is deliberately not written back: it is normalised across the
+    candidate pool, so persisting it would corrupt the relevance threshold
+    downstream, which is judged on the real vector distance.
+    """
+    docs = result.documents[0] if result.documents else []
+    if not docs:
+        return result
+
+    started = time.perf_counter()
+    distances = result.distances[0] if result.distances else []
+    metadatas = result.metadatas[0] if result.metadatas else []
+    ids = result.ids[0] if result.ids else []
+
+    # The port takes similarity (higher is better), not distance. Passing raw
+    # distances would silently invert the ranking. A literally-matched passage
+    # (#114) has distance None — no semantic score exists, and 1.0 - None
+    # would crash the re-rank; it enters neutral at 0.0 and lets the lexical
+    # component of the blend speak for it.
+    vector_scores = [
+        1.0 - d
+        if i < len(distances) and (d := distances[i]) is not None
+        else 0.0
+        for i in range(len(docs))
+    ]
+
+    order = reranker.rerank(query, docs, vector_scores)
+
+    # Logged so an operator can see the stage is running and what it costs
+    # without having to reason about it from answer quality alone.
+    logger.info(
+        "Re-ranked %d candidates in %.1fms",
+        len(docs), (time.perf_counter() - started) * 1000,
+    )
+
+    return QueryResult(
+        documents=[[docs[i] for i in order]],
+        metadatas=[[metadatas[i] if i < len(metadatas) else {} for i in order]],
+        distances=[[distances[i] if i < len(distances) else 1.0 for i in order]],
+        ids=[[ids[i] if i < len(ids) else "" for i in order]],
+    )
 
 
 def _filter_and_format(
@@ -96,6 +161,9 @@ class ExpertPlugin:
         answering_temperature: float | None = None,
         chain_of_thought_enabled: bool = True,
         hybrid_config: Any = None,
+        reranker: RerankerPort | None = None,
+        rerank_candidate_n: int = 20,
+        rerank_top_k: int = 5,
     ) -> None:
         self._llm = llm
         self._knowledge_store = knowledge_store
@@ -107,6 +175,52 @@ class ExpertPlugin:
         # None keeps retrieval exactly as it was: hybrid_retrieval.retrieve
         # reads the flag off this and falls through to the dense path.
         self._hybrid_config = hybrid_config
+        # Absent unless re-ranking is enabled, so an existing deployment keeps
+        # exactly its current retrieval behaviour with no new code path.
+        self._reranker = reranker
+        self._rerank_candidate_n = rerank_candidate_n
+        self._rerank_top_k = rerank_top_k
+
+    @property
+    def _retrieval_n_results(self) -> int:
+        """How many candidates to fetch.
+
+        Re-ranking can only reorder what retrieval returned, so it needs a
+        wider pool to choose from. Without it, the count is unchanged — which
+        is what makes disabling re-ranking a genuine rollback rather than a
+        differently-shaped request.
+        """
+        return self._rerank_candidate_n if self._reranker else self._n_results
+
+    def _maybe_rerank(self, query: str, result: QueryResult) -> QueryResult:
+        """Re-order candidates when re-ranking is on; otherwise pass through."""
+        if self._reranker is None:
+            return result
+        return _apply_rerank(self._reranker, query, result)
+
+    def _truncate_to_top_k(
+        self, docs: list[str], result: QueryResult,
+    ) -> tuple[list[str], QueryResult]:
+        """Keep the best K of what survived the threshold.
+
+        Deliberately after `_filter_and_format`, not before. Re-ranking lifts
+        term-matching passages that may sit below the relevance threshold; if
+        the cut happened first those would fill the whole top-K and then be
+        discarded, leaving fewer sources than before re-ranking — possibly
+        none. Filtering first, then cutting, means K good passages are kept
+        whenever K good passages exist.
+        """
+        if self._reranker is None:
+            return docs, result
+
+        k = self._rerank_top_k
+        return docs[:k], QueryResult(
+            documents=[(result.documents[0] if result.documents else [])[:k]],
+            metadatas=[(result.metadatas[0] if result.metadatas else [])[:k]],
+            distances=[(result.distances[0] if result.distances else [])[:k]],
+            ids=[(result.ids[0] if result.ids else [])[:k]],
+        )
+
 
     async def startup(self) -> None:
         logger.info("ExpertPlugin started")
@@ -202,9 +316,11 @@ class ExpertPlugin:
         graph = PromptGraph.from_definition(event.prompt_graph)
 
         # Create retrieve special node
-        n_results = self._n_results
+        n_results = self._retrieval_n_results
         score_threshold = self._score_threshold
         enforce_budget = self._enforce_context_budget
+        maybe_rerank = self._maybe_rerank
+        truncate_to_top_k = self._truncate_to_top_k
 
         async def retrieve_node(state: dict) -> dict:
             from opentelemetry.trace import SpanKind
@@ -216,14 +332,21 @@ class ExpertPlugin:
                 or event.message
             )
             # #114's hybrid retrieval inside #108's span, carrying #107's
-            # factual filter through to both arms.
+            # factual filter through to both arms; #115 re-ranks the pool and
+            # truncates AFTER threshold filtering (order is load-bearing —
+            # truncating first once turned 5 grounded sources into 0).
             with optional_span("vc.retrieval", kind=SpanKind.CLIENT) as span:
                 result = await hybrid_retrieval.retrieve(
                     self._knowledge_store, collection, query,
                     self._hybrid_config, n_results=n_results,
                     where=FACTUAL_WHERE,
                 )
+                # Re-rank against the question actually asked at this point in
+                # the graph — the rephrased one when there is one, since that
+                # is what was retrieved on.
+                result = maybe_rerank(query, result)
                 docs, filtered_result = _filter_and_format(result, score_threshold)
+                docs, filtered_result = truncate_to_top_k(docs, filtered_result)
                 initial_count = len(docs)
                 docs, filtered_result = enforce_budget(docs, filtered_result)
                 if span is not None:
@@ -291,10 +414,12 @@ class ExpertPlugin:
         with optional_span("vc.retrieval", kind=SpanKind.CLIENT) as span:
             result = await hybrid_retrieval.retrieve(
                 self._knowledge_store, collection, event.message,
-                self._hybrid_config, n_results=self._n_results,
+                self._hybrid_config, n_results=self._retrieval_n_results,
                 where=FACTUAL_WHERE,
             )
+            result = self._maybe_rerank(event.message, result)
             docs, result = _filter_and_format(result, self._score_threshold)
+            docs, result = self._truncate_to_top_k(docs, result)
             initial_count = len(docs)
             docs, result = self._enforce_context_budget(docs, result)
             if span is not None:

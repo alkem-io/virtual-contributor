@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 from typing import Any
+import time
 import re
 
 from core.domain.prompts_shared import (
@@ -23,6 +24,7 @@ from core.events.response import Response, Source
 from core.domain.retrieval_filters import FACTUAL_WHERE
 from core.ports.llm import LLMPort
 from core.ports.knowledge_store import KnowledgeStorePort
+from core.ports.reranker import RerankerPort
 
 logger = logging.getLogger(__name__)
 
@@ -54,12 +56,19 @@ class GuidancePlugin:
         max_context_chars: int = 20000,
         answering_temperature: float | None = None,
         chain_of_thought_enabled: bool = True,
-        hybrid_config: Any = None,
+        hybrid_config: Any = None,        reranker: RerankerPort | None = None,
+        rerank_candidate_n: int = 20,
+        rerank_top_k: int = 5,
     ) -> None:
         self._llm = llm
         self._knowledge_store = knowledge_store
         self._n_results = n_results
         self._score_threshold = score_threshold
+        # Absent unless re-ranking is enabled, so an existing deployment keeps
+        # exactly its current merge behaviour.
+        self._reranker = reranker
+        self._rerank_candidate_n = rerank_candidate_n
+        self._rerank_top_k = rerank_top_k
         self._max_context_chars = max_context_chars
         self._answering_temperature = answering_temperature
         self._chain_of_thought_enabled = chain_of_thought_enabled
@@ -118,7 +127,11 @@ class GuidancePlugin:
             question = condensed
 
         # Query multiple collections in parallel
-        n_results = self._n_results
+        # Re-ranking widens the candidate pool: fetch more, rerank, then
+        # truncate after dedupe. Without a reranker the pool stays as it was.
+        n_results = (
+            self._rerank_candidate_n if self._reranker else self._n_results
+        )
         # Which ordering applies below. Read once here, from the same flag the
         # retrieval helper reads, so the ordering can never disagree with the
         # shape of the results it is ordering.
@@ -214,6 +227,25 @@ class GuidancePlugin:
             # whenever the feature is off, so it must be a true rollback.
             ranked.sort(key=lambda r: -(r[2].score if r[2].score is not None else 0.0))
         all_pairs: list[tuple[str, Source, dict]] = [(d, s, m) for _, d, s, m in ranked]
+        # Re-rank the merged pool (#115). One scorer applied uniformly is what
+        # makes the cross-collection merge sound: three separately-populated
+        # collections produce only loosely comparable distances, so a sparse
+        # corpus loses every comparison regardless of how well it answers.
+        # Runs AFTER the hybrid/dense ordering above — it reorders whatever
+        # that produced — and no truncation happens here: cutting to top-K
+        # before the dedupe below would let several chunks from one page
+        # consume the budget and return fewer distinct sources than asked.
+        if self._reranker is not None:
+            docs_only = [doc for doc, _, _ in all_pairs]
+            vector_scores = [src.score or 0.0 for _, src, _ in all_pairs]
+            started = time.perf_counter()
+            order = self._reranker.rerank(question, docs_only, vector_scores)
+            all_pairs = [all_pairs[i] for i in order]
+            logger.info(
+                "Re-ranked %d merged candidates across %d collections in %.1fms",
+                len(docs_only), len(DEFAULT_COLLECTIONS),
+                (time.perf_counter() - started) * 1000,
+            )
 
         # Filter by score threshold — discard low-relevance chunks. A passage
         # with no score was matched literally rather than by similarity, so the
@@ -233,7 +265,11 @@ class GuidancePlugin:
                 seen_sources.add(key)
                 deduped.append((doc, src, metadata))
 
-        deduped = deduped[:self._n_results]
+        # Truncate only now, after dedupe, so K distinct sources are returned
+        # whenever K distinct sources exist.
+        deduped = deduped[
+            : (self._rerank_top_k if self._reranker else self._n_results)
+        ]
 
         # Context budget enforcement — drop lowest-scoring chunks if over budget
         # #109's rendered-block budgeting, keeping #108's `dropped` counter

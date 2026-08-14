@@ -16,11 +16,13 @@ from pydantic_settings import BaseSettings
 
 from core.config import BaseConfig, IngestSpaceConfig
 from core.container import Container
+from core.domain.rerank import LexicalReranker
 from core.health import HealthServer
 from core.logging import setup_logging
 from core.ports.llm import LLMPort
 from core.ports.embeddings import EmbeddingsPort
 from core.ports.knowledge_store import KnowledgeStorePort
+from core.ports.reranker import RerankerPort
 from core.registry import PluginRegistry
 from core.router import Router
 
@@ -77,6 +79,10 @@ def _log_config(config: BaseConfig, plugin_class: type | None = None) -> None:
         "answering_llm_temperature",
         "answering_chain_of_thought_enabled",
         "hybrid_retrieval_enabled",
+        "rerank_enabled",
+        "rerank_candidate_n",
+        "rerank_top_k",
+        "rerank_lexical_weight",
         "summary_chunk_threshold",
         "chunk_size",
         "chunk_overlap",
@@ -288,6 +294,16 @@ def _create_adapters(config: BaseConfig, container: Container) -> None:
     from core.adapters.openai_assistant import OpenAIAssistantAdapter
 
     container.register(OpenAIAssistantAdapter, OpenAIAssistantAdapter())
+
+    # Re-ranker — registered only when enabled. Left unregistered, plugins
+    # keep their `reranker=None` default and never take the re-ranking path,
+    # which is what makes disabling it a true rollback rather than a second
+    # code path that merely resembles the old one.
+    if config.rerank_enabled:
+        container.register(
+            RerankerPort,
+            LexicalReranker(lexical_weight=config.rerank_lexical_weight),
+        )
 
 
 async def _shutdown_tracing_bounded() -> None:
@@ -667,6 +683,16 @@ async def _run(config: BaseConfig) -> None:
     # settings from one place rather than each plugin re-listing them.
     if "hybrid_config" in sig.parameters:
         deps["hybrid_config"] = config
+    # The re-ranker itself now arrives via `resolve_for_plugin` above, which
+    # resolves the `RerankerPort | None` annotation to the registration made
+    # in `_create_adapters`. Only its scalar settings still need injecting,
+    # and only when it is actually present — otherwise a disabled deployment
+    # would carry re-ranking numbers it never uses.
+    if "reranker" in deps:
+        if "rerank_candidate_n" in sig.parameters:
+            deps["rerank_candidate_n"] = config.rerank_candidate_n
+        if "rerank_top_k" in sig.parameters:
+            deps["rerank_top_k"] = config.rerank_top_k
     # Inject summarization LLM for ingest plugins
     if "summarize_llm" in sig.parameters:
         deps["summarize_llm"] = summarize_llm
