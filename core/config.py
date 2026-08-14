@@ -270,6 +270,73 @@ class BaseConfig(BaseSettings):
                 f"got {self.rerank_lexical_weight}"
             )
 
+        # Routing validation. Fail at startup naming the variable: a bad value
+        # here would surface as quietly worse answers with nothing in the logs
+        # connecting them to a config change.
+        if self.routing_simple_n_results <= 0:
+            raise ValueError(
+                f"ROUTING_SIMPLE_N_RESULTS must be greater than 0, "
+                f"got {self.routing_simple_n_results}"
+            )
+        if self.routing_complex_n_results <= 0:
+            raise ValueError(
+                f"ROUTING_COMPLEX_N_RESULTS must be greater than 0, "
+                f"got {self.routing_complex_n_results}"
+            )
+        # An absolute ceiling, independent of routing being on: an extra zero
+        # in an env var is a misconfiguration whether or not the feature reads
+        # it today, and the relational check below is scoped to when routing
+        # actually governs behaviour.
+        if self.routing_complex_context_chars > 10_000_000:
+            raise ValueError(
+                f"ROUTING_COMPLEX_CONTEXT_CHARS must be at most 10000000, "
+                f"got {self.routing_complex_context_chars}"
+            )
+        if self.routing_complex_context_chars <= 0:
+            raise ValueError(
+                f"ROUTING_COMPLEX_CONTEXT_CHARS must be greater than 0, "
+                f"got {self.routing_complex_context_chars}"
+            )
+        if self.routing_simple_n_results > self.retrieval_n_results:
+            # Documented in .env.example and on the field itself: a simple
+            # query must never become slower than it is today. Enforced here
+            # so the promise is not merely written down.
+            raise ValueError(
+                f"ROUTING_SIMPLE_N_RESULTS ({self.routing_simple_n_results}) "
+                f"must not exceed RETRIEVAL_N_RESULTS "
+                f"({self.retrieval_n_results})"
+            )
+        if self.routing_complex_n_results > 100:
+            # An extra zero in an env var should not start the pod and then
+            # degrade it under load.
+            raise ValueError(
+                f"ROUTING_COMPLEX_N_RESULTS must be at most 100, "
+                f"got {self.routing_complex_n_results}"
+            )
+        # Only when routing is actually on. This one compares a routing knob
+        # against a NON-routing setting, so with routing disabled it can refuse
+        # to boot a configuration that was valid before this feature existed and
+        # that no routing code will read: MAX_CONTEXT_CHARS=2000 is fine on
+        # develop, but the shipped ROUTING_COMPLEX_CONTEXT_CHARS default of
+        # 40000 exceeds 10x it. A feature that is off by default must not be
+        # able to stop a pod.
+        if (
+            self.routing_enabled
+            and self.routing_complex_context_chars > 10 * self.max_context_chars
+        ):
+            raise ValueError(
+                f"ROUTING_COMPLEX_CONTEXT_CHARS "
+                f"({self.routing_complex_context_chars}) must be at most 10x "
+                f"MAX_CONTEXT_CHARS ({self.max_context_chars})"
+            )
+        if self.routing_complex_n_results < self.routing_simple_n_results:
+            # Incoherent: the route meant to see more would see less.
+            raise ValueError(
+                f"ROUTING_COMPLEX_N_RESULTS ({self.routing_complex_n_results}) "
+                f"must be at least ROUTING_SIMPLE_N_RESULTS "
+                f"({self.routing_simple_n_results})"
+            )
+
         # Context budget validation
         if self.max_context_chars <= 0:
             raise ValueError(
@@ -465,6 +532,20 @@ class BaseConfig(BaseSettings):
     #: is a validated setting that cannot do the thing re-ranking is for.
     #: See LexicalReranker.DEFAULT_LEXICAL_WEIGHT for the derivation.
     rerank_lexical_weight: float = 0.6
+    # Adaptive routing — off by default. It changes how much evidence every
+    # answer is built from, and can skip retrieval entirely, so it is opted
+    # into rather than inherited. Disabled, the plugins take their existing
+    # code path with their existing constants.
+    routing_enabled: bool = False
+    #: Retrieval width for a direct lookup. Must not exceed the default, so a
+    #: simple query never becomes slower than it is today.
+    routing_simple_n_results: int = 3
+    #: Width and budget for a comparative or multi-hop question. The budget
+    #: moves with the width on purpose: at a 9000-char chunk size the default
+    #: 20000-char budget admits only 2 chunks, so widening retrieval alone
+    #: would deliver exactly the same context.
+    routing_complex_n_results: int = 10
+    routing_complex_context_chars: int = 40_000
 
     # Ingest pipeline
     chunk_size: int = 2000

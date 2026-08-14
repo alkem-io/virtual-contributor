@@ -25,6 +25,8 @@ from core.domain.retrieval_filters import FACTUAL_WHERE
 from core.ports.llm import LLMPort
 from core.ports.knowledge_store import KnowledgeStorePort
 from core.ports.reranker import RerankerPort
+from core.domain.routing import DEFAULT_ROUTING_TABLE, RetrievalProfile
+from core.ports.query_router import QueryRouterPort, RouteClass, RoutingDecision
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +60,8 @@ class GuidancePlugin:
         chain_of_thought_enabled: bool = True,
         hybrid_config: Any = None,        reranker: RerankerPort | None = None,
         rerank_candidate_n: int = 20,
-        rerank_top_k: int = 5,
+        rerank_top_k: int = 5,        query_router: QueryRouterPort | None = None,
+        routing_table: dict | None = None,
     ) -> None:
         self._llm = llm
         self._knowledge_store = knowledge_store
@@ -74,7 +77,70 @@ class GuidancePlugin:
         self._chain_of_thought_enabled = chain_of_thought_enabled
         # None keeps retrieval exactly as it was — the helper reads the flag
         # off this and falls through to the dense path.
-        self._hybrid_config = hybrid_config
+        self._hybrid_config = hybrid_config        # Absent unless routing is enabled, so an existing deployment keeps
+        # exactly its current behaviour on its current code path.
+        self._query_router = query_router
+        self._routing_table = routing_table or DEFAULT_ROUTING_TABLE
+
+    def _resolve_profile(self, message: str) -> RetrievalProfile:
+        """Decide this query's retrieval settings.
+
+        Classification is an optimisation, never a dependency of answering: a
+        failure here serves the query with the configured defaults, which is
+        what happens with routing switched off.
+        """
+        unrouted = RetrievalProfile(
+            retrieve=True,
+            n_results=self._n_results,
+            score_threshold=self._score_threshold,
+            max_context_chars=self._max_context_chars,
+        )
+        if self._query_router is None:
+            return unrouted
+        try:
+            decision = self._query_router.classify(message)
+            # Validated, not trusted. The port is a Protocol with no runtime
+            # return-type enforcement, so a substituted router may hand back
+            # None, a bare string, or an object with no `route`. Every one of
+            # those would raise out of here and turn a query that would
+            # otherwise be answered into a retried, then failed, request —
+            # breaking the promise this method's docstring makes.
+            if not isinstance(decision, RoutingDecision):
+                logger.warning(
+                    "Query router returned %s, not a RoutingDecision; "
+                    "using unrouted defaults",
+                    type(decision).__name__,
+                )
+                return unrouted
+            if not isinstance(decision.route, RouteClass):
+                logger.warning(
+                    "Query router returned an unknown route type (%s); "
+                    "using unrouted defaults",
+                    type(decision.route).__name__,
+                )
+                return unrouted
+            profile = self._routing_table.get(decision.route)
+            if profile is None:
+                logger.warning(
+                    "No profile for route %s; using defaults", decision.route,
+                )
+                return unrouted
+            # The route, never the reason. `reason` is free text a substituted
+            # classifier could build from the member's own question, and this
+            # line goes to stdout and on to central logging.
+            logger.info(
+                "Routed query as %s: retrieve=%s n_results=%d budget=%d",
+                decision.route.value,
+                profile.retrieve, profile.n_results, profile.max_context_chars,
+            )
+            logger.debug("Routing reason: %s", decision.reason)
+        except Exception:
+            logger.warning(
+                "Query classification failed; using unrouted defaults",
+                exc_info=True,
+            )
+            return unrouted
+        return profile
 
     async def startup(self) -> None:
         logger.info("GuidancePlugin started")
@@ -126,11 +192,18 @@ class GuidancePlugin:
                 }])
             question = condensed
 
+        # One decision per query, resolved on the condensed question — that is
+        # what retrieval will actually run against.
+        profile = self._resolve_profile(question)
+
         # Query multiple collections in parallel
-        # Re-ranking widens the candidate pool: fetch more, rerank, then
-        # truncate after dedupe. Without a reranker the pool stays as it was.
+        # #116's profile decides the base width; #115's reranker needs its
+        # candidate pool regardless, so the fetch is the larger of the two.
+        # Truncation back down happens after dedupe.
         n_results = (
-            self._rerank_candidate_n if self._reranker else self._n_results
+            max(profile.n_results, self._rerank_candidate_n)
+            if self._reranker
+            else profile.n_results
         )
         # Which ordering applies below. Read once here, from the same flag the
         # retrieval helper reads, so the ordering can never disagree with the
@@ -186,12 +259,15 @@ class GuidancePlugin:
                 logger.warning("Failed to query collection %s", collection)
             return entries
 
-        query_results = await asyncio.gather(
-            *[_query_collection(c) for c in DEFAULT_COLLECTIONS]
-        )
         ranked: list[tuple[int, str, Source, dict]] = []
-        for entries in query_results:
-            ranked.extend(entries)
+        if profile.retrieve:
+            query_results = await asyncio.gather(
+                *[_query_collection(c) for c in DEFAULT_COLLECTIONS]
+            )
+            for entries in query_results:
+                ranked.extend(entries)
+        # Otherwise: small talk. All three collection queries are skipped
+        # outright rather than run and discarded.
 
         if hybrid_enabled:
             # Merge the collections by each passage's rank within its own
@@ -253,7 +329,7 @@ class GuidancePlugin:
         # drop exactly the exact-name matches the lexical arm exists to find.
         all_pairs = [
             (doc, src, metadata) for doc, src, metadata in all_pairs
-            if src.score is None or src.score >= self._score_threshold
+            if src.score is None or src.score >= profile.score_threshold
         ]
 
         # Deduplicate by source URL, keeping the highest-scoring chunk per page
@@ -266,14 +342,17 @@ class GuidancePlugin:
                 deduped.append((doc, src, metadata))
 
         # Truncate only now, after dedupe, so K distinct sources are returned
-        # whenever K distinct sources exist.
+        # whenever K distinct sources exist. The width is the profile's (#116)
+        # — applying it at the query but not here would fetch extra evidence
+        # and silently discard it — narrowed to top-K when re-ranking (#115).
         deduped = deduped[
-            : (self._rerank_top_k if self._reranker else self._n_results)
+            : (self._rerank_top_k if self._reranker else profile.n_results)
         ]
 
         # Context budget enforcement — drop lowest-scoring chunks if over budget
         # #109's rendered-block budgeting, keeping #108's `dropped` counter
-        # so the span attribute still reports what the budget discarded.
+        # so the span attribute still reports what the budget discarded; the
+        # budget itself is the profile's (#116).
         dropped = 0
         formatted_blocks = [
             render_document_block(number, doc, metadata)
@@ -283,13 +362,13 @@ class GuidancePlugin:
             rendered_document_budget_size(block, doc)
             for block, (doc, _, _) in zip(formatted_blocks, deduped)
         )
-        if total_budget_size > self._max_context_chars:
+        if total_budget_size > profile.max_context_chars:
             kept: list[tuple[str, Source, dict]] = []
             kept_blocks: list[str] = []
             accumulated = 0
             for block, (doc, src, metadata) in zip(formatted_blocks, deduped):
                 document_budget_size = rendered_document_budget_size(block, doc)
-                if accumulated + document_budget_size > self._max_context_chars:
+                if accumulated + document_budget_size > profile.max_context_chars:
                     break
                 kept.append((doc, src, metadata))
                 kept_blocks.append(block)

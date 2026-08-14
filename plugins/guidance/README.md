@@ -112,3 +112,29 @@ the deployment's existing provider/default behavior and does not affect
 ```bash
 poetry run pytest tests/plugins/test_guidance.py
 ```
+
+## Adaptive routing
+
+When `ROUTING_ENABLED=true`, each question is classified before retrieval and
+this plugin's retrieval width, score threshold and context budget come from the
+matching profile instead of the configured constants.
+
+| Route | Behaviour here |
+|---|---|
+| conversational | **no retrieval at all** — the store is not queried |
+| simple | narrower retrieval than today |
+| moderate | exactly today's behaviour (the fallback for unrecognised input) |
+| complex | wider retrieval **and** a wider context budget |
+
+**Off by default.** With routing disabled no classifier is injected and this
+plugin takes its existing code path with its existing constants — that is the
+rollback, and it is a config change rather than a deploy.
+
+Classification is rule-based and in-process: no model, no network call,
+sub-millisecond. See `docs/adr/0016-adaptive-query-routing.md` for why an LLM
+classifier was rejected on arithmetic, and `README.md` for the settings.
+
+Width applies at **both** points this plugin uses it: the per-collection query
+and the post-dedupe truncation. Applying it at only the first would fetch the
+extra evidence and then discard it, so widening would be invisible in the
+answer — covered by `tests/plugins/test_guidance_routing.py`.

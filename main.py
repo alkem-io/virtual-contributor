@@ -17,6 +17,7 @@ from pydantic_settings import BaseSettings
 from core.config import BaseConfig, IngestSpaceConfig
 from core.container import Container
 from core.domain.rerank import LexicalReranker
+from core.domain.rule_classifier import RuleQueryClassifier
 from core.health import HealthServer
 from core.logging import setup_logging
 from core.ports.llm import LLMPort
@@ -44,6 +45,63 @@ def _mask_sensitive(name: str, value: object) -> str:
                 host = f"{host}:{parsed.port}"
             return urlunsplit(parsed._replace(netloc=f"***@{host}"))
     return s
+
+
+def _build_routing_table(
+    config: BaseConfig,
+    *,
+    n_results: int,
+    score_threshold: float,
+    max_context_chars: int,
+) -> dict:
+    """Turn routing config into the per-route retrieval profiles.
+
+    The plugin's OWN effective settings are passed in, not read from the
+    deprecated globals. This matters: production sets `EXPERT_MIN_SCORE` and
+    `GUIDANCE_MIN_SCORE` to 0.1 and never sets `RETRIEVAL_SCORE_THRESHOLD`, so
+    building from the global would silently impose 0.3 on every routed query —
+    tripling a threshold nobody configured, the moment routing was switched on.
+
+    The moderate route deliberately mirrors those same settings: an
+    unrecognised question falls back to it, and that fallback has to behave
+    exactly as the plugin does today.
+    """
+    from core.domain.routing import RetrievalProfile
+    from core.ports.query_router import RouteClass
+
+    default_threshold = score_threshold
+    return {
+        RouteClass.CONVERSATIONAL: RetrievalProfile(
+            retrieve=False,
+            n_results=n_results,
+            score_threshold=default_threshold,
+            max_context_chars=max_context_chars,
+        ),
+        RouteClass.SIMPLE: RetrievalProfile(
+            retrieve=True,
+            # Never wider than what the plugin would have used anyway — a
+            # simple query must not become slower than it is today.
+            n_results=min(config.routing_simple_n_results, n_results),
+            score_threshold=default_threshold,
+            max_context_chars=max_context_chars,
+        ),
+        RouteClass.MODERATE: RetrievalProfile(
+            retrieve=True,
+            n_results=n_results,
+            score_threshold=default_threshold,
+            max_context_chars=max_context_chars,
+        ),
+        RouteClass.COMPLEX: RetrievalProfile(
+            retrieve=True,
+            # At least as wide as today, and never narrower: a complex
+            # question must not see less than an unrouted one.
+            n_results=max(config.routing_complex_n_results, n_results),
+            score_threshold=default_threshold,
+            max_context_chars=max(
+                config.routing_complex_context_chars, max_context_chars,
+            ),
+        ),
+    }
 
 
 def _log_config(config: BaseConfig, plugin_class: type | None = None) -> None:
@@ -83,6 +141,10 @@ def _log_config(config: BaseConfig, plugin_class: type | None = None) -> None:
         "rerank_candidate_n",
         "rerank_top_k",
         "rerank_lexical_weight",
+        "routing_enabled",
+        "routing_simple_n_results",
+        "routing_complex_n_results",
+        "routing_complex_context_chars",
         "summary_chunk_threshold",
         "chunk_size",
         "chunk_overlap",
@@ -693,6 +755,23 @@ async def _run(config: BaseConfig) -> None:
             deps["rerank_candidate_n"] = config.rerank_candidate_n
         if "rerank_top_k" in sig.parameters:
             deps["rerank_top_k"] = config.rerank_top_k
+    # Inject the classifier only when routing is enabled. Left absent, the
+    # plugins keep their `query_router=None` default and take their existing
+    # code path — which is what makes disabling this a true rollback rather
+    # than a routing table that merely happens to agree with today.
+    if config.routing_enabled and "query_router" in sig.parameters:
+        deps["query_router"] = RuleQueryClassifier()
+        if "routing_table" in sig.parameters:
+            deps["routing_table"] = _build_routing_table(
+                config,
+                n_results=deps.get("n_results", config.retrieval_n_results),
+                score_threshold=deps.get(
+                    "score_threshold", config.retrieval_score_threshold,
+                ),
+                max_context_chars=deps.get(
+                    "max_context_chars", config.max_context_chars,
+                ),
+            )
     # Inject summarization LLM for ingest plugins
     if "summarize_llm" in sig.parameters:
         deps["summarize_llm"] = summarize_llm

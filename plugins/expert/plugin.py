@@ -22,6 +22,8 @@ from core.domain.retrieval_filters import FACTUAL_WHERE
 from core.ports.llm import LLMPort
 from core.ports.knowledge_store import KnowledgeStorePort, QueryResult
 from core.ports.reranker import RerankerPort
+from core.domain.routing import DEFAULT_ROUTING_TABLE, RetrievalProfile
+from core.ports.query_router import QueryRouterPort, RouteClass, RoutingDecision
 
 logger = logging.getLogger(__name__)
 
@@ -164,6 +166,8 @@ class ExpertPlugin:
         reranker: RerankerPort | None = None,
         rerank_candidate_n: int = 20,
         rerank_top_k: int = 5,
+        query_router: QueryRouterPort | None = None,
+        routing_table: dict | None = None,
     ) -> None:
         self._llm = llm
         self._knowledge_store = knowledge_store
@@ -180,6 +184,11 @@ class ExpertPlugin:
         self._reranker = reranker
         self._rerank_candidate_n = rerank_candidate_n
         self._rerank_top_k = rerank_top_k
+        # Absent unless routing is enabled, so an existing deployment takes its
+        # current code path with its current constants — the disabled path is
+        # literally today's branch, not a table that happens to agree with it.
+        self._query_router = query_router
+        self._routing_table = routing_table or DEFAULT_ROUTING_TABLE
 
     @property
     def _retrieval_n_results(self) -> int:
@@ -221,6 +230,65 @@ class ExpertPlugin:
             ids=[(result.ids[0] if result.ids else [])[:k]],
         )
 
+    def _resolve_profile(self, message: str) -> RetrievalProfile:
+        """Decide this query's retrieval settings.
+
+        Classification is an optimisation, never a dependency of answering: if
+        it fails for any reason the query is served with the configured
+        defaults, which is exactly what happens with routing switched off.
+        """
+        unrouted = RetrievalProfile(
+            retrieve=True,
+            n_results=self._n_results,
+            score_threshold=self._score_threshold,
+            max_context_chars=self._max_context_chars,
+        )
+        if self._query_router is None:
+            return unrouted
+        try:
+            decision = self._query_router.classify(message)
+            # Validated, not trusted. The port is a Protocol with no runtime
+            # return-type enforcement, so a substituted router may hand back
+            # None, a bare string, or an object with no `route`. Every one of
+            # those would raise out of here and turn a query that would
+            # otherwise be answered into a retried, then failed, request —
+            # breaking the promise this method's docstring makes.
+            if not isinstance(decision, RoutingDecision):
+                logger.warning(
+                    "Query router returned %s, not a RoutingDecision; "
+                    "using unrouted defaults",
+                    type(decision).__name__,
+                )
+                return unrouted
+            if not isinstance(decision.route, RouteClass):
+                logger.warning(
+                    "Query router returned an unknown route type (%s); "
+                    "using unrouted defaults",
+                    type(decision.route).__name__,
+                )
+                return unrouted
+            profile = self._routing_table.get(decision.route)
+            if profile is None:
+                logger.warning(
+                    "No profile for route %s; using defaults", decision.route,
+                )
+                return unrouted
+            # The route, never the reason. `reason` is free text a substituted
+            # classifier could build from the member's own question, and this
+            # line goes to stdout and on to central logging.
+            logger.info(
+                "Routed query as %s: retrieve=%s n_results=%d budget=%d",
+                decision.route.value,
+                profile.retrieve, profile.n_results, profile.max_context_chars,
+            )
+            logger.debug("Routing reason: %s", decision.reason)
+        except Exception:
+            logger.warning(
+                "Query classification failed; using unrouted defaults",
+                exc_info=True,
+            )
+            return unrouted
+        return profile
 
     async def startup(self) -> None:
         logger.info("ExpertPlugin started")
@@ -252,23 +320,38 @@ class ExpertPlugin:
         bok_id = event.body_of_knowledge_id or ""
         collection = f"{bok_id}-knowledge" if bok_id else "default-knowledge"
 
+        # One decision per query, made before either path branches, so the
+        # two paths cannot drift apart in how they route.
+        profile = self._resolve_profile(event.message)
+
         # If prompt_graph is defined, use graph execution
         if event.prompt_graph:
-            return await self._handle_with_graph(event, collection)
+            return await self._handle_with_graph(event, collection, profile)
 
         # Fallback: simple RAG
-        return await self._handle_simple(event, collection)
+        return await self._handle_simple(event, collection, profile)
 
     def _enforce_context_budget(
         self, docs: list[str], filtered_result: QueryResult,
+        max_context_chars: int | None = None,
     ) -> tuple[list[str], QueryResult]:
-        """Drop lowest-scoring chunks if rendered context exceeds its budget."""
+        """Drop lowest-scoring chunks if rendered context exceeds its budget.
+
+        The budget is per-query, not per-instance (#116): a route that widens
+        retrieval must widen this too, or the extra chunks are fetched and
+        then silently discarded here. Accounting is rendered-block based
+        (#109): what is measured is what the model actually receives.
+        """
+        budget = (
+            self._max_context_chars if max_context_chars is None
+            else max_context_chars
+        )
         raw_docs_check = filtered_result.documents[0] if filtered_result.documents else []
         total_budget_size = sum(
             rendered_document_budget_size(rendered, content)
             for rendered, content in zip(docs, raw_docs_check)
         )
-        if total_budget_size <= self._max_context_chars:
+        if total_budget_size <= budget:
             return docs, filtered_result
 
         # docs are already in score order from _filter_and_format
@@ -283,7 +366,7 @@ class ExpertPlugin:
         for i, doc in enumerate(docs):
             raw_content = raw_docs[i] if i < len(raw_docs) else ""
             document_budget_size = rendered_document_budget_size(doc, raw_content)
-            if accumulated + document_budget_size > self._max_context_chars:
+            if accumulated + document_budget_size > budget:
                 break
             kept_formatted.append(doc)
             kept_docs.append(raw_content)
@@ -310,16 +393,26 @@ class ExpertPlugin:
         )
         return kept_formatted, new_result
 
-    async def _handle_with_graph(self, event: Input, collection: str) -> Response:
+    async def _handle_with_graph(
+        self, event: Input, collection: str, profile: RetrievalProfile,
+    ) -> Response:
         from core.domain.prompt_graph import PromptGraph
 
         graph = PromptGraph.from_definition(event.prompt_graph)
 
         # Create retrieve special node
-        n_results = self._retrieval_n_results
-        score_threshold = self._score_threshold
+        # NOT captured from the profile resolved in handle(). The graph may
+        # rephrase before retrieving — "yes" after "Shall I list the
+        # templates?" becomes a real standalone question — so the closure
+        # re-resolves on the query it is actually about to run. Capturing the
+        # raw turn's decision would skip retrieval on a genuine question and
+        # answer it ungrounded, which is the one mistake this feature is not
+        # allowed to make.
+        resolve_profile = self._resolve_profile
         enforce_budget = self._enforce_context_budget
         maybe_rerank = self._maybe_rerank
+        reranker = self._reranker
+        rerank_candidate_n = self._rerank_candidate_n
         truncate_to_top_k = self._truncate_to_top_k
 
         async def retrieve_node(state: dict) -> dict:
@@ -331,6 +424,20 @@ class ExpertPlugin:
                 or state.get("current_question")
                 or event.message
             )
+            # #116: classify what is being retrieved on, not what was typed.
+            node_profile = resolve_profile(query)
+            if not node_profile.retrieve:
+                # Small talk. There is nothing in a knowledge base that answers
+                # "thanks" — so no query is made at all, not a query whose
+                # results are discarded.
+                return {"combined_knowledge_docs": ""}
+            # The profile widens or narrows retrieval; a reranker needs its
+            # candidate pool regardless, so the pool is the larger of the two.
+            pool_n = (
+                max(node_profile.n_results, rerank_candidate_n)
+                if reranker is not None
+                else node_profile.n_results
+            )
             # #114's hybrid retrieval inside #108's span, carrying #107's
             # factual filter through to both arms; #115 re-ranks the pool and
             # truncates AFTER threshold filtering (order is load-bearing —
@@ -338,17 +445,21 @@ class ExpertPlugin:
             with optional_span("vc.retrieval", kind=SpanKind.CLIENT) as span:
                 result = await hybrid_retrieval.retrieve(
                     self._knowledge_store, collection, query,
-                    self._hybrid_config, n_results=n_results,
+                    self._hybrid_config, n_results=pool_n,
                     where=FACTUAL_WHERE,
                 )
                 # Re-rank against the question actually asked at this point in
                 # the graph — the rephrased one when there is one, since that
                 # is what was retrieved on.
                 result = maybe_rerank(query, result)
-                docs, filtered_result = _filter_and_format(result, score_threshold)
+                docs, filtered_result = _filter_and_format(
+                    result, node_profile.score_threshold,
+                )
                 docs, filtered_result = truncate_to_top_k(docs, filtered_result)
                 initial_count = len(docs)
-                docs, filtered_result = enforce_budget(docs, filtered_result)
+                docs, filtered_result = enforce_budget(
+                    docs, filtered_result, node_profile.max_context_chars,
+                )
                 if span is not None:
                     span.set_attribute("vc.retrieval.chunks_passed", len(docs))
                     span.set_attribute("vc.retrieval.chunks_dropped_budget", initial_count - len(docs))
@@ -405,28 +516,41 @@ class ExpertPlugin:
             original_result=final_state.get("original_result"),
         )
 
-    async def _handle_simple(self, event: Input, collection: str) -> Response:
+    async def _handle_simple(
+        self, event: Input, collection: str, profile: RetrievalProfile,
+    ) -> Response:
         """Simple RAG without graph execution."""
         from opentelemetry.trace import SpanKind
 
         from core.tracing import mark_empty_retrieval, optional_span
 
-        with optional_span("vc.retrieval", kind=SpanKind.CLIENT) as span:
-            result = await hybrid_retrieval.retrieve(
-                self._knowledge_store, collection, event.message,
-                self._hybrid_config, n_results=self._retrieval_n_results,
-                where=FACTUAL_WHERE,
+        if profile.retrieve:
+            pool_n = (
+                max(profile.n_results, self._rerank_candidate_n)
+                if self._reranker is not None
+                else profile.n_results
             )
-            result = self._maybe_rerank(event.message, result)
-            docs, result = _filter_and_format(result, self._score_threshold)
-            docs, result = self._truncate_to_top_k(docs, result)
-            initial_count = len(docs)
-            docs, result = self._enforce_context_budget(docs, result)
-            if span is not None:
-                span.set_attribute("vc.retrieval.chunks_passed", len(docs))
-                span.set_attribute("vc.retrieval.chunks_dropped_budget", initial_count - len(docs))
-            if not result.documents or not result.documents[0] or not docs:
-                mark_empty_retrieval()
+            with optional_span("vc.retrieval", kind=SpanKind.CLIENT) as span:
+                result = await hybrid_retrieval.retrieve(
+                    self._knowledge_store, collection, event.message,
+                    self._hybrid_config, n_results=pool_n,
+                    where=FACTUAL_WHERE,
+                )
+                result = self._maybe_rerank(event.message, result)
+                docs, result = _filter_and_format(result, profile.score_threshold)
+                docs, result = self._truncate_to_top_k(docs, result)
+                initial_count = len(docs)
+                docs, result = self._enforce_context_budget(
+                    docs, result, profile.max_context_chars,
+                )
+                if span is not None:
+                    span.set_attribute("vc.retrieval.chunks_passed", len(docs))
+                    span.set_attribute("vc.retrieval.chunks_dropped_budget", initial_count - len(docs))
+                if not result.documents or not result.documents[0] or not docs:
+                    mark_empty_retrieval()
+        else:
+            docs = []
+            result = QueryResult(documents=[[]], metadatas=[[]], distances=[[]], ids=[[]])
         knowledge = join_document_blocks(docs)
 
         from plugins.expert.prompts import combined_expert_prompt
