@@ -55,3 +55,21 @@ Per-plugin LLM overrides are supported via `EXPERT_LLM_*` prefix.
 ```bash
 poetry run pytest tests/plugins/test_expert.py
 ```
+
+## Faithfulness validation
+
+When `FAITHFULNESS_VALIDATION_ENABLED=true`, each generated answer is checked
+against the context it was produced from, and a warning is logged when the
+answer **asserts** something after retrieval returned **nothing**.
+
+**Observation only** — the answer a member receives is never changed, delayed,
+or withheld. Off by default; disabled, no validator is constructed at all.
+
+See `docs/adr/0017-post-generation-faithfulness-validation.md` for why
+word-overlap scoring was rejected (it cannot separate a fabrication from a
+faithful paraphrase, and would flag every non-English answer).
+
+Both generation paths are covered: `_handle_simple` and the graph path. The
+graph path returns no sources by design, which is why the check keys off the
+context string rather than `Response.sources` — a sources-keyed check would
+flag every graph answer.
