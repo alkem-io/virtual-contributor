@@ -36,6 +36,30 @@ class TestConversationalTurnsSkipTheRewrite:
         )
         assert llm.n == 1, f"{message!r} paid for a rewrite it did not need"
 
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "ok so what now",
+            "thanks for the space overview, what about subspaces?",
+            "ok and the leads?",
+            "cool what about subspaces",
+            "great, who runs it?",
+        ],
+    )
+    async def test_an_acknowledgement_carrying_a_question_still_rewrites(
+        self, message: str
+    ) -> None:
+        """US1-AS4 — the load-bearing boundary of the whole gate.
+
+        A turn may open with gratitude and still carry an information need.
+        Skipping it would send an unresolved fragment to the vector store.
+        """
+        llm = CountingLLM()
+        await _plugin(llm, rewrite_policy=SkipConversational()).handle(
+            make_input(message=message, history=HISTORY)
+        )
+        assert llm.n == 2, f"{message!r} was skipped despite carrying a question"
+
     async def test_conversational_cost_equals_the_no_history_baseline(self) -> None:
         """The saving is real, not merely reordered."""
         baseline = CountingLLM()

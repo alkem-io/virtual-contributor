@@ -31,18 +31,38 @@ def _mask_sensitive(name: str, value) -> str:
     return s
 
 
+#: Acknowledgements that classify CONVERSATIONAL but may mean "yes, do it".
+#:
+#: The classifier deliberately excludes bare "yes", "no" and "sure" from its
+#: conversational set, on the stated grounds that after *"Shall I list the
+#: templates in this space?"* they are the shortest way to say *do it*. That
+#: reasoning applies verbatim to these, which it does include. Skipping them
+#: searches the vector store for the literal string "ok" instead of the offer
+#: the member just accepted — a regression against develop, which rewrites it.
+#:
+#: Excluding them costs nothing: they fall through to being rewritten, exactly
+#: as today. The gate only ever needs to be *right* about what it skips.
+_AMBIGUOUS_ACKNOWLEDGEMENTS = frozenset({
+    "ok", "okay", "k", "kk", "alright", "all right", "right",
+    "will do", "later", "got it", "gotcha", "noted", "understood",
+    "sounds good", "fine", "cool", "yep", "yeah", "yup",
+})
+
+
 class _ConversationalSkipPolicy:
     """Skip the rewrite only for turns that are entirely small talk.
 
     Wraps the adaptive-query classifier without the plugins knowing it exists.
 
-    **Only CONVERSATIONAL is safe.** Skipping SIMPLE as well looks tempting —
-    it is roughly twice as fast — but SIMPLE covers anaphoric follow-ups like
-    "show me those" and "the name of the lead", which are meaningless without
-    the preceding turn. Measured against a 12-turn corpus, skipping SIMPLE
-    broke 9 of 12; skipping only CONVERSATIONAL broke none. CONVERSATIONAL is
-    safe because the classifier requires the *whole* message to be small talk,
-    so it cannot carry a question that needs resolving.
+    **Only CONVERSATIONAL is safe, and not even all of it.** Skipping SIMPLE as
+    well looks tempting — it is roughly twice as fast — but SIMPLE covers
+    anaphoric follow-ups like "show me those" and "the name of the lead", which
+    are meaningless without the preceding turn: 9 of a 12-turn corpus broke.
+    And within CONVERSATIONAL, the acknowledgements above are held back
+    because they can be an affirmative answer to a question the VC just asked.
+
+    What remains — "thanks", "cheers", "bye" — asserts that the member wants
+    nothing looked up, which is what makes dropping the history safe.
     """
 
     def __init__(self, classifier: object, conversational: object) -> None:
@@ -50,6 +70,8 @@ class _ConversationalSkipPolicy:
         self._conversational = conversational
 
     def should_skip_rewrite(self, message: str) -> bool:
+        if message.strip().rstrip("!.?").lower() in _AMBIGUOUS_ACKNOWLEDGEMENTS:
+            return False
         try:
             return self._classifier.classify(message).route is self._conversational
         except Exception as exc:

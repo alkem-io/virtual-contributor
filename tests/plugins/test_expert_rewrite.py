@@ -77,7 +77,14 @@ class TestExpertGraphPath:
     `retrieve_node` already preferred but which nothing ever wrote."""
 
     @staticmethod
-    def _graph() -> dict:
+    def _graph(*, declares_rephrased: bool = True) -> dict:
+        properties = {
+            "current_question": {"type": "string"},
+            "combined_knowledge_docs": {"type": "string"},
+            "final_answer": {"type": "string"},
+        }
+        if declares_rephrased:
+            properties["rephrased_question"] = {"type": "string"}
         return {
             "nodes": [
                 {"name": "retrieve", "input_variables": [], "prompt": ""},
@@ -88,15 +95,12 @@ class TestExpertGraphPath:
                 {"from": "retrieve", "to": "answer"},
                 {"from": "answer", "to": "END"},
             ],
-            "state": {"type": "object", "properties": {
-                "current_question": {"type": "string"},
-                "rephrased_question": {"type": "string"},
-                "combined_knowledge_docs": {"type": "string"},
-                "final_answer": {"type": "string"},
-            }},
+            "state": {"type": "object", "properties": properties},
         }
 
-    async def _run(self, plugin: ExpertPlugin, message: str) -> None:
+    async def _run(
+        self, plugin: ExpertPlugin, message: str, *, declares_rephrased: bool = True
+    ) -> None:
         from unittest.mock import patch
 
         from core.domain.prompt_graph import PromptGraph
@@ -120,7 +124,11 @@ class TestExpertGraphPath:
 
         with patch.object(PromptGraph, "from_definition", staticmethod(_with_stub)):
             await plugin.handle(
-                make_input(message=message, history=HISTORY, promptGraph=self._graph())
+                make_input(
+                    message=message,
+                    history=HISTORY,
+                    promptGraph=self._graph(declares_rephrased=declares_rephrased),
+                )
             )
 
     async def test_the_graph_retrieves_with_the_resolved_question(self) -> None:
@@ -226,3 +234,156 @@ class TestTheRewriteCannotCrossCollectionScope:
         collection, queries, _ = store.query_calls[0]
         assert collection == "space-A-knowledge"
         assert "SECRET" in queries[0], "the rewrite did reach the query, as expected"
+
+
+class TestGraphResolutionSurvivesTheCallerSchema:
+    """`event.prompt_graph` arrives on the wire, so its state schema is the
+    caller's, and LangGraph drops any key the schema does not declare.
+
+    Seeding `initial_state["rephrased_question"]` alone meant a graph that
+    simply did not list that key **paid for the rewrite and discarded it** —
+    worse than not rewriting at all, on both axes this feature optimises.
+    """
+
+    async def test_resolution_reaches_retrieval_when_the_schema_omits_the_key(
+        self,
+    ) -> None:
+        store = MockKnowledgeStorePort()
+        await TestExpertGraphPath()._run(
+            ExpertPlugin(llm=CountingLLM(), knowledge_store=store),
+            "and the other one?",
+            declares_rephrased=False,
+        )
+        assert store.query_calls[0][1] == [RESOLVED], (
+            "the rewrite was paid for and dropped by the caller's state schema"
+        )
+
+    async def test_a_graph_node_writing_the_key_still_wins(self) -> None:
+        """The closure must not pre-empt a graph that routes its own rephrase."""
+        from unittest.mock import patch
+
+        from core.domain.prompt_graph import PromptGraph
+
+        store = MockKnowledgeStorePort()
+        plugin = ExpertPlugin(llm=CountingLLM(), knowledge_store=store)
+        real = PromptGraph.from_definition
+
+        def _with_rephraser(definition: dict):
+            graph = real(definition)
+            real_compile = graph.compile
+
+            async def _rephrase(state) -> dict:
+                return {"rephrased_question": "THE GRAPH'S OWN REPHRASE"}
+
+            async def _answer(state) -> dict:
+                return {"final_answer": "an answer"}
+
+            def compile_with_stub(llm, special_nodes=None):
+                nodes = dict(special_nodes or {})
+                nodes.setdefault("answer", _answer)
+                nodes["rephrase"] = _rephrase
+                return real_compile(llm=llm, special_nodes=nodes)
+
+            graph.compile = compile_with_stub  # type: ignore[method-assign]
+            return graph
+
+        definition = {
+            "nodes": [
+                {"name": "rephrase", "input_variables": [], "prompt": ""},
+                {"name": "retrieve", "input_variables": [], "prompt": ""},
+                {"name": "answer", "input_variables": [], "prompt": ""},
+            ],
+            "edges": [
+                {"from": "START", "to": "rephrase"},
+                {"from": "rephrase", "to": "retrieve"},
+                {"from": "retrieve", "to": "answer"},
+                {"from": "answer", "to": "END"},
+            ],
+            "state": {"type": "object", "properties": {
+                "current_question": {"type": "string"},
+                "rephrased_question": {"type": "string"},
+                "combined_knowledge_docs": {"type": "string"},
+                "final_answer": {"type": "string"},
+            }},
+        }
+        with patch.object(PromptGraph, "from_definition", staticmethod(_with_rephraser)):
+            await plugin.handle(
+                make_input(
+                    message="and the other one?", history=HISTORY, promptGraph=definition
+                )
+            )
+        assert store.query_calls[0][1] == ["THE GRAPH'S OWN REPHRASE"]
+
+
+class TestTheGraphPathIsBoundedToo:
+    """Bounding only the rewrite prompt was incoherent: the graph builds a
+    `conversation` string and a `messages` list from the same member-supplied
+    history, both fed straight to the graph's LLM nodes, and unbounded they
+    were an order of magnitude larger than the prompt already bounded."""
+
+    async def test_an_enormous_history_does_not_reach_the_graph(self) -> None:
+        from unittest.mock import patch
+
+        from core.domain.prompt_graph import PromptGraph
+
+        seen: dict[str, int] = {}
+        real = PromptGraph.from_definition
+
+        def _capturing(definition: dict):
+            graph = real(definition)
+            real_compile = graph.compile
+
+            async def _answer(state) -> dict:
+                read = (
+                    state.get
+                    if isinstance(state, dict)
+                    else lambda k, d=None: getattr(state, k, d)
+                )
+                seen["conversation"] = len(read("conversation", "") or "")
+                seen["messages"] = len(read("messages", []) or [])
+                return {"final_answer": "an answer"}
+
+            def compile_with_stub(llm, special_nodes=None):
+                nodes = dict(special_nodes or {})
+                nodes.setdefault("answer", _answer)
+                return real_compile(llm=llm, special_nodes=nodes)
+
+            graph.compile = compile_with_stub  # type: ignore[method-assign]
+            return graph
+
+        definition = {
+            "nodes": [
+                {"name": "retrieve", "input_variables": [], "prompt": ""},
+                {"name": "answer", "input_variables": [], "prompt": ""},
+            ],
+            "edges": [
+                {"from": "START", "to": "retrieve"},
+                {"from": "retrieve", "to": "answer"},
+                {"from": "answer", "to": "END"},
+            ],
+            "state": {"type": "object", "properties": {
+                "current_question": {"type": "string"},
+                "conversation": {"type": "string"},
+                "messages": {"type": "array", "items": {"type": "object"}},
+                "combined_knowledge_docs": {"type": "string"},
+                "final_answer": {"type": "string"},
+            }},
+        }
+        history = [
+            {"role": "human" if i % 2 == 0 else "assistant", "content": "x" * 500}
+            for i in range(5_000)
+        ]
+        with patch.object(PromptGraph, "from_definition", staticmethod(_capturing)):
+            await ExpertPlugin(
+                llm=CountingLLM(), knowledge_store=MockKnowledgeStorePort()
+            ).handle(
+                make_input(
+                    message="and the other one?",
+                    history=history,
+                    promptGraph=definition,
+                )
+            )
+        assert seen["conversation"] < 50_000, (
+            f"graph conversation was {seen['conversation']:,} chars — unbounded"
+        )
+        assert seen["messages"] < 50

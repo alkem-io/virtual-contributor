@@ -151,14 +151,21 @@ class ExpertPlugin:
 
         graph = PromptGraph.from_definition(event.prompt_graph)
 
+        # Resolved before the graph runs so `retrieve_node` can close over it.
+        resolved = await self._resolve_question(event)
+
         # Create retrieve special node
         n_results = self._n_results
         score_threshold = self._score_threshold
         enforce_budget = self._enforce_context_budget
 
         async def retrieve_node(state: dict) -> dict:
+            # `resolved` first: it survives a caller schema that drops the key.
+            # A graph node that writes its own rephrased_question still wins,
+            # because `resolved` is only set when it differs from the message.
             query = (
                 state.get("rephrased_question")
+                or resolved
                 or state.get("current_question")
                 or event.message
             )
@@ -181,7 +188,13 @@ class ExpertPlugin:
         # Build messages list and conversation text from event history +
         # the current user message.  The graph's `check_input` node expects
         # a formatted `conversation` string of ``role:\ncontent`` turns.
-        history = list(event.history or [])
+        # Bounded for the same reason the rewrite prompt is: the member
+        # supplies the history, and every turn here is embedded in
+        # `conversation` and `messages`, both of which go straight to the
+        # graph's LLM nodes. Measured unbounded: 5 000 turns built a 2.5 MB
+        # conversation string — larger than the rewrite prompt this feature
+        # already bounded, so bounding only that one was incoherent.
+        history = recent_history(event.history)
         messages = [
             {
                 "role": h.role.value if hasattr(h.role, "value") else str(h.role),
@@ -202,11 +215,17 @@ class ExpertPlugin:
             "description": event.description,
             "display_name": event.display_name,
         }
-        # `retrieve_node` already prefers `rephrased_question` over
-        # `current_question` — nothing ever wrote it. Seeding it activates a
-        # dormant seam rather than adding one. Only when it differs, so a graph
-        # whose own node writes this key is not pre-empted by an identical value.
-        resolved = await self._resolve_question(event)
+        # `retrieve_node` already prefers `rephrased_question` — nothing ever
+        # wrote it. Seeding it activates a dormant seam rather than adding one,
+        # and only when it differs, so a graph whose own node writes that key is
+        # not pre-empted.
+        #
+        # But the state alone cannot carry it: the graph definition arrives on
+        # the event, so its schema is the *caller's*, and LangGraph drops any
+        # key the schema does not declare. A graph omitting
+        # `rephrased_question` would pay for the rewrite and silently discard
+        # it — worse than not rewriting at all. The closure below is the
+        # authority; the state seeding is for graphs that route it themselves.
         if resolved != event.message:
             initial_state["rephrased_question"] = resolved
 
