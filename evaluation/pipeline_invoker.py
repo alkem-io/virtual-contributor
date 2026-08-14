@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import logging
+import hashlib
+import json
 
 from core.config import BaseConfig
-from core.container import Container
+from core.container import Container, ContainerError
 from core.events.input import Input
 from core.ports.knowledge_store import KnowledgeStorePort
 from core.ports.llm import LLMPort
@@ -35,6 +37,7 @@ class PipelineInvoker:
         self._plugin = None
         self._tracing_store: TracingKnowledgeStore | None = None
         self._llm_adapter = None
+        self._composition_fingerprint = ""
 
     async def setup(self) -> None:
         """Initialize the pipeline: container, adapters, plugin."""
@@ -47,13 +50,16 @@ class PipelineInvoker:
 
         container = Container()
         _create_adapters(self._config, container)
-        if KnowledgeStorePort not in container._bindings:
+        try:
+            store = container.resolve(KnowledgeStorePort)
+        except ContainerError:
             container.register(KnowledgeStorePort, ChromaDBAdapter(
                 host=self._config.vector_db_host or "localhost",
                 port=self._config.vector_db_port,
             ))
-        self._llm_adapter = container._bindings.get(LLMPort)
-        self._tracing_store = TracingKnowledgeStore(container._bindings[KnowledgeStorePort])
+            store = container.resolve(KnowledgeStorePort)
+        self._llm_adapter = container.resolve(LLMPort)
+        self._tracing_store = TracingKnowledgeStore(store)
         container.register(KnowledgeStorePort, self._tracing_store)
 
         # Discover and instantiate plugin
@@ -71,6 +77,21 @@ class PipelineInvoker:
         if "context_observer" in signature.parameters:
             deps["context_observer"] = self._tracing_store.capture_generation_context
         self._plugin = plugin_class(**deps)
+        # Stable and redacted: this records all behavior-affecting evaluation
+        # composition without serializing credentials, endpoints, or payloads.
+        values = self._config.model_dump()
+        effective = {
+            key: value for key, value in values.items()
+            if any(token in key for token in (
+                "expert_", "hybrid_", "rerank_", "routing_", "query_rewrite",
+                "answering_", "embeddings_", "vector_db_distance",
+            )) and not any(secret in key for secret in ("key", "credentials", "endpoint"))
+        }
+        # A paired flat/on run is allowed to differ in this one experimental
+        # toggle. All other composition drift invalidates the comparison.
+        effective.pop("expert_hierarchical_retrieval_enabled", None)
+        serialized = json.dumps(effective, sort_keys=True, default=str, separators=(",", ":"))
+        self._composition_fingerprint = hashlib.sha256(serialized.encode()).hexdigest()
 
         await self._plugin.startup()
         logger.info("Pipeline initialized: plugin=%s", self._plugin_type)
@@ -126,6 +147,13 @@ class PipelineInvoker:
         if self._llm_adapter is None:
             raise RuntimeError("PipelineInvoker not set up. Call setup() first.")
         return self._llm_adapter._llm
+
+    @property
+    def composition_fingerprint(self) -> str:
+        """Redacted hash of the effective production composition."""
+        if not self._composition_fingerprint:
+            raise RuntimeError("PipelineInvoker not set up. Call setup() first.")
+        return self._composition_fingerprint
 
     async def shutdown(self) -> None:
         if self._plugin is not None:

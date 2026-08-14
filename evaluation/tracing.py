@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from core.ports.knowledge_store import KnowledgeStorePort, QueryResult
+from core.ports.knowledge_store import GetResult, KnowledgeStorePort, QueryResult
 
 
 class TracingKnowledgeStore:
@@ -46,6 +46,32 @@ class TracingKnowledgeStore:
 
     async def delete_collection(self, collection: str) -> None:
         await self._delegate.delete_collection(collection)
+
+    async def query_lexical(
+        self,
+        collection: str,
+        terms: list[str],
+        n_results: int = 10,
+        where: dict | None = None,
+    ) -> QueryResult:
+        """Forward lexical retrieval too; hybrid detection is structural."""
+        result = await self._delegate.query_lexical(
+            collection, terms, n_results, where=where,
+        )
+        self._captured.append(result)
+        return result
+
+    async def get(
+        self, collection: str, ids: list[str] | None = None,
+        where: dict | None = None, include: list[str] | None = None,
+    ) -> GetResult:
+        return await self._delegate.get(collection, ids, where, include)
+
+    async def delete(
+        self, collection: str, ids: list[str] | None = None,
+        where: dict | None = None,
+    ) -> None:
+        await self._delegate.delete(collection, ids, where)
 
     def get_retrieved_contexts(self) -> list[str]:
         """Extract all document texts captured during query() calls."""

@@ -20,6 +20,16 @@ def test_tracing_config_logging_is_safe(caplog) -> None:
     assert "secret" not in caplog.text
 
 
+def test_hierarchy_startup_log_reports_safe_enablement_and_cap(caplog) -> None:
+    caplog.set_level(logging.INFO)
+    _log_config(BaseConfig(
+        llm_base_url="http://local", expert_hierarchical_retrieval_enabled=True,
+        expert_hierarchy_max_branches=2,
+    ))
+    assert "EXPERT_HIERARCHICAL_RETRIEVAL_ENABLED=True" in caplog.text
+    assert "EXPERT_HIERARCHY_MAX_BRANCHES=2" in caplog.text
+
+
 def test_url_userinfo_is_masked() -> None:
     assert _mask_sensitive("llm_base_url", "https://user:secret@llm.internal/v1") == "https://***@llm.internal/v1"
     assert _mask_sensitive("tracing_otlp_endpoint", "https://token@collector.internal/v1/traces") == "https://***@collector.internal/v1/traces"

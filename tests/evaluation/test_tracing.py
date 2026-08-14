@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
 
-from core.ports.knowledge_store import QueryResult
+from core.ports.knowledge_store import GetResult, QueryResult
+from core.domain.hybrid_retrieval import retrieve
 from evaluation.tracing import TracingKnowledgeStore
 
 
@@ -47,3 +48,48 @@ async def test_final_detail_context_is_flat_result_when_only_one_query() -> None
     await tracing_store.query("knowledge", ["question"])
     tracing_store.capture_generation_context(["[Document 1]\ndetail"])
     assert tracing_store.get_final_detail_contexts() == ["[Document 1]\ndetail"]
+
+
+async def test_transparent_wrapper_forwards_hybrid_lexical_and_store_operations() -> None:
+    result = QueryResult([["lexical"]], [[{}]], [[None]], [["id"]])
+    delegate = MagicMock()
+    delegate.query_lexical = AsyncMock(return_value=result)
+    delegate.get = AsyncMock(return_value=GetResult(ids=["id"]))
+    delegate.delete = AsyncMock()
+    tracing_store = TracingKnowledgeStore(delegate)
+    where = {"subspaceId": {"$eq": "branch"}}
+
+    assert await tracing_store.query_lexical("c", ["needle"], 7, where=where) is result
+    assert await tracing_store.get("c", ["id"], where, ["documents"]) == GetResult(ids=["id"])
+    await tracing_store.delete("c", ["id"], where)
+
+    delegate.query_lexical.assert_awaited_once_with("c", ["needle"], 7, where=where)
+    delegate.get.assert_awaited_once_with("c", ["id"], where, ["documents"])
+    delegate.delete.assert_awaited_once_with("c", ["id"], where)
+    assert tracing_store.get_retrieved_contexts() == ["lexical"]
+
+
+async def test_hybrid_retrieval_uses_both_arms_through_evaluation_wrapper() -> None:
+    class HybridConfig:
+        hybrid_retrieval_enabled = True
+        hybrid_dense_weight = 1.0
+        hybrid_lexical_weight = 1.0
+        hybrid_rrf_k = 60
+        hybrid_max_terms = 8
+        hybrid_min_term_len = 3
+
+    delegate = MagicMock()
+    delegate.query = AsyncMock(return_value=QueryResult(
+        [["dense"]], [[{}]], [[0.1]], [["dense-id"]],
+    ))
+    delegate.query_lexical = AsyncMock(return_value=QueryResult(
+        [["lexical"]], [[{}]], [[None]], [["lexical-id"]],
+    ))
+    store = TracingKnowledgeStore(delegate)
+    predicate = {"subspaceId": {"$eq": "selected"}}
+
+    result = await retrieve(store, "c", "Needle wording", HybridConfig(), n_results=3, where=predicate)
+
+    assert set(result.ids[0]) == {"dense-id", "lexical-id"}
+    assert delegate.query.await_args.kwargs["where"] == predicate
+    assert delegate.query_lexical.await_args.kwargs["where"] == predicate

@@ -120,6 +120,13 @@ class TestComputeComparison:
         # Zero baseline → percentage_change should be 0.0 (no division error)
         assert report.deltas["faithfulness"].percentage_change == 0.0
 
+    def test_rejects_comparison_when_effective_composition_differs(self):
+        baseline, current = _make_run("baseline"), _make_run("current")
+        baseline.composition_fingerprint = "flat-and-on-compatible"
+        current.composition_fingerprint = "reranker-drift"
+        with pytest.raises(ValueError, match="fingerprints differ"):
+            compute_comparison(baseline, current)
+
     def test_summary_count(self):
         baseline = _make_run(
             "baseline",

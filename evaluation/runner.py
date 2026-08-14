@@ -187,11 +187,17 @@ class EvaluationRunner:
         total_duration = time.monotonic() - run_start
         aggregate = self._compute_aggregate(cases)
 
+        fingerprint = getattr(self._invoker, "composition_fingerprint", None)
+        # Test doubles and third-party invokers need not expose the optional
+        # protocol property; only persist an actual deterministic fingerprint.
+        if not isinstance(fingerprint, str):
+            fingerprint = None
         run = EvaluationRun(
             id=run_id,
             timestamp=ts.isoformat(),
             label=label,
             plugin_type=plugin_type,
+            composition_fingerprint=fingerprint,
             test_set_path=test_set_path,
             test_case_count=total,
             success_count=success_count,

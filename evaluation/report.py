@@ -53,6 +53,7 @@ class EvaluationRun(BaseModel):
     timestamp: str
     label: str | None = None
     plugin_type: str
+    composition_fingerprint: str | None = None
     test_set_path: str
     test_case_count: int
     success_count: int
@@ -158,6 +159,11 @@ def compute_comparison(
     baseline: EvaluationRun, current: EvaluationRun
 ) -> ComparisonReport:
     """Compute per-metric deltas between two runs."""
+    if (baseline.composition_fingerprint and current.composition_fingerprint
+            and baseline.composition_fingerprint != current.composition_fingerprint):
+        raise ValueError(
+            "Evaluation composition fingerprints differ; comparison is not a hierarchy-only experiment"
+        )
     deltas: dict[str, MetricDelta] = {}
 
     for name in METRIC_NAMES:
