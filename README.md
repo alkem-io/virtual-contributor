@@ -322,8 +322,14 @@ are structurally incapable of being flagged.
 
 **Honest limit.** It does not catch a fabrication built on thin-but-nonempty
 context. That needs either citation verification (which requires the model to
-be asked to cite — a separate change) or a judge. The port is shaped so either
-drops in without touching plugin code.
+be asked to cite — a separate change) or a judge.
+
+**Citation verification** is a string check against the context, so it can
+occupy this port directly. **A judge cannot.** `validate()` is synchronous by
+design and runs on the response path, so an implementation that calls a model
+would block the event loop for every message this worker is serving — not just
+its own. A judge belongs out of band: the port is the seam for recording the
+verdict, not for fetching it.
 
 ### Embeddings
 

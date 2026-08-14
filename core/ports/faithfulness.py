@@ -47,6 +47,10 @@ class FaithfulnessValidatorPort(Protocol):
         serving, not just this one. Anything needing a model or a network call
         does not belong behind this signature; it belongs in an out-of-band
         path. An async signature here would have invited exactly that.
+
+        Concretely: a citation verifier is a string check against the context
+        and fits here directly. An LLM judge does not — it belongs out of band,
+        with this port used to record the verdict rather than to fetch it.
         """
         """Return a verdict for ``answer`` given ``context``.
 
