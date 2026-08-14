@@ -62,7 +62,6 @@ def test_document_label_includes_available_kind_and_origin() -> None:
             "source": "legacy-source",
         },
     )
-
     assert "[Document 1 · Welcome · callout · origin: https://welcome.alkem.io]" in block
 
 
@@ -96,11 +95,28 @@ def test_metadata_label_values_are_bounded() -> None:
             "uri": "u" * 301,
         },
     )
-
     assert block == (
         f"[Document 1 · {'t' * 200} · {'k' * 200} · origin: {'u' * 300}]\n"
         "passage"
     )
+
+
+def test_metadata_values_use_utf8_byte_limits_without_splitting_codepoints() -> None:
+    block = render_document_block(1, "passage", {"title": "é" * 101})
+
+    title = block.split(" · ", 1)[1].split("]", 1)[0]
+    assert title == "é" * 100
+    assert len(title.encode("utf-8")) == 200
+
+
+def test_metadata_values_remove_control_and_format_characters() -> None:
+    block = render_document_block(
+        1, "passage", {"title": "safe\x00\u202e\u200b name"},
+    )
+
+    assert block == "[Document 1 · safe name]\npassage"
+    assert "\x00" not in block and "\u202e" not in block and "\u200b" not in block
+
 
 
 def test_context_budget_charges_rendered_label_utf8_bytes() -> None:

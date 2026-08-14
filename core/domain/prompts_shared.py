@@ -7,6 +7,7 @@ from drifting while leaving the platform-facing response envelope untouched.
 
 from __future__ import annotations
 
+import unicodedata
 from enum import Enum
 from typing import Mapping, Sequence
 
@@ -66,12 +67,38 @@ def _metadata_text(metadata: Mapping[str, object], key: str) -> str:
         return ""
     if isinstance(value, Enum):
         value = value.value
-    text = " ".join(str(value).split())
+    # Metadata becomes model-visible label text. Control and format codepoints
+    # include NUL, bidi overrides, and zero-width separators; remove them
+    # before collapsing whitespace and delimiter escaping.
+    characters: list[str] = []
+    for character in str(value):
+        category = unicodedata.category(character)
+        if category == "Cf":
+            continue
+        if category == "Cc":
+            if character.isspace():
+                characters.append(" ")
+            continue
+        characters.append(character)
+    text = "".join(characters)
+    text = " ".join(text.split())
     text = " ".join(text.translate(_LABEL_UNSAFE_CHARACTERS).split())
     if text.casefold() == "none":
         return ""
     limit = _METADATA_VALUE_LIMITS.get(key)
-    return text[:limit] if limit is not None else text
+    if limit is None:
+        return text
+    # Limits are protocol byte limits, not Python codepoint counts. Iterating
+    # codepoints gives a deterministic UTF-8 prefix without splitting one.
+    kept: list[str] = []
+    used = 0
+    for character in text:
+        size = len(character.encode("utf-8"))
+        if used + size > limit:
+            break
+        kept.append(character)
+        used += size
+    return "".join(kept)
 
 
 def render_document_block(
