@@ -7,7 +7,10 @@ on:
     types: [published]
 
 env:
-  IMAGE_NAME: alkemio/virtual-contributor
+  # ghcr namespace must be the OWNING ORG (alkem-io). `alkemio` is a different
+  # GitHub account, and GITHUB_TOKEN cannot push outside its own installation —
+  # that mismatch broke every develop image push from May to August 2026.
+  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
   build:
