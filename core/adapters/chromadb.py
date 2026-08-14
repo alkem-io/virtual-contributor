@@ -146,7 +146,12 @@ class ChromaDBAdapter:
                 ids=ids,
             )
 
-        return await self._retry(_query)
+        # Redacted: this call carries the member's own search terms in
+        # ``where_document``, and the store echoes the whole filter back in its
+        # validation errors. An unredacted retry warning would write those terms
+        # to the log, going around the redaction the fusion layer applies when
+        # the lexical arm fails.
+        return await self._retry(_query, redact_errors=True)
 
     async def ingest(
         self,
@@ -247,7 +252,16 @@ class ChromaDBAdapter:
         await self._retry(_delete_items)
 
     @staticmethod
-    async def _retry(fn, max_retries: int = MAX_RETRIES) -> Any:
+    async def _retry(
+        fn, max_retries: int = MAX_RETRIES, *, redact_errors: bool = False,
+    ) -> Any:
+        """Retry ``fn`` with exponential backoff.
+
+        ``redact_errors`` logs only the exception's type, for operations whose
+        arguments are derived from a member's query. The exception itself is
+        still raised unchanged — the caller decides what to do with it; only
+        what this adapter *writes to the log* is narrowed.
+        """
         last_exc: Exception | None = None
         for attempt in range(max_retries):
             try:
@@ -256,7 +270,11 @@ class ChromaDBAdapter:
                 last_exc = exc
                 if attempt < max_retries - 1:
                     delay = BASE_DELAY * (2 ** attempt)
-                    logger.warning("ChromaDB attempt %d failed, retrying: %s", attempt + 1, exc)
+                    detail = type(exc).__name__ if redact_errors else exc
+                    logger.warning(
+                        "ChromaDB attempt %d failed, retrying: %s",
+                        attempt + 1, detail,
+                    )
                     await asyncio.sleep(delay)
         if last_exc is not None:
             raise last_exc

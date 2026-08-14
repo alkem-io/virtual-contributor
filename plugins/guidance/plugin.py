@@ -79,6 +79,12 @@ class GuidancePlugin:
 
         # Query multiple collections in parallel
         n_results = self._n_results
+        # Which ordering applies below. Read once here, from the same flag the
+        # retrieval helper reads, so the ordering can never disagree with the
+        # shape of the results it is ordering.
+        hybrid_enabled = bool(
+            getattr(self._hybrid_config, "hybrid_retrieval_enabled", False)
+        )
 
         async def _query_collection(collection: str):
             # Rank within the collection is carried out of here: it is the
@@ -119,26 +125,39 @@ class GuidancePlugin:
         for docs, sources, ranks in query_results:
             ranked.extend(zip(ranks, docs, sources))
 
-        # Merge the collections by each passage's rank within its own
-        # collection, so the best of each competes with the best of the others.
-        # Ordering by score instead would sink every literally-matched passage
-        # below every scored one and then slice it away — discarding exactly
-        # what the lexical arm contributes.
-        #
-        # Within one rank, a passage with no score comes first. It was matched
-        # literally — a different kind of evidence, not weaker evidence — and
-        # it already earned its rank against the semantic hits inside its own
-        # collection. Ordering it behind its scored peers puts it just past
-        # wherever the list is truncated, which is how it was being discarded
-        # despite ranking well: three collections each contribute a rank-1, and
-        # the cut lands mid-tier.
-        ranked.sort(
-            key=lambda r: (
-                r[0],
-                r[2].score is not None,
-                -(r[2].score if r[2].score is not None else 0.0),
+        if hybrid_enabled:
+            # Merge the collections by each passage's rank within its own
+            # collection, so the best of each competes with the best of the
+            # others. Ordering by score instead would sink every
+            # literally-matched passage below every scored one and then slice
+            # it away — discarding exactly what the lexical arm contributes.
+            #
+            # Within one rank, a passage with no score comes first. It was
+            # matched literally — a different kind of evidence, not weaker
+            # evidence — and it already earned its rank against the semantic
+            # hits inside its own collection. Ordering it behind its scored
+            # peers puts it just past wherever the list is truncated, which is
+            # how it was being discarded despite ranking well: three
+            # collections each contribute a rank-1, and the cut lands mid-tier.
+            ranked.sort(
+                key=lambda r: (
+                    r[0],
+                    r[2].score is not None,
+                    -(r[2].score if r[2].score is not None else 0.0),
+                )
             )
-        )
+        else:
+            # Dense-only. Every passage has a comparable semantic score, so the
+            # collections merge on that score globally — which is what this
+            # code did before hybrid retrieval existed.
+            #
+            # Rank-first ordering must NOT be used here. It interleaves the
+            # collections round-robin, so a weak collection's best hit outranks
+            # a strong collection's second — and since the list is truncated to
+            # n_results straight after, that does not merely reorder the
+            # sources, it changes which ones survive. This path is reached
+            # whenever the feature is off, so it must be a true rollback.
+            ranked.sort(key=lambda r: -(r[2].score if r[2].score is not None else 0.0))
         all_pairs: list[tuple[str, Source]] = [(d, s) for _, d, s in ranked]
 
         # Filter by score threshold — discard low-relevance chunks. A passage

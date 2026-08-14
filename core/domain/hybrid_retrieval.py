@@ -67,6 +67,28 @@ async def retrieve(
             collection=collection, query_texts=[query], n_results=n_results,
         )
 
+    dense_weight = getattr(config, "hybrid_dense_weight", 1.0)
+    lexical_weight = getattr(config, "hybrid_lexical_weight", 1.0)
+
+    # A zero weight mutes an arm. Muted means *not consulted*: not queried, not
+    # fused, and — for the dense arm — not able to fail the request. Querying it
+    # anyway and then multiplying by zero is not the same thing, because RRF
+    # keeps a document that any arm returned. Its ids would still surface
+    # whenever fewer than ``n_results`` documents have a positive score, which
+    # is exactly the comparison-against-baseline this switch exists to make.
+    dense_muted = dense_weight == 0
+    lexical_muted = lexical_weight == 0
+
+    if lexical_muted:
+        # Nothing to fuse and nothing to ask: the capability check and term
+        # extraction below are both work done solely for an arm that is off.
+        logger.debug(
+            "Hybrid retrieval: lexical arm muted by zero weight, dense only"
+        )
+        return await store.query(
+            collection=collection, query_texts=[query], n_results=n_results,
+        )
+
     query_lexical = getattr(store, "query_lexical", None)
     if query_lexical is None:
         # A store predating this feature. Retrieval is still correct without a
@@ -94,6 +116,27 @@ async def retrieve(
         return await store.query(
             collection=collection, query_texts=[query], n_results=n_results,
         )
+
+    if dense_muted:
+        # The dense arm is off, so its failure cannot be "the primary arm
+        # failed" — there is no primary arm. Querying it to then discard the
+        # result would let a broken embedding backend fail a request that was
+        # deliberately configured not to use it. Configuration forbids both
+        # weights being zero, so the lexical arm is live here.
+        logger.debug(
+            "Hybrid retrieval: dense arm muted by zero weight, lexical only"
+        )
+        try:
+            return await query_lexical(
+                collection=collection, terms=terms, n_results=n_results,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Lexical retrieval failed for collection %s (%s) with the "
+                "dense arm muted; returning no results",
+                collection, type(exc).__name__,
+            )
+            return _empty()
 
     # One gather, so the lexical arm's latency overlaps the embedding arm's
     # rather than being added to it. Every answer pays the wall-clock cost of

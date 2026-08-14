@@ -10,6 +10,7 @@ import pytest
 
 from core.domain.hybrid_retrieval import retrieve
 from core.ports.knowledge_store import QueryResult
+from tests.conftest import MockKnowledgeStorePort
 
 
 @dataclass
@@ -31,7 +32,7 @@ def _result(ids: list[str], *, lexical: bool = False) -> QueryResult:
     )
 
 
-class _FakeStore:
+class _FakeStore(MockKnowledgeStorePort):
     def __init__(self, *, dense=None, lexical=None, dense_error=None,
                  lexical_error=None, delay=0.0):
         self._dense = dense if dense is not None else _result(["a", "b"])
@@ -39,8 +40,7 @@ class _FakeStore:
         self._dense_error = dense_error
         self._lexical_error = lexical_error
         self._delay = delay
-        self.query_calls: list[tuple] = []
-        self.lexical_calls: list[tuple] = []
+        super().__init__()
 
     async def query(self, collection, query_texts, n_results=10):
         self.query_calls.append((collection, query_texts, n_results))
@@ -138,3 +138,71 @@ class TestConcurrency:
         assert elapsed < delay * 1.8, (
             f"arms appear serialised: {elapsed:.3f}s for two {delay}s arms"
         )
+
+
+class TestMutedArms:
+    """A zero weight means an arm is off, not that it scores zero.
+
+    RRF keeps every document any arm returned, so a "muted" arm that is still
+    queried leaks its ids into the output whenever fewer than ``n_results``
+    documents carry a positive score — which is exactly the baseline
+    comparison a zero weight is set to make.
+    """
+
+    async def test_muted_lexical_arm_is_not_queried(self):
+        store = _FakeStore()
+        await retrieve(store, "c", "traefik ingress config",
+                       _Settings(hybrid_lexical_weight=0.0))
+        assert store.lexical_calls == []
+
+    async def test_muted_lexical_results_never_reach_the_output(self):
+        store = _FakeStore(dense=_result(["a"]),
+                           lexical=_result(["lex"], lexical=True))
+        out = await retrieve(store, "c", "traefik ingress config",
+                             _Settings(hybrid_lexical_weight=0.0), n_results=5)
+        assert out.ids[0] == ["a"]
+        assert "lex" not in out.ids[0]
+
+    async def test_muted_dense_arm_is_not_queried(self):
+        store = _FakeStore()
+        await retrieve(store, "c", "traefik ingress config",
+                       _Settings(hybrid_dense_weight=0.0))
+        assert store.query_calls == []
+
+    async def test_muted_dense_results_never_reach_the_output(self):
+        store = _FakeStore(dense=_result(["a"]),
+                           lexical=_result(["lex"], lexical=True))
+        out = await retrieve(store, "c", "traefik ingress config",
+                             _Settings(hybrid_dense_weight=0.0), n_results=5)
+        assert out.ids[0] == ["lex"]
+        assert "a" not in out.ids[0]
+
+    async def test_a_muted_dense_arm_cannot_fail_the_request(self):
+        """It was configured out of the request; it must not break it."""
+        store = _FakeStore(dense_error=RuntimeError("embeddings backend down"),
+                           lexical=_result(["lex"], lexical=True))
+        out = await retrieve(store, "c", "traefik ingress config",
+                             _Settings(hybrid_dense_weight=0.0))
+        assert out.ids[0] == ["lex"]
+
+    async def test_a_muted_lexical_arm_skips_term_extraction(self):
+        """No store lacks the capability badly enough to matter when it's off."""
+        class _NoLexical:
+            def __init__(self):
+                self.query_calls = []
+
+            async def query(self, collection, query_texts, n_results=10):
+                self.query_calls.append((collection, query_texts, n_results))
+                return _result(["a"])
+
+        store = _NoLexical()
+        out = await retrieve(store, "c", "traefik ingress config",
+                             _Settings(hybrid_lexical_weight=0.0))
+        assert out.ids[0] == ["a"]
+        assert len(store.query_calls) == 1
+
+    async def test_lexical_failure_with_dense_muted_yields_no_results(self):
+        store = _FakeStore(lexical_error=RuntimeError("store unavailable"))
+        out = await retrieve(store, "c", "traefik ingress config",
+                             _Settings(hybrid_dense_weight=0.0))
+        assert out.ids[0] == []
