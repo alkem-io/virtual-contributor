@@ -11,6 +11,7 @@ from plugins.generic.prompts import condenser_system_prompt
 from core.domain.query_rewrite import (
     DEFAULT_MAX_EXPANSION_RATIO,
     RewritePolicy,
+    recent_history,
     rewrite_query,
     should_rewrite,
 )
@@ -61,7 +62,7 @@ class GenericPlugin:
 
         # Resolve the question against history when that is worth a call.
         if should_rewrite(question, event.history, self._rewrite_policy):
-            history_text = _history_as_text(event.history)
+            history_text = _history_as_text(recent_history(event.history))
             condenser_messages = [
                 {"role": "system", "content": condenser_system_prompt},
                 {"role": "human", "content": f"History:\n{history_text}\n\nLatest question: {question}"},

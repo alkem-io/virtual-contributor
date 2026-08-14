@@ -11,6 +11,7 @@ from core.ports.knowledge_store import KnowledgeStorePort, QueryResult
 from core.domain.query_rewrite import (
     DEFAULT_MAX_EXPANSION_RATIO,
     RewritePolicy,
+    recent_history,
     rewrite_query,
     should_rewrite,
 )
@@ -235,7 +236,9 @@ class ExpertPlugin:
             return event.message
         from plugins.guidance.prompts import condense_prompt
 
-        history_text = "\n".join(f"{h.role}: {h.content}" for h in event.history or [])
+        history_text = "\n".join(
+            f"{h.role}: {h.content}" for h in recent_history(event.history)
+        )
         return await rewrite_query(
             self._llm,
             [{

@@ -14,8 +14,10 @@ import pytest
 
 from core.domain.query_rewrite import (
     DEFAULT_MAX_EXPANSION_RATIO,
+    DEFAULT_MAX_HISTORY_TURNS,
     MIN_REWRITE_ALLOWANCE,
     RewritePolicy,
+    recent_history,
     rewrite_query,
     should_rewrite,
     validate_rewrite,
@@ -207,3 +209,35 @@ class TestTheFloorProtectsShortAnaphors:
         at_floor = "x" * MIN_REWRITE_ALLOWANCE
         assert validate_rewrite(at_floor, "hi?") == at_floor
         assert validate_rewrite("x" * (MIN_REWRITE_ALLOWANCE + 1), "hi?") == "hi?"
+
+
+class TestHistoryIsBounded:
+    """The condense prompt embedded the *whole* conversation, unbounded.
+
+    `history_length` has existed in config since before this feature and is
+    read by no code at all. The member supplies the history, so the size of
+    that third-party prompt was theirs to choose: 5 000 turns of 500 chars
+    built a 2.5 MB prompt, sent on every request to a metered API.
+    """
+
+    def test_a_long_history_is_truncated(self) -> None:
+        assert len(recent_history(list(range(5_000)))) == DEFAULT_MAX_HISTORY_TURNS
+
+    def test_the_most_recent_turns_are_the_ones_kept(self) -> None:
+        """A follow-up refers to what was just said, not to turn one."""
+        assert recent_history(list(range(30)), 5) == [25, 26, 27, 28, 29]
+
+    def test_a_short_history_is_untouched(self) -> None:
+        assert recent_history([1, 2, 3]) == [1, 2, 3]
+
+    @pytest.mark.parametrize("bad", [None, [], 12_345, object()])
+    def test_a_malformed_history_yields_nothing_rather_than_raising(
+        self, bad: object
+    ) -> None:
+        """A malformed history must not be the reason a request fails."""
+        assert recent_history(bad) == []
+
+    def test_zero_or_negative_disables_the_bound(self) -> None:
+        """An operator may opt out; the default is what protects them."""
+        assert recent_history([1, 2, 3], 0) == [1, 2, 3]
+        assert recent_history([1, 2, 3], -1) == [1, 2, 3]

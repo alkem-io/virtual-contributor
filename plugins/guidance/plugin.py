@@ -14,6 +14,7 @@ from core.ports.knowledge_store import KnowledgeStorePort
 from core.domain.query_rewrite import (
     DEFAULT_MAX_EXPANSION_RATIO,
     RewritePolicy,
+    recent_history,
     rewrite_query,
     should_rewrite,
 )
@@ -76,7 +77,7 @@ class GuidancePlugin:
         if should_rewrite(question, event.history, self._rewrite_policy):
             from plugins.guidance.prompts import condense_prompt
             history_text = "\n".join(
-                f"{h.role}: {h.content}" for h in event.history
+                f"{h.role}: {h.content}" for h in recent_history(event.history)
             )
             question = await rewrite_query(
                 self._llm,

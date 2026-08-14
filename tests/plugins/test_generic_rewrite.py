@@ -140,3 +140,32 @@ class TestFlagDisabledMatchesDevelop:
         llm = CountingLLM()
         await GenericPlugin(llm=llm).handle(make_input(message="What is a space?"))
         assert llm.n == 1
+
+
+class TestTheCondensePromptIsBounded:
+    async def test_an_enormous_history_does_not_build_an_enormous_prompt(self) -> None:
+        """Measured before the bound: 5 000 turns produced a 2.5 MB prompt sent
+        to a metered third-party API on every single request."""
+
+        class _Capturing(MockLLMPort):
+            def __init__(self) -> None:
+                super().__init__(response="an answer")
+                self.sizes: list[int] = []
+
+            async def invoke(self, messages, **kw):  # type: ignore[override]
+                self.sizes.append(
+                    sum(len(str(m.get("content", ""))) for m in messages)
+                )
+                return "resolved"
+
+        llm = _Capturing()
+        history = [
+            {"role": "human" if i % 2 == 0 else "assistant", "content": "x" * 500}
+            for i in range(5_000)
+        ]
+        await GenericPlugin(llm=llm).handle(
+            make_input(message="and the other one?", history=history)
+        )
+        assert llm.sizes[0] < 50_000, (
+            f"condense prompt was {llm.sizes[0]:,} chars — history is unbounded"
+        )

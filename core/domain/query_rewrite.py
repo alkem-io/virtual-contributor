@@ -60,6 +60,36 @@ DEFAULT_MAX_EXPANSION_RATIO = 8.0
 #: which started explaining instead of rewriting is still caught.
 MIN_REWRITE_ALLOWANCE = 120
 
+#: How many trailing conversation turns the rewrite may see.
+#:
+#: The condense prompt embeds the *whole* history, and nothing bounded it —
+#: `history_length` has existed in config since before this feature and is read
+#: by no code at all. Measured: 5 000 turns of 500 chars builds a 2.5 MB prompt
+#: and sends it to a metered third-party API on every request. The member
+#: supplies the history, so the ceiling is theirs, not ours.
+#:
+#: The most recent turns are the ones a follow-up refers to, so the tail is
+#: what is kept. Matches the existing `ExpertConfig.history_length` default.
+DEFAULT_MAX_HISTORY_TURNS = 20
+
+
+def recent_history(history: object, max_turns: int = DEFAULT_MAX_HISTORY_TURNS) -> list:
+    """The trailing `max_turns` of a conversation, for prompt construction.
+
+    Returns a list so callers can format it as they already do; a non-sequence
+    or empty history yields an empty list rather than raising, because a
+    malformed history must not be the reason a request fails.
+    """
+    if not history:
+        return []
+    try:
+        items = list(history)
+    except TypeError:
+        return []
+    if max_turns <= 0:
+        return items
+    return items[-max_turns:]
+
 
 @runtime_checkable
 class RewritePolicy(Protocol):
