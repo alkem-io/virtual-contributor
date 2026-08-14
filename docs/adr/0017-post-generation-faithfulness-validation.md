@@ -75,6 +75,11 @@ flag, so a gap there costs one spurious log line — never a wrongly-approved an
   nothing for half the traffic.
 - **The expert graph path returns `sources=[]` by design.** Keying the check off `Response.sources`
   would have flagged 100% of graph-path answers. It keys off the context string.
+- **The graph's state schema belongs to the caller.** `event.prompt_graph` arrives on the wire, and
+  LangGraph drops any key the schema does not declare. Reading `combined_knowledge_docs` back from
+  the final state collapsed "this graph never retrieved" (must not be validated) into "this graph
+  retrieved, found nothing, and the schema dropped the evidence" (the whole point). Validation keys
+  off a closure the retrieve node writes to instead — that code knows which case it is in.
 
 ### Flagging is internal
 
@@ -94,7 +99,17 @@ member-facing decision informed rather than speculative.
   judge. The port exists so either drops in without touching plugin code — which is the reason to
   ship the seam now rather than wait for #109.
 - Hedge detection is English-only. The failure mode is one spurious internal log line, never a
-  member-visible change.
-- No egress on this path, enforced by a transitive import scan over *every* implementation of the
-  port, a socket-poisoned runtime test, and a manifest guard. That is a claim about the validation
+  member-visible change. Adversarial review measured 13/13 spurious flags on apologetic declines
+  ("I'm sorry, I don't have that information") — every one the model refusing correctly, which is the
+  worst error this check can make. Now 0/13, with all three sampled fabrications still flagged.
+  Contracted negations needed matching as whole words: `\bn't\b` cannot match inside `don't`.
+- **Reason codes are an allow-list, not free text.** `reason` is `str` on the port, so a substituted
+  validator could build it from the member's answer; logs reach central logging, readable by log
+  access rather than by space membership. Unknown codes become `unknown`, exceptions log only their
+  type, and `verdict.detail` is never logged.
+- No egress on this path, enforced by an **allow-list** transitive import scan over *every*
+  implementation of the port found anywhere in the repo, a socket-poisoned runtime test, and a
+  manifest guard. Review bypassed the earlier deny-list twice: `langchain_openai` (this repo's own
+  route to Mistral) was not on it and no plausible deny-list would have contained it, and a validator
+  in `plugins/` was invisible to a `core/`-only sweep. Both replayed and confirmed failing. That is a claim about the validation
   step, not about the service: generation already sends the same answer and context to a third party.
