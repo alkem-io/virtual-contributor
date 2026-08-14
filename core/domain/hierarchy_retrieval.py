@@ -83,9 +83,11 @@ def select_branches(
             continue
         selected.append(branch)
         seen.add(branch)
-        if len(selected) >= max_branches:
-            break
-    return selected
+    # Root IDs occur on each descendant and cannot safely scope a detail
+    # query. Canonicalize before capping: otherwise three high-ranked roots
+    # hide a later precise subspace and spuriously force flat fallback.
+    subspaces = [branch for branch in selected if branch.field == "subspaceId"]
+    return (subspaces if subspaces else selected)[:max_branches]
 
 
 def scoped_detail_where(branches: list[BranchRef]) -> dict | None:

@@ -18,6 +18,26 @@ from evaluation.tracing import TracingKnowledgeStore
 logger = logging.getLogger(__name__)
 
 
+def effective_composition_fingerprint(config: BaseConfig) -> str:
+    """Hash redacted behavior-affecting composition for paired evaluation.
+
+    The hierarchy retrieval toggle is the controlled experiment variable and
+    deliberately does not alter the paired-run fingerprint. Display-name
+    rendering remains included because it changes model-visible context.
+    """
+    values = config.model_dump()
+    effective = {
+        key: value for key, value in values.items()
+        if any(token in key for token in (
+            "expert_", "hybrid_", "rerank_", "routing_", "query_rewrite",
+            "answering_", "embeddings_", "vector_db_distance",
+        )) and not any(secret in key for secret in ("key", "credentials", "endpoint"))
+    }
+    effective.pop("expert_hierarchical_retrieval_enabled", None)
+    serialized = json.dumps(effective, sort_keys=True, default=str, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode()).hexdigest()
+
+
 class PipelineInvoker:
     """Invokes the pipeline in-process for evaluation.
 
@@ -77,21 +97,7 @@ class PipelineInvoker:
         if "context_observer" in signature.parameters:
             deps["context_observer"] = self._tracing_store.capture_generation_context
         self._plugin = plugin_class(**deps)
-        # Stable and redacted: this records all behavior-affecting evaluation
-        # composition without serializing credentials, endpoints, or payloads.
-        values = self._config.model_dump()
-        effective = {
-            key: value for key, value in values.items()
-            if any(token in key for token in (
-                "expert_", "hybrid_", "rerank_", "routing_", "query_rewrite",
-                "answering_", "embeddings_", "vector_db_distance",
-            )) and not any(secret in key for secret in ("key", "credentials", "endpoint"))
-        }
-        # A paired flat/on run is allowed to differ in this one experimental
-        # toggle. All other composition drift invalidates the comparison.
-        effective.pop("expert_hierarchical_retrieval_enabled", None)
-        serialized = json.dumps(effective, sort_keys=True, default=str, separators=(",", ":"))
-        self._composition_fingerprint = hashlib.sha256(serialized.encode()).hexdigest()
+        self._composition_fingerprint = effective_composition_fingerprint(self._config)
 
         await self._plugin.startup()
         logger.info("Pipeline initialized: plugin=%s", self._plugin_type)

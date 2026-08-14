@@ -61,12 +61,22 @@ def test_branch_skips_missing_distances_and_threshold_failures() -> None:
 
 def test_branch_deduplicates_in_relevance_order() -> None:
     result = _result([{"spaceId": "a"}, {"spaceId": "a"}, {"subspaceId": "b"}], [0.1, 0.2, 0.3])
-    assert select_branches(result, score_threshold=0.3, max_branches=3) == [BranchRef("spaceId", "a"), BranchRef("subspaceId", "b")]
+    assert select_branches(result, score_threshold=0.3, max_branches=3) == [BranchRef("subspaceId", "b")]
 
 
 def test_branch_caps_at_three() -> None:
     result = _result([{"spaceId": str(i)} for i in range(4)], [0.1] * 4)
     assert len(select_branches(result, score_threshold=0.3, max_branches=3)) == 3
+
+
+def test_branch_canonicalizes_specific_subspaces_before_cap() -> None:
+    result = _result(
+        [{"spaceId": "r1"}, {"spaceId": "r2"}, {"spaceId": "r3"}, {"spaceId": "root", "subspaceId": "precise"}],
+        [0.1, 0.1, 0.1, 0.1],
+    )
+    assert select_branches(result, score_threshold=0.3, max_branches=3) == [
+        BranchRef("subspaceId", "precise"),
+    ]
 
 
 def test_scoped_single_branch_is_not_store_invalid_or() -> None:

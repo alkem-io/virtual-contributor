@@ -220,6 +220,7 @@ def _log_config(config: BaseConfig, plugin_class: type | None = None) -> None:
         "expert_min_score",
         "expert_hierarchical_retrieval_enabled",
         "expert_hierarchy_max_branches",
+        "expert_hierarchy_display_names_enabled",
         "guidance_n_results",
         "guidance_min_score",
         "max_context_chars",
@@ -327,6 +328,10 @@ def _inject_plugin_config(
         )
     if "hierarchy_max_branches" in sig.parameters:
         deps["hierarchy_max_branches"] = config.expert_hierarchy_max_branches
+    if "hierarchy_display_names_enabled" in sig.parameters:
+        deps["hierarchy_display_names_enabled"] = (
+            config.expert_hierarchy_display_names_enabled
+        )
 
     # Inject summarization configuration for ingest plugins
     if "summarize_llm" in sig.parameters:

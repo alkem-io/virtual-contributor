@@ -44,8 +44,10 @@ the current single flat retrieval call. When explicitly enabled, Stage 1 makes
 a dense query over `overview`, `summary`, and legacy body-of-knowledge summary
 entries; Stage 2 applies the current hybrid/rerank/threshold/top-K/budget path
 to detail matching one to three selected `spaceId`/nearest `subspaceId` keys.
-The rendered `[Document N]` blocks retain their numbering and add sanitized
-Space/Subspace provenance.
+`EXPERT_HIERARCHY_DISPLAY_NAMES_ENABLED=false` by default, so scoped retrieval
+does not expose Space/Subspace names to the answering provider. Only explicit
+true adds sanitized provenance, and it requires the RG-05P human approval;
+this code does not grant or imply that approval.
 
 The stored `subspaceId` is only the nearest subspace; it is not an ancestor
 chain, so this feature never claims subtree expansion. No usable route, an

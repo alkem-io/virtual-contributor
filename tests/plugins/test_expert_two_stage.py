@@ -94,6 +94,18 @@ async def test_graph_hierarchy_context_uses_scoped_detail_result() -> None:
     assert store.query_calls[-1][3]["$and"][-1] == {"subspaceId": {"$eq": "a-sub"}}
 
 
+async def test_stage_one_roots_do_not_hide_later_specific_subspace_route() -> None:
+    store = _store()
+    roots = [
+        {"id": f"root-{n}", "document": "root overview", "metadata": {"embeddingType": "overview", "spaceId": f"root-{n}"}}
+        for n in range(3)
+    ]
+    store.collections["c-knowledge"] = roots + _entries()
+    response = await _plugin(store).handle(_event())  # type: ignore[arg-type]
+    assert store.query_calls[-1][3]["$and"][-1] == {"subspaceId": {"$eq": "a-sub"}}
+    assert [source.source for source in response.sources] == ["a-1", "a-2"]
+
+
 @dataclass
 class _Hybrid:
     hybrid_retrieval_enabled: bool = True
@@ -129,7 +141,10 @@ async def test_pipeline_order_applies_hierarchy_after_detail_selection() -> None
 async def test_hierarchy_context_and_row_alignment() -> None:
     store = _store()
     llm = MockLLMPort(response="answer")
-    plugin = ExpertPlugin(llm, store, hierarchical_retrieval_enabled=True)
+    plugin = ExpertPlugin(
+        llm, store, hierarchical_retrieval_enabled=True,
+        hierarchy_display_names_enabled=True,
+    )
     response = await plugin.handle(_event())  # type: ignore[arg-type]
     prompt = llm.calls[-1][0]["content"]
     assert "Space: Alpha" in prompt
@@ -146,6 +161,27 @@ async def test_simple_outbound_context_never_contains_raw_hierarchy_ids_without_
     prompt = llm.calls[-1][0]["content"]
     assert "a-sub" not in prompt
     assert "route-a" not in prompt
+
+
+async def test_hierarchy_display_names_are_default_off_and_explicit_on() -> None:
+    store, llm = _store(), MockLLMPort(response="answer")
+    await ExpertPlugin(llm, store, hierarchical_retrieval_enabled=True).handle(_event())  # type: ignore[arg-type]
+    assert "Space: Alpha" not in llm.calls[-1][0]["content"]
+    store, llm = _store(), MockLLMPort(response="answer")
+    await ExpertPlugin(
+        llm, store, hierarchical_retrieval_enabled=True,
+        hierarchy_display_names_enabled=True,
+    ).handle(_event())  # type: ignore[arg-type]
+    assert "Space: Alpha" in llm.calls[-1][0]["content"]
+
+
+async def test_graph_hierarchy_display_names_are_explicit_and_ids_remain_hidden() -> None:
+    store, observed = _store(), []
+    result = await _graph_retrieve(_plugin(
+        store, hierarchy_display_names_enabled=True, context_observer=observed.append,
+    ))
+    assert "Space: Alpha" in result["combined_knowledge_docs"]
+    assert "a-sub" not in result["combined_knowledge_docs"]
 
 
 async def test_row_alignment_preserves_source_order_with_hierarchy() -> None:
@@ -271,6 +307,23 @@ async def test_root_only_route_uses_flat_fallback_without_mixed_root_clause() ->
             {"type": {"$ne": "bodyOfKnowledgeSummary"}},
         ],
     }
+
+
+async def test_repeated_unusable_hierarchy_requests_do_not_cache_capability() -> None:
+    store = _store()
+    store.collections["c-knowledge"][0]["metadata"].pop("subspaceId")
+    plugin = _plugin(store)
+    await plugin.handle(_event())  # type: ignore[arg-type]
+    await plugin.handle(_event())  # type: ignore[arg-type]
+    assert len(store.query_calls) == 4  # Stage 1 then flat for each request
+
+
+async def test_repeated_usable_hierarchy_requests_do_not_cache_capability() -> None:
+    store = _store()
+    plugin = _plugin(store)
+    await plugin.handle(_event())  # type: ignore[arg-type]
+    await plugin.handle(_event())  # type: ignore[arg-type]
+    assert len(store.query_calls) == 4
 
 
 async def test_fallback_empty_scoped_detail_uses_flat_once() -> None:

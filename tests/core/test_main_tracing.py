@@ -24,10 +24,11 @@ def test_hierarchy_startup_log_reports_safe_enablement_and_cap(caplog) -> None:
     caplog.set_level(logging.INFO)
     _log_config(BaseConfig(
         llm_base_url="http://local", expert_hierarchical_retrieval_enabled=True,
-        expert_hierarchy_max_branches=2,
+        expert_hierarchy_max_branches=2, expert_hierarchy_display_names_enabled=False,
     ))
     assert "EXPERT_HIERARCHICAL_RETRIEVAL_ENABLED=True" in caplog.text
     assert "EXPERT_HIERARCHY_MAX_BRANCHES=2" in caplog.text
+    assert "EXPERT_HIERARCHY_DISPLAY_NAMES_ENABLED=False" in caplog.text
 
 
 def test_url_userinfo_is_masked() -> None:

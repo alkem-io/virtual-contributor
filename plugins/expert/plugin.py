@@ -193,6 +193,7 @@ class ExpertPlugin:
         max_history_chars: int = DEFAULT_MAX_HISTORY_CHARS,
         hierarchical_retrieval_enabled: bool = False,
         hierarchy_max_branches: int = 3,
+        hierarchy_display_names_enabled: bool = False,
         context_observer: Callable[[list[str]], None] | None = None,
     ) -> None:
         self._llm = llm
@@ -224,6 +225,7 @@ class ExpertPlugin:
         self._max_history_chars = max_history_chars
         self._hierarchical_retrieval_enabled = hierarchical_retrieval_enabled
         self._hierarchy_max_branches = hierarchy_max_branches
+        self._hierarchy_display_names_enabled = hierarchy_display_names_enabled
         self._context_observer = context_observer
 
     @property
@@ -538,7 +540,8 @@ class ExpertPlugin:
             return await flat()
         try:
             docs, result, initial_count = await self._retrieve_pipeline(
-                collection, query, profile, where=predicate, hierarchy=True,
+                collection, query, profile, where=predicate,
+                hierarchy=self._hierarchy_display_names_enabled,
             )
             # A short but non-empty selected branch is an intended precision
             # result.  Only absence of usable detail re-enters flat retrieval.

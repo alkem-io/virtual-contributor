@@ -8,7 +8,7 @@ from core.container import Container
 from core.ports.knowledge_store import QueryResult
 from core.ports.knowledge_store import KnowledgeStorePort
 from core.ports.llm import LLMPort
-from evaluation.pipeline_invoker import PipelineInvoker
+from evaluation.pipeline_invoker import PipelineInvoker, effective_composition_fingerprint
 from evaluation.tracing import TracingKnowledgeStore
 
 
@@ -53,9 +53,10 @@ async def test_invoker_wires_hierarchy_settings_to_expert(monkeypatch) -> None:
             pass
 
     class Plugin:
-        def __init__(self, *, hierarchical_retrieval_enabled=False, hierarchy_max_branches=0) -> None:
+        def __init__(self, *, hierarchical_retrieval_enabled=False, hierarchy_max_branches=0, hierarchy_display_names_enabled=False) -> None:
             captured.update(
                 enabled=hierarchical_retrieval_enabled, branches=hierarchy_max_branches,
+                display_names=hierarchy_display_names_enabled,
             )
 
         async def startup(self) -> None:
@@ -67,11 +68,11 @@ async def test_invoker_wires_hierarchy_settings_to_expert(monkeypatch) -> None:
     invoker = PipelineInvoker(
         "expert", BaseConfig(
             llm_base_url="http://local", expert_hierarchical_retrieval_enabled=True,
-            expert_hierarchy_max_branches=2,
+            expert_hierarchy_max_branches=2, expert_hierarchy_display_names_enabled=True,
         ),
     )
     await invoker.setup()
-    assert captured == {"enabled": True, "branches": 2}
+    assert captured == {"enabled": True, "branches": 2, "display_names": True}
 
 
 async def test_invoker_nondefault_production_composition_and_fingerprint(monkeypatch) -> None:
@@ -125,3 +126,20 @@ async def test_invoker_nondefault_production_composition_and_fingerprint(monkeyp
     assert isinstance(captured["knowledge_store"], TracingKnowledgeStore)
     fingerprint = invoker.composition_fingerprint
     assert len(fingerprint) == 64 and fingerprint == invoker.composition_fingerprint
+
+
+def test_effective_composition_fingerprint_is_stable_and_redacted() -> None:
+    shared = dict(
+        plugin_type="expert", llm_base_url="http://local", expert_min_score=0.1,
+        hybrid_retrieval_enabled=True, rerank_enabled=True, rerank_top_k=4,
+        embeddings_model_name="approved-model", vector_db_distance_fn="l2",
+    )
+    flat = BaseConfig(**shared)
+    hierarchy = BaseConfig(**shared, expert_hierarchical_retrieval_enabled=True)
+    assert effective_composition_fingerprint(flat) == effective_composition_fingerprint(hierarchy)
+    assert effective_composition_fingerprint(flat) == effective_composition_fingerprint(BaseConfig(**shared))
+    assert effective_composition_fingerprint(flat) != effective_composition_fingerprint(
+        BaseConfig(**(shared | {"expert_min_score": 0.2}))
+    )
+    secret_changed = BaseConfig(**shared, embeddings_endpoint="https://secret.invalid", embeddings_api_key="not-in-hash")
+    assert effective_composition_fingerprint(flat) == effective_composition_fingerprint(secret_changed)
