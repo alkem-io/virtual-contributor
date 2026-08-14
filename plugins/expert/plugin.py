@@ -26,6 +26,15 @@ from core.ports.knowledge_store import KnowledgeStorePort, QueryResult
 from core.ports.reranker import RerankerPort
 from core.domain.routing import DEFAULT_ROUTING_TABLE, RetrievalProfile
 from core.ports.query_router import QueryRouterPort, RouteClass, RoutingDecision
+from core.domain.query_rewrite import (
+    DEFAULT_MAX_EXPANSION_RATIO,
+    DEFAULT_MAX_HISTORY_CHARS,
+    DEFAULT_MAX_HISTORY_TURNS,
+    RewritePolicy,
+    recent_history,
+    rewrite_query,
+    should_rewrite,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -171,6 +180,10 @@ class ExpertPlugin:
         query_router: QueryRouterPort | None = None,
         routing_table: dict | None = None,
         faithfulness_validator: FaithfulnessValidatorPort | None = None,
+        rewrite_policy: RewritePolicy | None = None,
+        max_expansion_ratio: float = DEFAULT_MAX_EXPANSION_RATIO,
+        max_history_turns: int = DEFAULT_MAX_HISTORY_TURNS,
+        max_history_chars: int = DEFAULT_MAX_HISTORY_CHARS,
     ) -> None:
         self._llm = llm
         self._knowledge_store = knowledge_store
@@ -194,6 +207,11 @@ class ExpertPlugin:
         self._routing_table = routing_table or DEFAULT_ROUTING_TABLE
         # Absent unless validation is enabled. Its absence is the off switch.
         self._faithfulness_validator = faithfulness_validator
+        # None means "never skip" — see GuidancePlugin.
+        self._rewrite_policy = rewrite_policy
+        self._max_expansion_ratio = max_expansion_ratio
+        self._max_history_turns = max_history_turns
+        self._max_history_chars = max_history_chars
 
     @property
     def _retrieval_n_results(self) -> int:
@@ -440,6 +458,9 @@ class ExpertPlugin:
 
         graph = PromptGraph.from_definition(event.prompt_graph)
 
+        # Resolved before the graph runs so `retrieve_node` can close over it.
+        resolved = await self._resolve_question(event)
+
         # Create retrieve special node
         # NOT captured from the profile resolved in handle(). The graph may
         # rephrase before retrieving — "yes" after "Shall I list the
@@ -468,8 +489,20 @@ class ExpertPlugin:
             from opentelemetry.trace import SpanKind
             from core.tracing import mark_empty_retrieval, optional_span
 
+            # `resolved` sits between the graph's own rephrase and the raw
+            # question, because it survives a caller schema that drops the key.
+            # A graph node writing its own `rephrased_question` still wins.
+            #
+            # An *empty* `rephrased_question` falls through to `resolved`. That
+            # is deliberate: a field the schema declares but no node writes
+            # reads as "" too, and that — not a deliberate suppression — is the
+            # common case. The two are indistinguishable through `state.get`,
+            # and there was no rewriting on develop for a graph to suppress, so
+            # treating "" as "nothing was written" is the reading that matches
+            # every graph that exists today.
             query = (
                 state.get("rephrased_question")
+                or resolved
                 or state.get("current_question")
                 or event.message
             )
@@ -533,7 +566,13 @@ class ExpertPlugin:
         # Build messages list and conversation text from event history +
         # the current user message.  The graph's `check_input` node expects
         # a formatted `conversation` string of ``role:\ncontent`` turns.
-        history = list(event.history or [])
+        # Bounded for the same reason the rewrite prompt is: the member
+        # supplies the history, and every turn here is embedded in
+        # `conversation` and `messages`, both of which go straight to the
+        # graph's LLM nodes. Measured unbounded: 5 000 turns built a 2.5 MB
+        # conversation string — larger than the rewrite prompt this feature
+        # already bounded, so bounding only that one was incoherent.
+        history = recent_history(event.history, self._max_history_turns, self._max_history_chars)
         messages = [
             {
                 "role": h.role.value if hasattr(h.role, "value") else str(h.role),
@@ -554,6 +593,19 @@ class ExpertPlugin:
             "description": event.description,
             "display_name": event.display_name,
         }
+        # `retrieve_node` already prefers `rephrased_question` — nothing ever
+        # wrote it. Seeding it activates a dormant seam rather than adding one,
+        # and only when it differs, so a graph whose own node writes that key is
+        # not pre-empted.
+        #
+        # But the state alone cannot carry it: the graph definition arrives on
+        # the event, so its schema is the *caller's*, and LangGraph drops any
+        # key the schema does not declare. A graph omitting
+        # `rephrased_question` would pay for the rewrite and silently discard
+        # it — worse than not rewriting at all. The closure below is the
+        # authority; the state seeding is for graphs that route it themselves.
+        if resolved != event.message:
+            initial_state["rephrased_question"] = resolved
 
         final_state = await graph.invoke(initial_state)
 
@@ -575,6 +627,33 @@ class ExpertPlugin:
             original_result=final_state.get("original_result"),
         )
 
+    async def _resolve_question(self, event: Input) -> str:
+        """Resolve a follow-up against its history before retrieval.
+
+        Expert is the one plugin that genuinely matched the story's premise:
+        it sent the raw message to the vector store, so "and the other one?"
+        was searched for literally. Guidance's condense prompt is reused rather
+        than a new one invented — its wording is plugin-neutral.
+        """
+        if not should_rewrite(event.message, event.history, self._rewrite_policy):
+            return event.message
+        from plugins.guidance.prompts import condense_prompt
+
+        history_text = "\n".join(
+            f"{h.role}: {h.content}" for h in recent_history(event.history, self._max_history_turns, self._max_history_chars)
+        )
+        return await rewrite_query(
+            self._llm,
+            [{
+                "role": "human",
+                "content": condense_prompt.format(
+                    chat_history=history_text, question=event.message
+                ),
+            }],
+            event.message,
+            max_expansion_ratio=self._max_expansion_ratio,
+        )
+
     async def _handle_simple(
         self, event: Input, collection: str, profile: RetrievalProfile,
     ) -> Response:
@@ -583,6 +662,7 @@ class ExpertPlugin:
 
         from core.tracing import mark_empty_retrieval, optional_span
 
+        question = await self._resolve_question(event)
         if profile.retrieve:
             pool_n = (
                 max(profile.n_results, self._rerank_candidate_n)
@@ -591,11 +671,11 @@ class ExpertPlugin:
             )
             with optional_span("vc.retrieval", kind=SpanKind.CLIENT) as span:
                 result = await hybrid_retrieval.retrieve(
-                    self._knowledge_store, collection, event.message,
+                    self._knowledge_store, collection, question,
                     self._hybrid_config, n_results=pool_n,
                     where=FACTUAL_WHERE,
                 )
-                result = self._maybe_rerank(event.message, result)
+                result = self._maybe_rerank(question, result)
                 docs, result = _filter_and_format(result, profile.score_threshold)
                 docs, result = self._truncate_to_top_k(docs, result)
                 initial_count = len(docs)
@@ -616,7 +696,7 @@ class ExpertPlugin:
         prompt = combined_expert_prompt.format(
             vc_name=event.display_name or "Expert",
             knowledge=knowledge,
-            question=event.message,
+            question=question,
             empty_context_instruction=empty_context_instruction(bool(docs)),
             citation_scope_instruction=citation_scope_instruction(len(docs)),
         )

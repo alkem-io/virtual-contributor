@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import math
 from enum import Enum
 
 import logging
-import math
 
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings
@@ -174,6 +174,23 @@ class BaseConfig(BaseSettings):
                 f"SUMMARIZE_LLM_TEMPERATURE must be between 0.0 and 2.0, "
                 f"got {self.summarize_llm_temperature}"
             )
+        # Query rewrite validation. A ratio <= 1.0 would reject every rewrite
+        # longer than the original — which is what resolving a follow-up
+        # against its history normally produces — so the gate would silently
+        # discard all of them and always fall back.
+        # `inf`, `nan` and absurd finite values all pass a bare `> 1.0` check
+        # and silently disable the bound this feature exists to enforce. `nan`
+        # is the worst: every comparison against it is False, so the length
+        # check is not merely large but structurally unreachable, while startup
+        # logs a plausible-looking value.
+        if not math.isfinite(self.query_rewrite_max_expansion_ratio) or not (
+            1.0 < self.query_rewrite_max_expansion_ratio <= 100.0
+        ):
+            raise ValueError(
+                f"QUERY_REWRITE_MAX_EXPANSION_RATIO must be a finite value in "
+                f"(1.0, 100.0], got {self.query_rewrite_max_expansion_ratio}"
+            )
+
         if self.summarize_llm_timeout is not None and self.summarize_llm_timeout <= 0:
             raise ValueError(
                 f"SUMMARIZE_LLM_TIMEOUT must be greater than 0, "
@@ -559,6 +576,19 @@ class BaseConfig(BaseSettings):
     summary_length: int = 2500
     summarize_concurrency: int = 8
     summarize_enabled: bool = True
+
+    # Query rewrite — gating and output validation (workspace#049)
+    # Both default to develop's behaviour: no gate, and a ratio permissive
+    # enough that only a model which started explaining is rejected.
+    query_rewrite_gating_enabled: bool = False
+    query_rewrite_max_expansion_ratio: float = 8.0
+    # Turn and character bounds on the history embedded in a rewrite prompt.
+    # `history_length` exists on ExpertConfig/OpenAIAssistantConfig only, so it
+    # cannot serve guidance or generic; these live on the base so every plugin
+    # that rewrites is bounded. A plugin that also defines `history_length`
+    # takes the smaller of the two — see main.py.
+    query_rewrite_max_history_turns: int = 20
+    query_rewrite_max_history_chars: int = 12000
 
     # Health
     health_port: int = 8080

@@ -6,6 +6,7 @@ import asyncio
 import inspect
 import json
 import logging
+import unicodedata
 import os
 import signal
 from typing import Any
@@ -105,6 +106,91 @@ def _build_routing_table(
     }
 
 
+#: Acknowledgements that classify CONVERSATIONAL but may mean "yes, do it".
+#:
+#: The classifier deliberately excludes bare "yes", "no" and "sure" from its
+#: conversational set, on the stated grounds that after *"Shall I list the
+#: templates in this space?"* they are the shortest way to say *do it*. That
+#: reasoning applies verbatim to these, which it does include. Skipping them
+#: searches the vector store for the literal string "ok" instead of the offer
+#: the member just accepted — a regression against develop, which rewrites it.
+#:
+#: Excluding them costs nothing: they fall through to being rewritten, exactly
+#: as today. The gate only ever needs to be *right* about what it skips.
+_AMBIGUOUS_ACKNOWLEDGEMENTS = frozenset({
+    "ok", "okay", "k", "kk", "alright", "all right", "right",
+    "will do", "later", "got it", "gotcha", "noted", "understood",
+    "sounds good", "fine", "cool", "yep", "yeah", "yup",
+})
+
+
+class _ConversationalSkipPolicy:
+    """Skip the rewrite only for turns that are entirely small talk.
+
+    Wraps the adaptive-query classifier without the plugins knowing it exists.
+
+    **Only CONVERSATIONAL is safe, and not even all of it.** Skipping SIMPLE as
+    well looks tempting — it is roughly twice as fast — but SIMPLE covers
+    anaphoric follow-ups like "show me those" and "the name of the lead", which
+    are meaningless without the preceding turn: 9 of a 12-turn corpus broke.
+    And within CONVERSATIONAL, the acknowledgements above are held back
+    because they can be an affirmative answer to a question the VC just asked.
+
+    What remains — "thanks", "cheers", "bye" — asserts that the member wants
+    nothing looked up, which is what makes dropping the history safe.
+    """
+
+    def __init__(self, classifier: object, conversational: object) -> None:
+        self._classifier = classifier
+        self._conversational = conversational
+
+    @staticmethod
+    def _normalise(message: str) -> str:
+        """Strip trailing punctuation of any kind before the membership test.
+
+        A literal `!.?` set misses "ok," and "ok…" — and the whole point of the
+        hold-back list is that it must not be trivially side-stepped by how
+        someone happens to punctuate.
+        """
+        stripped = message.strip().lower()
+        while stripped and unicodedata.category(stripped[-1]).startswith("P"):
+            stripped = stripped[:-1].rstrip()
+        return stripped
+
+    def should_skip_rewrite(self, message: str) -> bool:
+        if self._normalise(message) in _AMBIGUOUS_ACKNOWLEDGEMENTS:
+            return False
+        try:
+            return self._classifier.classify(message).route is self._conversational
+        except Exception as exc:
+            # Never let the optimisation break the request it was optimising.
+            logger.warning(
+                "Rewrite policy failed, not skipping: error_type=%s", type(exc).__name__
+            )
+            return False
+
+
+def _build_rewrite_policy() -> object | None:
+    """Build the gate policy if the classifier is available, else None.
+
+    The classifier ships on a separate, unmerged PR that sits in a multi-way
+    pile-up on these same files. Guarding the import means this feature builds
+    and runs on develop today and starts gating the moment that lands — with no
+    merge-order dependency in either direction. Returning None disables only the
+    skip: every turn is rewritten, exactly as before.
+    """
+    try:
+        from core.domain.rule_classifier import RuleQueryClassifier
+        from core.ports.query_router import RouteClass
+    except ImportError:
+        logger.info(
+            "Query-rewrite gating requested but the query classifier is not "
+            "available in this build; every turn with history will be rewritten"
+        )
+        return None
+    return _ConversationalSkipPolicy(RuleQueryClassifier(), RouteClass.CONVERSATIONAL)
+
+
 def _log_config(config: BaseConfig, plugin_class: type | None = None) -> None:
     """Log all configurable summarization/retrieval fields at startup.
 
@@ -147,6 +233,8 @@ def _log_config(config: BaseConfig, plugin_class: type | None = None) -> None:
         "routing_complex_n_results",
         "routing_complex_context_chars",
         "faithfulness_validation_enabled",
+        "query_rewrite_gating_enabled",
+        "query_rewrite_max_expansion_ratio",
         "summary_chunk_threshold",
         "chunk_size",
         "chunk_overlap",
@@ -782,6 +870,24 @@ async def _run(config: BaseConfig) -> None:
             if config.faithfulness_validation_enabled
             else None
         )
+    # Inject the query-rewrite gate
+    if "max_expansion_ratio" in sig.parameters:
+        deps["max_expansion_ratio"] = config.query_rewrite_max_expansion_ratio
+    if "max_history_turns" in sig.parameters:
+        # Honour a plugin's own `history_length` when it declares one — it is
+        # that plugin's statement about how much history is meaningful, and it
+        # should never be exceeded by the rewrite prompt.
+        plugin_history = getattr(config, "history_length", None)
+        turns = config.query_rewrite_max_history_turns
+        deps["max_history_turns"] = (
+            min(turns, plugin_history) if plugin_history else turns
+        )
+    if "max_history_chars" in sig.parameters:
+        deps["max_history_chars"] = config.query_rewrite_max_history_chars
+    if "rewrite_policy" in sig.parameters and config.query_rewrite_gating_enabled:
+        policy = _build_rewrite_policy()
+        if policy is not None:
+            deps["rewrite_policy"] = policy
     # Inject summarization LLM for ingest plugins
     if "summarize_llm" in sig.parameters:
         deps["summarize_llm"] = summarize_llm

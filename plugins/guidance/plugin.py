@@ -29,6 +29,15 @@ from core.ports.knowledge_store import KnowledgeStorePort
 from core.ports.reranker import RerankerPort
 from core.domain.routing import DEFAULT_ROUTING_TABLE, RetrievalProfile
 from core.ports.query_router import QueryRouterPort, RouteClass, RoutingDecision
+from core.domain.query_rewrite import (
+    DEFAULT_MAX_EXPANSION_RATIO,
+    DEFAULT_MAX_HISTORY_CHARS,
+    DEFAULT_MAX_HISTORY_TURNS,
+    RewritePolicy,
+    recent_history,
+    rewrite_query,
+    should_rewrite,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +74,12 @@ class GuidancePlugin:
         rerank_candidate_n: int = 20,
         rerank_top_k: int = 5,
         query_router: QueryRouterPort | None = None,
-        routing_table: dict | None = None,        faithfulness_validator: FaithfulnessValidatorPort | None = None,
+        routing_table: dict | None = None,
+        faithfulness_validator: FaithfulnessValidatorPort | None = None,
+        rewrite_policy: RewritePolicy | None = None,
+        max_expansion_ratio: float = DEFAULT_MAX_EXPANSION_RATIO,
+        max_history_turns: int = DEFAULT_MAX_HISTORY_TURNS,
+        max_history_chars: int = DEFAULT_MAX_HISTORY_CHARS,
     ) -> None:
         self._llm = llm
         self._knowledge_store = knowledge_store
@@ -82,10 +96,17 @@ class GuidancePlugin:
         self._chain_of_thought_enabled = chain_of_thought_enabled
         # None keeps retrieval exactly as it was — the helper reads the flag
         # off this and falls through to the dense path.
-        self._hybrid_config = hybrid_config        # Absent unless routing is enabled, so an existing deployment keeps
+        self._hybrid_config = hybrid_config
+        # Absent unless routing is enabled, so an existing deployment keeps
         # exactly its current behaviour on its current code path.
         self._query_router = query_router
         self._routing_table = routing_table or DEFAULT_ROUTING_TABLE
+        # None means "never skip" — the gate is opt-in, so an unconfigured
+        # deployment behaves exactly as before apart from output validation.
+        self._rewrite_policy = rewrite_policy
+        self._max_expansion_ratio = max_expansion_ratio
+        self._max_history_turns = max_history_turns
+        self._max_history_chars = max_history_chars
 
     def _resolve_profile(self, message: str) -> RetrievalProfile:
         """Decide this query's retrieval settings.
@@ -209,25 +230,32 @@ class GuidancePlugin:
         question = event.message
         language = event.language or "EN"
 
-        # Condense history if present
-        if event.history:
+        # Resolve the question against history when that is worth a call.
+        # Was: an unconditional LLM round-trip on ANY history, whose output was
+        # assigned verbatim however malformed, and whose failure aborted the
+        # whole request.
+        if should_rewrite(question, event.history, self._rewrite_policy):
+            from core.tracing import optional_span
+
             from plugins.guidance.prompts import condense_prompt
 
             history_text = "\n".join(
-                f"{h.role}: {h.content}" for h in event.history
+                f"{h.role}: {h.content}" for h in recent_history(event.history, self._max_history_turns, self._max_history_chars)
             )
-            from core.tracing import optional_span
-
             with optional_span("vc.stage query_processing") as span:
                 if span is not None:
                     span.set_attribute("vc.history_turns", len(event.history))
-                condensed = await self._llm.invoke([{
-                    "role": "human",
-                    "content": condense_prompt.format(
-                        chat_history=history_text, question=question
-                    ),
-                }])
-            question = condensed
+                question = await rewrite_query(
+                    self._llm,
+                    [{
+                        "role": "human",
+                        "content": condense_prompt.format(
+                            chat_history=history_text, question=question
+                        ),
+                    }],
+                    question,
+                    max_expansion_ratio=self._max_expansion_ratio,
+                )
 
         # One decision per query, resolved on the condensed question — that is
         # what retrieval will actually run against.
