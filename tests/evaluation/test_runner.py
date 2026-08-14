@@ -99,6 +99,28 @@ class TestEvaluationRunner:
         assert run.cases[1].error is not None
         assert "Pipeline timeout" in run.cases[1].error
 
+    async def test_runner_persists_complete_v4_pairing_identity(self, mock_pipeline_invoker, mock_scorer, tmp_path):
+        from evaluation.runner import EvaluationRunner
+
+        mock_pipeline_invoker.composition_fingerprint = "a" * 64
+        mock_pipeline_invoker.full_composition_fingerprint = "b" * 64
+        mock_pipeline_invoker._config.expert_hierarchical_retrieval_enabled = False
+        run = await EvaluationRunner(mock_pipeline_invoker, mock_scorer, tmp_path).run(
+            _make_test_cases(1), plugin_type="expert", body_of_knowledge_id="bok", corpus_revision="reingest-1",
+        )
+        assert run.test_set_digest and run.body_of_knowledge_digest and run.successful_case_digests
+
+    async def test_runner_persists_ordered_successful_case_digests(self, mock_pipeline_invoker, mock_scorer, tmp_path):
+        from evaluation.runner import EvaluationRunner
+
+        mock_pipeline_invoker.composition_fingerprint = "a" * 64
+        mock_pipeline_invoker.full_composition_fingerprint = "b" * 64
+        mock_pipeline_invoker._config.expert_hierarchical_retrieval_enabled = False
+        run = await EvaluationRunner(mock_pipeline_invoker, mock_scorer, tmp_path).run(
+            _make_test_cases(2), plugin_type="expert", corpus_revision="reingest-1",
+        )
+        assert len(run.successful_case_digests or []) == 2
+
     async def test_persists_results_json(self, mock_pipeline_invoker, mock_scorer, tmp_path):
         from evaluation.runner import EvaluationRunner
 

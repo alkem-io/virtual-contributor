@@ -47,9 +47,13 @@ def cli():
     default=None,
     help="Body of knowledge ID (for expert plugin)",
 )
-def run(plugin: str, label: str | None, test_set: str, body_of_knowledge_id: str | None):
+@click.option("--corpus-revision", default=None, help="Immutable operator corpus/re-ingestion revision (required for Expert)")
+def run(plugin: str, label: str | None, test_set: str, body_of_knowledge_id: str | None, corpus_revision: str | None):
     """Run the evaluation suite against the pipeline."""
-    asyncio.run(_run_evaluation(plugin, label, Path(test_set), body_of_knowledge_id))
+    plugin = plugin.lower().replace("-", "_")
+    if plugin == "expert" and not corpus_revision:
+        raise click.UsageError("Expert evaluation requires --corpus-revision")
+    asyncio.run(_run_evaluation(plugin, label, Path(test_set), body_of_knowledge_id, corpus_revision))
 
 
 async def _run_evaluation(
@@ -57,6 +61,7 @@ async def _run_evaluation(
     label: str | None,
     test_set_path: Path,
     body_of_knowledge_id: str | None,
+    corpus_revision: str | None,
 ) -> None:
     from core.config import BaseConfig
     from evaluation.metrics import create_metrics
@@ -73,7 +78,9 @@ async def _run_evaluation(
     click.echo(f"Loaded {len(test_cases)} test cases from {test_set_path}")
 
     # Initialize pipeline
-    config = BaseConfig()
+    # The explicit CLI selection wins over blank, generic, or conflicting env.
+    plugin_type = plugin_type.lower().replace("-", "_")
+    config = BaseConfig(plugin_type=plugin_type)
     invoker = PipelineInvoker(
         plugin_type=plugin_type,
         config=config,
@@ -117,6 +124,8 @@ async def _run_evaluation(
             plugin_type=plugin_type,
             label=label,
             test_set_path=str(test_set_path),
+            body_of_knowledge_id=body_of_knowledge_id,
+            corpus_revision=corpus_revision,
         )
         click.echo("")
         click.echo(format_run_summary(evaluation_run))

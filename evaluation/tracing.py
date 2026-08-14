@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+
 from core.ports.knowledge_store import GetResult, KnowledgeStorePort, QueryResult
 
 
@@ -16,10 +18,12 @@ class TracingKnowledgeStore:
         self._delegate = delegate
         self._captured: list[QueryResult] = []
         self._generation_contexts: list[str] = []
+        self._generation_context_published = False
 
     def capture_generation_context(self, blocks: list[str]) -> None:
         """Capture the exact rendered blocks handed to the answering LLM."""
         self._generation_contexts = list(blocks)
+        self._generation_context_published = True
 
     async def query(
         self,
@@ -73,6 +77,16 @@ class TracingKnowledgeStore:
     ) -> None:
         await self._delegate.delete(collection, ids, where)
 
+    @asynccontextmanager
+    async def query_embedding_scope(self):
+        """Forward the optional request-local vector scope transparently."""
+        scope = getattr(self._delegate, "query_embedding_scope", None)
+        if not callable(scope):
+            yield
+            return
+        async with scope():
+            yield
+
     def get_retrieved_contexts(self) -> list[str]:
         """Extract all document texts captured during query() calls."""
         contexts: list[str] = []
@@ -91,7 +105,13 @@ class TracingKnowledgeStore:
 
         return list(self._generation_contexts)
 
+    @property
+    def generation_context_published(self) -> bool:
+        """Whether an observer published, independently of an empty value."""
+        return self._generation_context_published
+
     def clear(self) -> None:
         """Reset captured state between test cases."""
         self._captured = []
         self._generation_contexts = []
+        self._generation_context_published = False

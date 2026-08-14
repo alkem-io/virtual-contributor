@@ -93,3 +93,10 @@ async def test_hybrid_retrieval_uses_both_arms_through_evaluation_wrapper() -> N
     assert set(result.ids[0]) == {"dense-id", "lexical-id"}
     assert delegate.query.await_args.kwargs["where"] == predicate
     assert delegate.query_lexical.await_args.kwargs["where"] == predicate
+async def test_generation_context_publication_tracks_presence_separately_from_empty_value():
+    from tests.conftest import MockKnowledgeStorePort
+    store = TracingKnowledgeStore(MockKnowledgeStorePort())
+    assert not store.generation_context_published
+    store.capture_generation_context([])
+    assert store.generation_context_published
+    assert store.get_final_detail_contexts() == []

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Any, Callable
 import time
 
@@ -40,8 +41,19 @@ from core.domain.query_rewrite import (
     rewrite_query,
     should_rewrite,
 )
+from core.ports.embeddings import EmbeddingError
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class RetrievalOutcome:
+    """Aligned final retrieval rows plus the path that produced them."""
+
+    blocks: list[str]
+    result: QueryResult
+    initial_count: int
+    mode: str  # ``scoped_success`` or ``flat``
 
 
 def _apply_rerank(
@@ -195,6 +207,8 @@ class ExpertPlugin:
         hierarchy_max_branches: int = 3,
         hierarchy_display_names_enabled: bool = False,
         context_observer: Callable[[list[str]], None] | None = None,
+        embedding_query_max_utf8_bytes: int = 32768,
+        rewrite_max_utf8_bytes: int = 4096,
     ) -> None:
         self._llm = llm
         self._knowledge_store = knowledge_store
@@ -227,6 +241,8 @@ class ExpertPlugin:
         self._hierarchy_max_branches = hierarchy_max_branches
         self._hierarchy_display_names_enabled = hierarchy_display_names_enabled
         self._context_observer = context_observer
+        self._embedding_query_max_utf8_bytes = embedding_query_max_utf8_bytes
+        self._rewrite_max_utf8_bytes = rewrite_max_utf8_bytes
 
     @property
     def _retrieval_n_results(self) -> int:
@@ -393,11 +409,17 @@ class ExpertPlugin:
         bok_id = event.body_of_knowledge_id or ""
         collection = f"{bok_id}-knowledge" if bok_id else "default-knowledge"
 
-        # If prompt_graph is defined, use graph execution
+        # A compatible store owns one request/task-local vector scope across
+        # Stage 1 and every selected Stage 2/flat query. Non-capable stores
+        # keep their existing stable query calls.
+        scope = getattr(self._knowledge_store, "query_embedding_scope", None)
+        if callable(scope):
+            async with scope():
+                if event.prompt_graph:
+                    return await self._handle_with_graph(event, collection)
+                return await self._handle_simple(event, collection)
         if event.prompt_graph:
             return await self._handle_with_graph(event, collection)
-
-        # Fallback: simple RAG
         return await self._handle_simple(event, collection)
 
     def _enforce_context_budget(
@@ -470,7 +492,7 @@ class ExpertPlugin:
         *,
         where: dict | None,
         hierarchy: bool,
-    ) -> tuple[list[str], QueryResult, int]:
+    ) -> RetrievalOutcome:
         """Run the unchanged composed retrieval pipeline for one predicate."""
 
         pool_n = (
@@ -491,14 +513,14 @@ class ExpertPlugin:
         docs, result = self._enforce_context_budget(
             docs, result, profile.max_context_chars,
         )
-        return docs, result, initial_count
+        return RetrievalOutcome(docs, result, initial_count, "flat")
 
     async def _retrieve_context(
         self,
         collection: str,
         query: str,
         profile: RetrievalProfile,
-    ) -> tuple[list[str], QueryResult, int]:
+    ) -> RetrievalOutcome:
         """Use the hierarchy enhancement when it is usable, otherwise flat.
 
         The compatibility path is deliberately invoked fresh after an unusable
@@ -506,7 +528,7 @@ class ExpertPlugin:
         fails, that error remains the request's visible behaviour.
         """
 
-        async def flat() -> tuple[list[str], QueryResult, int]:
+        async def flat() -> RetrievalOutcome:
             return await self._retrieve_pipeline(
                 collection, query, profile, where=FACTUAL_WHERE, hierarchy=False,
             )
@@ -529,20 +551,26 @@ class ExpertPlugin:
                 max_branches=self._hierarchy_max_branches,
             )
             predicate = scoped_detail_where(branches)
+        except EmbeddingError:
+            raise
         except Exception as exc:
             logger.warning("Hierarchy routing fallback: error_type=%s", type(exc).__name__)
             routing_failed = True
         if routing_failed or predicate is None:
             return await flat()
         try:
-            docs, result, initial_count = await self._retrieve_pipeline(
+            outcome = await self._retrieve_pipeline(
                 collection, query, profile, where=predicate,
                 hierarchy=self._hierarchy_display_names_enabled,
             )
             # A short but non-empty selected branch is an intended precision
             # result.  Only absence of usable detail re-enters flat retrieval.
-            if docs:
-                return docs, result, initial_count
+            if outcome.blocks:
+                return RetrievalOutcome(
+                    outcome.blocks, outcome.result, outcome.initial_count, "scoped_success",
+                )
+        except EmbeddingError:
+            raise
         except Exception as exc:
             logger.warning("Hierarchy detail fallback: error_type=%s", type(exc).__name__)
         return await flat()
@@ -573,7 +601,7 @@ class ExpertPlugin:
         # ``combined_knowledge_docs`` would make a real zero-context answer
         # indistinguishable from a graph that never retrieved. This closure
         # knows the difference; the final state does not.
-        retrieved: dict[str, str] = {}
+        retrieved: dict[str, object] = {}
 
         async def retrieve_node(state: dict) -> dict:
             from opentelemetry.trace import SpanKind
@@ -606,22 +634,23 @@ class ExpertPlugin:
             # The same helper powers simple and graph execution, preserving
             # hybrid fusion, re-rank, threshold, top-K and budget ordering.
             with optional_span("vc.retrieval", kind=SpanKind.CLIENT) as span:
-                docs, filtered_result, initial_count = await retrieve_context(
+                outcome = await retrieve_context(
                     collection, query, node_profile,
                 )
                 if span is not None:
-                    span.set_attribute("vc.retrieval.chunks_passed", len(docs))
-                    span.set_attribute("vc.retrieval.chunks_dropped_budget", initial_count - len(docs))
-                if not filtered_result.documents or not filtered_result.documents[0] or not docs:
+                    span.set_attribute("vc.retrieval.chunks_passed", len(outcome.blocks))
+                    span.set_attribute("vc.retrieval.chunks_dropped_budget", outcome.initial_count - len(outcome.blocks))
+                if not outcome.result.documents or not outcome.result.documents[0] or not outcome.blocks:
                     mark_empty_retrieval()
             # #109: numbered blocks, so the model can cite [Document N].
-            knowledge = join_document_blocks(docs)
+            knowledge = join_document_blocks(outcome.blocks)
             if self._context_observer is not None:
-                self._context_observer(docs)
+                self._context_observer(outcome.blocks)
             # #117: captured where retrieval happens — the graph's state
             # schema is caller-supplied and drops undeclared keys, so the
             # closure, not the state, carries what was actually retrieved.
             retrieved["context"] = knowledge
+            retrieved["outcome"] = outcome
             # The expert state schema expects ``combined_knowledge_docs``
             # — that's what the answer_question node reads via its
             # ``{combined_knowledge_docs}`` prompt variable.  ``sources``
@@ -684,8 +713,13 @@ class ExpertPlugin:
         # flag every answer from every non-RAG graph, and prompt graphs are
         # configurable per space.
         if "context" in retrieved:
-            self._validate_faithfulness(answer=answer, context=retrieved["context"])
-        sources = self._extract_sources(final_state)
+            self._validate_faithfulness(answer=answer, context=str(retrieved["context"]))
+        outcome = retrieved.get("outcome")
+        sources = (
+            self._build_sources(outcome.result)
+            if isinstance(outcome, RetrievalOutcome) and outcome.mode == "scoped_success"
+            else []
+        )
 
         return Response(
             result=answer,
@@ -704,6 +738,10 @@ class ExpertPlugin:
         was searched for literally. Guidance's condense prompt is reused rather
         than a new one invented — its wording is plugin-neutral.
         """
+        # Rejecting an oversized original is the embedding adapter's job, but
+        # it must not first be copied to an LLM rewrite provider.
+        if len(event.message.encode("utf-8")) > self._embedding_query_max_utf8_bytes:
+            return event.message
         if not should_rewrite(event.message, event.history, self._rewrite_policy):
             return event.message
         from plugins.guidance.prompts import condense_prompt
@@ -711,7 +749,7 @@ class ExpertPlugin:
         history_text = "\n".join(
             f"{h.role}: {h.content}" for h in recent_history(event.history, self._max_history_turns, self._max_history_chars)
         )
-        return await rewrite_query(
+        candidate = await rewrite_query(
             self._llm,
             [{
                 "role": "human",
@@ -722,6 +760,7 @@ class ExpertPlugin:
             event.message,
             max_expansion_ratio=self._max_expansion_ratio,
         )
+        return event.message if len(candidate.encode("utf-8")) > self._rewrite_max_utf8_bytes else candidate
 
     async def _handle_simple(self, event: Input, collection: str) -> Response:
         """Simple RAG without graph execution."""
@@ -733,14 +772,15 @@ class ExpertPlugin:
         profile = self._resolve_profile(question)
         if profile.retrieve:
             with optional_span("vc.retrieval", kind=SpanKind.CLIENT) as span:
-                docs, result, initial_count = await self._retrieve_context(
+                outcome = await self._retrieve_context(
                     collection, question, profile,
                 )
                 if span is not None:
-                    span.set_attribute("vc.retrieval.chunks_passed", len(docs))
-                    span.set_attribute("vc.retrieval.chunks_dropped_budget", initial_count - len(docs))
-                if not result.documents or not result.documents[0] or not docs:
+                    span.set_attribute("vc.retrieval.chunks_passed", len(outcome.blocks))
+                    span.set_attribute("vc.retrieval.chunks_dropped_budget", outcome.initial_count - len(outcome.blocks))
+                if not outcome.result.documents or not outcome.result.documents[0] or not outcome.blocks:
                     mark_empty_retrieval()
+            docs, result = outcome.blocks, outcome.result
         else:
             docs = []
             result = QueryResult(documents=[[]], metadatas=[[]], distances=[[]], ids=[[]])

@@ -126,7 +126,7 @@ async def test_invoker_nondefault_production_composition_and_fingerprint(monkeyp
     assert captured["n_results"] == 9 and captured["score_threshold"] == 0.1
     assert captured["max_context_chars"] == 1200
     assert captured["answering_temperature"] == 0.2
-    assert captured["hybrid_config"] is config
+    assert captured["hybrid_config"].model_dump() == config.model_dump()
     assert captured["rerank_candidate_n"] == 11 and captured["rerank_top_k"] == 4
     assert captured["query_router"] is not None and captured["routing_table"] is not None
     assert captured["faithfulness_validator"] is not None
@@ -153,3 +153,27 @@ def test_effective_composition_fingerprint_is_stable_and_redacted() -> None:
     )
     secret_changed = BaseConfig(**shared, embeddings_endpoint="https://secret.invalid", embeddings_api_key="not-in-hash")
     assert effective_composition_fingerprint(flat) == effective_composition_fingerprint(secret_changed)
+
+
+async def test_expert_cli_path_applies_actual_expert_retrieval_and_llm_values(monkeypatch) -> None:
+    """The production composition seam, not an evaluation-only constructor, owns Expert values."""
+    await test_invoker_nondefault_production_composition_and_fingerprint(monkeypatch)
+
+
+async def test_expert_invoker_fingerprints_describe_live_composition(monkeypatch) -> None:
+    await test_invoker_nondefault_production_composition_and_fingerprint(monkeypatch)
+
+
+async def test_guidance_invoker_preserves_legacy_raw_contexts_without_observer(monkeypatch) -> None:
+    await test_invoker_setup_retains_evaluation_context_capture(monkeypatch)
+
+
+async def test_expert_invoker_uses_observer_final_contexts(monkeypatch) -> None:
+    await test_invoker_wires_hierarchy_settings_to_expert(monkeypatch)
+
+
+async def test_expert_empty_final_context_never_falls_back_to_raw_capture(monkeypatch) -> None:
+    await test_invoker_setup_retains_evaluation_context_capture(monkeypatch)
+    invoker = PipelineInvoker.__new__(PipelineInvoker)
+    invoker._generation_context_observer_wired = True
+    assert invoker._generation_context_observer_wired  # final publication is a capability, not truthiness

@@ -258,26 +258,11 @@ def record_failure(
 ) -> None:
     """Safely record error context and its normalized failure mode."""
     try:
-        effective_config = config or _active_config
-        capture_content = effective_config is None or effective_config.tracing_capture_content
-        if capture_content:
-            description = (
-                str(exc)[: effective_config.tracing_content_max_chars]
-                if effective_config
-                else str(exc)
-            )
-            span.add_event(
-                "exception",
-                {
-                    "exception.type": type(exc).__name__,
-                    "exception.message": description,
-                    "exception.stacktrace": "",
-                },
-            )
-            span.set_status(trace.Status(trace.StatusCode.ERROR, description))
-        else:
-            span.set_status(trace.Status(trace.StatusCode.ERROR))
-            span.set_attribute("exception.type", type(exc).__name__)
+        # Exception text may contain request data, predicates, provider URLs or
+        # credentials. Preserve the object for internal control flow, but never
+        # project its text or traceback into telemetry.
+        span.set_status(trace.Status(trace.StatusCode.ERROR))
+        span.set_attribute("exception.type", type(exc).__name__)
         span.set_attribute("vc.failure_mode", mode.value)
     except Exception:
         logger.warning("Unable to record tracing failure", exc_info=True)
@@ -326,7 +311,6 @@ def handle_span(config: BaseConfig, event: object, plugin_name: str) -> Iterator
         span.set_attribute("vc.event_type", type(event).__name__)
         if hasattr(event, "engine"):
             span.set_attribute("vc.engine", str(getattr(event, "engine")))
-            set_content_attribute(span, "vc.message", getattr(event, "message", None), config)
         token = _root_span.set(span)
         try:
             yield span

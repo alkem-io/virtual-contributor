@@ -61,4 +61,6 @@ async def test_failed_collection_is_recorded_once(traced_exporter, traced_config
         if span.name == "vc.retrieval" and span.status.status_code.name == "ERROR"
     )
     assert failed.status.status_code.name == "ERROR"
-    assert len([event for event in failed.events if event.name == "exception"]) == 1
+    # Safe failure projection deliberately excludes SDK exception events: they
+    # serialize the error message and stack, neither of which is trace-safe.
+    assert len([event for event in failed.events if event.name == "exception"]) == 0

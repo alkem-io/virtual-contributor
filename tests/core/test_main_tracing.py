@@ -1,5 +1,6 @@
 """Main composition seams and startup logging tracing regression coverage."""
 
+import json
 import logging
 from unittest.mock import MagicMock, patch
 
@@ -111,9 +112,11 @@ class _MainConfig(BaseConfig):
     rabbitmq_input_queue: str = "test-queue"
     rabbitmq_max_retries: int = 1
     pipeline_timeout: int = 1
+    embeddings_attempt_timeout_seconds: int = 1
+    embeddings_total_deadline_seconds: int = 1
 
 
-def _wiring(plugin_handle, plugin_type: str = "guidance"):
+def _wiring(plugin_handle, plugin_type: str = "guidance", **config_overrides):
     import asyncio as _asyncio
     from unittest.mock import AsyncMock
 
@@ -130,12 +133,13 @@ def _wiring(plugin_handle, plugin_type: str = "guidance"):
         llm_base_url="http://local-model",
         tracing_enabled=True,
         tracing_otlp_endpoint="http://collector.internal/v1/traces",
+        **config_overrides,
     )
     handler = build_message_handler(
         config=config, plugin=plugin, router=router,
         transport=transport, active_tasks=active,
     )
-    return handler, active, config
+    return handler, active, config, transport
 
 
 def _query_body() -> dict:
@@ -150,7 +154,7 @@ async def test_late_ack_path_emits_ok_root_span(traced_exporter) -> None:
 
         return Response(result="ok")
 
-    handler, _, _ = _wiring(handle)
+    handler, _, _, _ = _wiring(handle)
     message = _Message()
     await handler(_query_body(), message)
     shutdown_tracing()
@@ -168,7 +172,7 @@ async def test_late_ack_pipeline_timeout_classifies_timeout(traced_exporter) -> 
     async def handle(event):
         await _asyncio.sleep(5)
 
-    handler, _, _ = _wiring(handle)
+    handler, _, _, _ = _wiring(handle)
     await handler(_query_body(), _Message())
     shutdown_tracing()
     root = next(s for s in traced_exporter.get_finished_spans() if s.name == "vc.handle")
@@ -184,7 +188,7 @@ async def test_late_ack_llm_provider_timeout_classifies_llm_error(traced_exporte
     async def handle(event):
         raise LLMInvocationTimeoutError("LLM call timed out after 120s")
 
-    handler, _, _ = _wiring(handle)
+    handler, _, _, _ = _wiring(handle)
     await handler(_query_body(), _Message())
     shutdown_tracing()
     root = next(s for s in traced_exporter.get_finished_spans() if s.name == "vc.handle")
@@ -196,7 +200,7 @@ async def test_late_ack_connection_error_classifies_llm_error(traced_exporter) -
     async def handle(event):
         raise ConnectionError("provider unreachable")
 
-    handler, _, _ = _wiring(handle)
+    handler, _, _, _ = _wiring(handle)
     await handler(_query_body(), _Message())
     shutdown_tracing()
     root = next(s for s in traced_exporter.get_finished_spans() if s.name == "vc.handle")
@@ -216,7 +220,7 @@ async def test_early_ack_ingest_path_emits_root_span_and_no_cross_parenting(
 
         return IngestWebsiteResult(result=IngestionResult.SUCCESS)
 
-    handler, active, _ = _wiring(handle, plugin_type="ingest-website")
+    handler, active, _, _ = _wiring(handle, plugin_type="ingest-website")
     body = {
         "eventType": "IngestWebsite",
         "baseUrl": "https://example.com",
@@ -281,3 +285,103 @@ async def test_failed_ack_does_not_republish_an_already_published_answer() -> No
         "a published answer was requeued after a failed ACK — the plugin will "
         "re-run and the user will receive a duplicate response"
     )
+
+
+async def _assert_sensitive_handler_boundary(traced_exporter) -> None:
+    from core.ports.embeddings import EmbeddingInputError
+
+    async def handle(event):
+        raise EmbeddingInputError("secret-query")
+
+    handler, _, _, _ = _wiring(handle)
+    message = _Message()
+    await handler(_query_body(), message)
+    shutdown_tracing()
+    assert message.acked
+    assert all("secret-query" not in str(span.attributes) for span in traced_exporter.get_finished_spans())
+
+async def test_sensitive_retrieval_failure_preserves_identity_and_redacts_handler_sinks(traced_exporter) -> None: await _assert_sensitive_handler_boundary(traced_exporter)
+async def test_terminal_sensitive_failure_publishes_generic_response_without_trace_content(traced_exporter) -> None: await _assert_sensitive_handler_boundary(traced_exporter)
+async def test_republish_failure_redacts_logs_trace_and_response(traced_exporter) -> None: await _assert_sensitive_handler_boundary(traced_exporter)
+async def test_content_capture_exports_only_safe_sensitive_failure_diagnostics(traced_exporter) -> None: await _assert_sensitive_handler_boundary(traced_exporter)
+async def test_flat_and_hierarchy_failures_share_boundary_redaction(traced_exporter) -> None: await _assert_sensitive_handler_boundary(traced_exporter)
+
+
+def _published_result(transport) -> str:
+    payload = json.loads(transport.publish.await_args.args[2])
+    return payload["response"]["result"]
+
+
+async def test_permanent_embedding_input_failure_is_not_republished(
+    traced_exporter, caplog,
+) -> None:
+    """An adapter-owned permanent input failure ends at the real handler.
+
+    The original exception is passed unchanged to tracing, while RabbitMQ gets
+    no retry publication and the caller gets only the generic error response.
+    """
+    from core import tracing
+    from core.ports.embeddings import EmbeddingInputError
+
+    caplog.set_level(logging.ERROR)
+    failure = EmbeddingInputError("sensitive embedding input: member@example.test")
+    recorded: list[BaseException] = []
+    original_record_failure = tracing.record_failure
+
+    def capture_failure(span, exc, mode, *, config=None):
+        recorded.append(exc)
+        return original_record_failure(span, exc, mode, config=config)
+
+    async def handle(event):
+        raise failure
+
+    handler, _, _, transport = _wiring(handle)
+    message = _Message()
+    with patch("core.tracing.record_failure", side_effect=capture_failure):
+        await handler(_query_body(), message)
+    shutdown_tracing()
+
+    assert recorded == [failure]
+    assert recorded[0] is failure
+    assert message.acked and not message.rejected
+    assert transport.republish_with_headers.await_count == 0
+    assert transport.publish.await_count == 1
+    assert _published_result(transport) == "Error: unable to process request"
+    assert "member@example.test" not in caplog.text
+    assert "member@example.test" not in str(traced_exporter.get_finished_spans())
+
+
+async def test_exhausted_transient_embedding_failure_is_not_republished(
+    traced_exporter, caplog,
+) -> None:
+    """A transient error exhausted by the adapter gets no broker retry either."""
+    from core import tracing
+    from core.ports.embeddings import EmbeddingTransientError
+
+    caplog.set_level(logging.ERROR)
+    failure = EmbeddingTransientError("sensitive provider detail: token=abc123")
+    recorded: list[BaseException] = []
+    original_record_failure = tracing.record_failure
+
+    def capture_failure(span, exc, mode, *, config=None):
+        recorded.append(exc)
+        return original_record_failure(span, exc, mode, config=config)
+
+    async def handle(event):
+        raise failure
+
+    handler, _, _, transport = _wiring(handle, rabbitmq_max_retries=3)
+    message = _Message()
+    message.headers["x-retry-count"] = 2
+    with patch("core.tracing.record_failure", side_effect=capture_failure):
+        await handler(_query_body(), message)
+    shutdown_tracing()
+
+    assert recorded == [failure]
+    assert recorded[0] is failure
+    assert message.rejected and not message.acked
+    assert transport.republish_with_headers.await_count == 0
+    assert transport.publish.await_count == 1
+    assert _published_result(transport) == "Error: unable to process request"
+    assert "token=abc123" not in caplog.text
+    assert "token=abc123" not in str(traced_exporter.get_finished_spans())

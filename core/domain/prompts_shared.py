@@ -59,17 +59,29 @@ that addresses every part. Do not reveal intermediate reasoning, scratch work,
 or chain-of-thought in the reply."""
 
 
-def _metadata_text(metadata: Mapping[str, object], key: str) -> str:
-    """Return a bounded, single-line metadata value without inventing one."""
+def _legacy_metadata_text(metadata: Mapping[str, object], key: str) -> str:
+    """Preserve the frozen legacy label contract exactly (codepoint caps)."""
 
     value = metadata.get(key)
     if value is None:
         return ""
     if isinstance(value, Enum):
         value = value.value
-    # Metadata becomes model-visible label text. Control and format codepoints
-    # include NUL, bidi overrides, and zero-width separators; remove them
-    # before collapsing whitespace and delimiter escaping.
+    text = " ".join(str(value).split())
+    text = " ".join(text.translate(_LABEL_UNSAFE_CHARACTERS).split())
+    if text.casefold() == "none":
+        return ""
+    limit = _METADATA_VALUE_LIMITS.get(key)
+    return text[:limit] if limit is not None else text
+
+
+def _hierarchy_name(metadata: Mapping[str, object], key: str) -> str:
+    """Return hardened, UTF-8 bounded hierarchy display metadata only."""
+    value = metadata.get(key)
+    if value is None:
+        return ""
+    if isinstance(value, Enum):
+        value = value.value
     characters: list[str] = []
     for character in str(value):
         category = unicodedata.category(character)
@@ -85,9 +97,7 @@ def _metadata_text(metadata: Mapping[str, object], key: str) -> str:
     text = " ".join(text.translate(_LABEL_UNSAFE_CHARACTERS).split())
     if text.casefold() == "none":
         return ""
-    limit = _METADATA_VALUE_LIMITS.get(key)
-    if limit is None:
-        return text
+    limit = 200
     # Limits are protocol byte limits, not Python codepoint counts. Iterating
     # codepoints gives a deterministic UTF-8 prefix without splitting one.
     kept: list[str] = []
@@ -115,10 +125,10 @@ def render_document_block(
         raise ValueError("Document numbers must be 1-based")
 
     metadata = metadata or {}
-    title = _metadata_text(metadata, "title")
-    uri = _metadata_text(metadata, "uri")
-    source = _metadata_text(metadata, "source")
-    kind = _metadata_text(metadata, "type")
+    title = _legacy_metadata_text(metadata, "title")
+    uri = _legacy_metadata_text(metadata, "uri")
+    source = _legacy_metadata_text(metadata, "source")
+    kind = _legacy_metadata_text(metadata, "type")
     origin = uri or source
     identity = title or uri or source or "Untitled"
 
@@ -126,8 +136,8 @@ def render_document_block(
     if hierarchy:
         # Stable hierarchy IDs are retrieval-only identifiers. Never disclose
         # them to an answering provider when a display name is absent.
-        space = _metadata_text(metadata, "spaceName")
-        subspace = _metadata_text(metadata, "subspaceName")
+        space = _hierarchy_name(metadata, "spaceName")
+        subspace = _hierarchy_name(metadata, "subspaceName")
         if space:
             label_parts.append(f"Space: {space}")
         if subspace:

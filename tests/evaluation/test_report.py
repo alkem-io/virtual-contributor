@@ -15,6 +15,7 @@ from evaluation.report import (
     format_comparison,
     format_run_summary,
 )
+from plugins.expert.composition import expert_full_composition_fingerprint
 
 
 # ---------------------------------------------------------------------------
@@ -24,7 +25,7 @@ from evaluation.report import (
 
 def _make_run(
     run_id: str = "20260406T143022_baseline",
-    plugin_type: str = "guidance",
+    plugin_type: str = "expert",
     agg_values: dict[str, float] | None = None,
 ) -> EvaluationRun:
     """Create a minimal EvaluationRun for testing."""
@@ -39,6 +40,8 @@ def _make_run(
         name: AggregateMetrics(mean=val, median=val, min=val - 0.1, max=val + 0.1)
         for name, val in agg_values.items()
     }
+    mode = "hierarchical" if "current" in run_id else "flat"
+    invariant = "a" * 64
     return EvaluationRun(
         id=run_id,
         timestamp="2026-04-06T14:30:22Z",
@@ -46,10 +49,17 @@ def _make_run(
         plugin_type=plugin_type,
         test_set_path="evaluation/golden/test_set.jsonl",
         test_case_count=50,
-        success_count=48,
-        failure_count=2,
+        success_count=50,
+        failure_count=0,
         duration_seconds=842.5,
         composition_fingerprint="matched-composition",
+        hierarchy_mode=mode,
+        test_set_digest="b" * 64,
+        body_of_knowledge_digest="c" * 64,
+        corpus_revision="reingest-2026-08-14",
+        successful_case_digests=["d" * 64],
+        invariant_composition_fingerprint=invariant,
+        full_composition_fingerprint=expert_full_composition_fingerprint(invariant, mode),
         aggregate=aggregate,
         cases=[
             EvaluationCase(
@@ -123,19 +133,18 @@ class TestComputeComparison:
 
     def test_rejects_comparison_when_effective_composition_differs(self):
         baseline, current = _make_run("baseline"), _make_run("current")
-        baseline.composition_fingerprint = "flat-and-on-compatible"
-        current.composition_fingerprint = "reranker-drift"
-        with pytest.raises(ValueError, match="fingerprints differ"):
+        current.invariant_composition_fingerprint = "e" * 64
+        with pytest.raises(ValueError, match="invariant_composition_fingerprint differs"):
             compute_comparison(baseline, current)
 
     @pytest.mark.parametrize("missing", ["baseline", "current"])
     def test_rejects_comparison_when_a_fingerprint_is_missing(self, missing):
         baseline, current = _make_run("baseline"), _make_run("current")
         if missing == "baseline":
-            baseline.composition_fingerprint = None
+            baseline.invariant_composition_fingerprint = None
         else:
-            current.composition_fingerprint = ""
-        with pytest.raises(ValueError, match="fingerprints are required"):
+            current.invariant_composition_fingerprint = ""
+        with pytest.raises(ValueError, match="complete v4 pairing identity"):
             compute_comparison(baseline, current)
 
     def test_summary_count(self):
@@ -177,7 +186,107 @@ class TestFormatRunSummary:
     def test_contains_failure_count(self):
         run = _make_run()
         output = format_run_summary(run)
-        assert "Failures: 2/50" in output
+        assert "Failures: 0/50" in output
+
+
+def test_comparison_accepts_complete_expert_flat_to_on_pair():
+    assert compute_comparison(_make_run("baseline"), _make_run("current")).deltas
+
+
+@pytest.mark.parametrize("mutation", ["plugin", "mode", "dataset", "bok", "corpus", "success", "invariant", "full", "failure", "legacy"])
+def test_comparison_rejects_incomplete_or_mismatched_v4_identity(mutation):
+    baseline, current = _make_run("baseline"), _make_run("current")
+    if mutation == "plugin":
+        current.plugin_type = "guidance"
+    elif mutation == "mode":
+        current.hierarchy_mode = "flat"
+    elif mutation == "dataset":
+        current.test_set_digest = "e" * 64
+    elif mutation == "bok":
+        current.body_of_knowledge_digest = "e" * 64
+    elif mutation == "corpus":
+        current.corpus_revision = "other-revision"
+    elif mutation == "success":
+        current.successful_case_digests = ["e" * 64]
+    elif mutation == "invariant":
+        current.invariant_composition_fingerprint = "e" * 64
+    elif mutation == "full":
+        current.full_composition_fingerprint = baseline.full_composition_fingerprint
+    elif mutation == "failure":
+        current.failure_count = 1
+    else:
+        baseline.invariant_composition_fingerprint = None
+    with pytest.raises(ValueError):
+        compute_comparison(baseline, current)
+
+
+def _reject_v4(mutation: str) -> None:
+    baseline, current = _make_run("baseline"), _make_run("current")
+    if mutation == "plugin":
+        current.plugin_type = "guidance"
+    elif mutation == "mode":
+        current.hierarchy_mode = "flat"
+    elif mutation == "dataset":
+        current.test_set_digest = "e" * 64
+    elif mutation == "bok":
+        current.body_of_knowledge_digest = "e" * 64
+    elif mutation == "corpus":
+        current.corpus_revision = "other"
+    elif mutation == "success":
+        current.successful_case_digests = ["e" * 64]
+    elif mutation == "invariant":
+        current.invariant_composition_fingerprint = "e" * 64
+    elif mutation == "equal_full":
+        current.full_composition_fingerprint = baseline.full_composition_fingerprint
+    elif mutation == "mode_full":
+        current.full_composition_fingerprint = expert_full_composition_fingerprint(
+            current.invariant_composition_fingerprint, "flat"
+        )
+    elif mutation == "legacy":
+        baseline.invariant_composition_fingerprint = None
+    with pytest.raises(ValueError):
+        compute_comparison(baseline, current)
+
+
+def test_comparison_rejects_non_expert_or_wrong_mode_order():
+    _reject_v4("plugin")
+    _reject_v4("mode")
+
+
+def test_comparison_rejects_test_set_identity_mismatch():
+    _reject_v4("dataset")
+
+
+def test_comparison_rejects_body_of_knowledge_identity_mismatch():
+    _reject_v4("bok")
+
+
+def test_comparison_rejects_missing_or_mismatched_corpus_revision():
+    _reject_v4("corpus")
+
+
+def test_comparison_rejects_failures_or_successful_case_mismatch():
+    _reject_v4("success")
+    baseline, current = _make_run("baseline"), _make_run("current")
+    current.failure_count = 1
+    with pytest.raises(ValueError):
+        compute_comparison(baseline, current)
+
+
+def test_comparison_rejects_invariant_fingerprint_mismatch():
+    _reject_v4("invariant")
+
+
+def test_comparison_rejects_missing_or_equal_full_fingerprints():
+    _reject_v4("equal_full")
+
+
+def test_comparison_rejects_full_fingerprint_not_bound_to_mode():
+    _reject_v4("mode_full")
+
+
+def test_comparison_rejects_legacy_reports_without_v4_identity():
+    _reject_v4("legacy")
 
 
 class TestFormatComparison:

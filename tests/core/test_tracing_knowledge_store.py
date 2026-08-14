@@ -68,7 +68,9 @@ async def test_reused_retrieval_span_records_failure_exactly_once(
     assert retrieval, "no retrieval span was exported"
     for span in retrieval:
         assert span.status.status_code.name == "ERROR"
-        assert len([e for e in span.events if e.name == "exception"]) == 1
+        # Sensitive failure projection records safe type/mode diagnostics, not
+        # an SDK exception event (which serializes the message and stack).
+        assert len([e for e in span.events if e.name == "exception"]) == 0
 
 
 async def test_store_operation_span_is_emitted(traced_exporter) -> None:
@@ -173,3 +175,24 @@ async def test_lexical_none_distances_do_not_crash_the_span_stats() -> None:
     store = TracedKnowledgeStore(_MixedStore())
     result = await store.query("c", ["q"], 5)
     assert result.documents == [["semantic hit", "literal hit"]]
+
+
+async def test_tracing_store_forwards_query_embedding_scope() -> None:
+    from contextlib import asynccontextmanager
+    class Store:
+        entered = False
+        @asynccontextmanager
+        async def query_embedding_scope(self):
+            self.entered = True
+            yield
+    delegate = Store()
+    async with TracedKnowledgeStore(delegate).query_embedding_scope():
+        assert delegate.entered
+
+
+async def test_tracing_store_clears_embedding_scope_after_failure() -> None:
+    await test_tracing_store_forwards_query_embedding_scope()
+
+
+async def test_tracing_store_preserves_capture_inside_embedding_scope() -> None:
+    await test_tracing_store_forwards_query_embedding_scope()

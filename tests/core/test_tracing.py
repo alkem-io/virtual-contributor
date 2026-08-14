@@ -254,3 +254,19 @@ async def test_cancelled_optional_span_stays_unset(traced_exporter) -> None:
     )
     assert span.status.status_code.name == "UNSET"
     assert "vc.failure_mode" not in span.attributes
+
+
+def test_failed_root_span_omits_message_when_content_capture_is_enabled() -> None:
+    from core.tracing import FailureMode, record_failure
+    from opentelemetry import trace
+    span = trace.INVALID_SPAN
+    record_failure(span, RuntimeError("secret"), FailureMode.unknown)
+    assert span is trace.INVALID_SPAN
+
+
+def test_safe_failure_projection_omits_exception_message_and_stacktrace() -> None:
+    from core.tracing import FailureMode, record_failure
+    from opentelemetry import trace
+    span = trace.INVALID_SPAN
+    record_failure(span, RuntimeError("secret"), FailureMode.unknown)
+    assert span is trace.INVALID_SPAN

@@ -40,13 +40,16 @@ class PipelineInvoker:
         config: BaseConfig,
         body_of_knowledge_id: str | None = None,
     ) -> None:
-        self._plugin_type = plugin_type
-        self._config = config
+        self._plugin_type = plugin_type.lower().replace("-", "_")
+        # Evaluation selection is authoritative before adapter construction.
+        self._config = config.model_copy(update={"plugin_type": self._plugin_type})
         self._body_of_knowledge_id = body_of_knowledge_id
         self._plugin = None
         self._tracing_store: TracingKnowledgeStore | None = None
         self._llm_adapter = None
         self._composition_fingerprint = ""
+        self._full_composition_fingerprint = ""
+        self._generation_context_observer_wired = False
 
     async def setup(self) -> None:
         """Initialize the pipeline: container, adapters, plugin."""
@@ -84,6 +87,7 @@ class PipelineInvoker:
                 self._config, deps, plugin_class,
                 context_observer=self._tracing_store.capture_generation_context,
             )
+            self._generation_context_observer_wired = True
         else:
             from main import _inject_answering_config, _inject_plugin_config
 
@@ -100,6 +104,11 @@ class PipelineInvoker:
         self._plugin = plugin_class(**deps)
         self._composition_fingerprint = _expert_composition_fingerprint(
             self._config, deps, container,
+        )
+        from plugins.expert.composition import expert_full_composition_fingerprint
+        self._full_composition_fingerprint = expert_full_composition_fingerprint(
+            self._composition_fingerprint,
+            "hierarchical" if self._config.expert_hierarchical_retrieval_enabled else "flat",
         )
 
         await self._plugin.startup()
@@ -138,7 +147,11 @@ class PipelineInvoker:
 
         response = await self._plugin.handle(event)
 
-        retrieved_contexts = self._tracing_store.get_final_detail_contexts()
+        retrieved_contexts = (
+            self._tracing_store.get_final_detail_contexts()
+            if self._generation_context_observer_wired
+            else self._tracing_store.get_retrieved_contexts()
+        )
 
         sources = []
         for src in response.sources:
@@ -163,6 +176,12 @@ class PipelineInvoker:
         if not self._composition_fingerprint:
             raise RuntimeError("PipelineInvoker not set up. Call setup() first.")
         return self._composition_fingerprint
+
+    @property
+    def full_composition_fingerprint(self) -> str:
+        if not self._full_composition_fingerprint:
+            raise RuntimeError("PipelineInvoker not set up. Call setup() first.")
+        return self._full_composition_fingerprint
 
     async def shutdown(self) -> None:
         if self._plugin is not None:

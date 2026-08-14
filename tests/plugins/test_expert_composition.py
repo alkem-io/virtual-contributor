@@ -8,6 +8,7 @@ from core.config import BaseConfig
 from plugins.expert.composition import (
     expert_composition_descriptor,
     expert_composition_fingerprint,
+    expert_full_composition_fingerprint,
 )
 
 
@@ -183,3 +184,16 @@ def test_effective_plugin_llm_override_changes_the_fingerprint() -> None:
     assert expert_composition_fingerprint(raw, _dependencies(), llm_config=raw) != (
         expert_composition_fingerprint(raw, _dependencies(), llm_config=effective)
     )
+
+
+def test_invariant_fingerprint_excludes_only_hierarchy_mode() -> None:
+    assert expert_composition_fingerprint(
+        _config(expert_hierarchical_retrieval_enabled=False), _dependencies(), embeddings=_Embeddings(),
+    ) == expert_composition_fingerprint(
+        _config(expert_hierarchical_retrieval_enabled=True), _dependencies(), embeddings=_Embeddings(),
+    )
+
+
+def test_full_fingerprint_includes_hierarchy_mode() -> None:
+    invariant = expert_composition_fingerprint(_config(), _dependencies(), embeddings=_Embeddings())
+    assert expert_full_composition_fingerprint(invariant, "flat") != expert_full_composition_fingerprint(invariant, "hierarchical")

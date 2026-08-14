@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import re
+
+from plugins.expert.composition import expert_full_composition_fingerprint
+
 from pydantic import BaseModel, Field
 
 
@@ -54,6 +58,15 @@ class EvaluationRun(BaseModel):
     label: str | None = None
     plugin_type: str
     composition_fingerprint: str | None = None
+    # v4 pairing identity. Optional only so historical JSON remains displayable;
+    # comparison below intentionally requires every member.
+    hierarchy_mode: str | None = None
+    test_set_digest: str | None = None
+    body_of_knowledge_digest: str | None = None
+    corpus_revision: str | None = None
+    successful_case_digests: list[str] | None = None
+    invariant_composition_fingerprint: str | None = None
+    full_composition_fingerprint: str | None = None
     test_set_path: str
     test_case_count: int
     success_count: int
@@ -159,14 +172,31 @@ def compute_comparison(
     baseline: EvaluationRun, current: EvaluationRun
 ) -> ComparisonReport:
     """Compute per-metric deltas between two runs."""
-    if not baseline.composition_fingerprint or not current.composition_fingerprint:
-        raise ValueError(
-            "Evaluation composition fingerprints are required; comparison is not a hierarchy-only experiment"
-        )
-    if baseline.composition_fingerprint != current.composition_fingerprint:
-        raise ValueError(
-            "Evaluation composition fingerprints differ; comparison is not a hierarchy-only experiment"
-        )
+    runs = (baseline, current)
+    required = (
+        "hierarchy_mode", "test_set_digest", "body_of_knowledge_digest",
+        "corpus_revision", "successful_case_digests",
+        "invariant_composition_fingerprint", "full_composition_fingerprint",
+    )
+    if any(getattr(run, field) in (None, "") for run in runs for field in required):
+        raise ValueError("Evaluation runs lack complete v4 pairing identity")
+    if baseline.plugin_type != "expert" or current.plugin_type != "expert":
+        raise ValueError("Only Expert evaluation runs are comparable")
+    if baseline.hierarchy_mode != "flat" or current.hierarchy_mode != "hierarchical":
+        raise ValueError("Evaluation comparison requires Expert flat-to-hierarchical ordering")
+    if baseline.failure_count or current.failure_count:
+        raise ValueError("Evaluation comparison requires failure-free runs")
+    if not all(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}", run.corpus_revision or "") for run in runs):
+        raise ValueError("Evaluation corpus revision is invalid")
+    for field in ("test_set_digest", "body_of_knowledge_digest", "corpus_revision", "successful_case_digests", "invariant_composition_fingerprint"):
+        if getattr(baseline, field) != getattr(current, field):
+            raise ValueError(f"Evaluation {field} differs; comparison is not a paired experiment")
+    if baseline.full_composition_fingerprint == current.full_composition_fingerprint:
+        raise ValueError("Evaluation full fingerprints must differ by mode")
+    for run in runs:
+        expected = expert_full_composition_fingerprint(run.invariant_composition_fingerprint or "", run.hierarchy_mode or "")
+        if run.full_composition_fingerprint != expected:
+            raise ValueError("Evaluation full fingerprint is not bound to its mode")
     deltas: dict[str, MetricDelta] = {}
 
     for name in METRIC_NAMES:

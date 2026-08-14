@@ -101,21 +101,35 @@ def test_metadata_label_values_are_bounded() -> None:
     )
 
 
-def test_metadata_values_use_utf8_byte_limits_without_splitting_codepoints() -> None:
+def test_legacy_metadata_multibyte_values_keep_frozen_codepoint_caps() -> None:
     block = render_document_block(1, "passage", {"title": "é" * 101})
 
     title = block.split(" · ", 1)[1].split("]", 1)[0]
-    assert title == "é" * 100
-    assert len(title.encode("utf-8")) == 200
+    assert title == "é" * 101
+    assert len(title.encode("utf-8")) == 202
 
 
-def test_metadata_values_remove_control_and_format_characters() -> None:
+def test_legacy_metadata_controls_keep_frozen_base_semantics() -> None:
     block = render_document_block(
         1, "passage", {"title": "safe\x00\u202e\u200b name"},
     )
 
-    assert block == "[Document 1 · safe name]\npassage"
-    assert "\x00" not in block and "\u202e" not in block and "\u200b" not in block
+    assert block == "[Document 1 · safe\x00\u202e\u200b name]\npassage"
+    assert "\x00" in block and "\u202e" in block and "\u200b" in block
+
+
+def test_hierarchy_names_keep_hardened_utf8_and_control_semantics() -> None:
+    block = render_document_block(
+        1, "body", {"spaceName": "é" * 101 + "\x00x", "source": "raw\x00source"}, hierarchy=True,
+    )
+    assert "Space: " + "é" * 100 in block and "\x00" not in block.split(" · ")[1]
+    assert "raw\x00source" in block
+
+
+def test_flat_near_budget_legacy_metadata_matches_frozen_oracle() -> None:
+    content = "x" * 10
+    block = render_document_block(1, content, {"title": "é" * 200})
+    assert rendered_document_budget_size(block, content) == len(content) + len(block.removesuffix(content).encode())
 
 
 

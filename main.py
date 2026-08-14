@@ -31,6 +31,27 @@ from core.router import Router
 from plugins.expert.composition import expert_composition_fingerprint
 
 logger = logging.getLogger(__name__)
+GENERIC_PIPELINE_ERROR = "Error: unable to process request"
+
+
+def _is_embedding_error(exc: Exception) -> bool:
+    """Embedding retry ownership ends at the adapter, never at RabbitMQ."""
+    from core.ports.embeddings import EmbeddingError
+    return isinstance(exc, EmbeddingError)
+
+
+def _is_permanent_embedding_error(exc: Exception) -> bool:
+    """Return whether a terminal embedding result can be acknowledged.
+
+    Input and permanent provider failures have no useful broker-level recovery
+    path.  Once the generic result has been published, acknowledge them rather
+    than routing the request to the broker's rejected-message handling.
+    Exhausted transient failures remain a rejected terminal delivery so broker
+    policy can retain its operational signal, but they are never republished.
+    """
+    from core.ports.embeddings import EmbeddingInputError, EmbeddingPermanentError
+
+    return isinstance(exc, (EmbeddingInputError, EmbeddingPermanentError))
 
 
 def _mask_sensitive(name: str, value: object) -> str:
@@ -333,6 +354,10 @@ def _inject_plugin_config(
         deps["hierarchy_display_names_enabled"] = (
             config.expert_hierarchy_display_names_enabled
         )
+    if "embedding_query_max_utf8_bytes" in sig.parameters:
+        deps["embedding_query_max_utf8_bytes"] = config.embeddings_query_max_utf8_bytes
+    if "rewrite_max_utf8_bytes" in sig.parameters:
+        deps["rewrite_max_utf8_bytes"] = config.query_rewrite_max_utf8_bytes
 
     # Inject summarization configuration for ingest plugins
     if "summarize_llm" in sig.parameters:
@@ -492,6 +517,10 @@ def _create_adapters(config: BaseConfig, container: Container) -> None:
                 endpoint=config.embeddings_endpoint,
                 model_name=config.embeddings_model_name or "qwen3-embedding-8b",
                 query_instruction=config.embeddings_query_instruction,
+                query_max_utf8_bytes=config.embeddings_query_max_utf8_bytes,
+                max_attempts=config.embeddings_max_attempts,
+                attempt_timeout_seconds=config.embeddings_attempt_timeout_seconds,
+                total_deadline_seconds=config.embeddings_total_deadline_seconds,
             ),
         )
 
@@ -598,6 +627,9 @@ def build_message_handler(
                     plugin.handle(event),
                     timeout=config.pipeline_timeout,
                 )
+                if root is not None:
+                    from core.tracing import set_content_attribute
+                    set_content_attribute(root, "vc.message", getattr(event, "message", None), config)
                 envelope = router.build_response_envelope(response, event)
                 await _publish_result(envelope)
                 if root is not None:
@@ -611,7 +643,7 @@ def build_message_handler(
                 if root is not None:
                     record_failure(root, exc, FailureMode.llm_error, config=config)
                 from core.events.response import Response
-                error_response = Response(result=f"Error: {exc}")
+                error_response = Response(result=GENERIC_PIPELINE_ERROR)
                 envelope = router.build_response_envelope(error_response, event)
                 await _publish_result(envelope)
             except asyncio.TimeoutError as exc:
@@ -623,15 +655,15 @@ def build_message_handler(
                 if root is not None:
                     record_failure(root, exc, FailureMode.timeout, config=config)
                 from core.events.response import Response
-                error_response = Response(result=f"Error: pipeline timed out after {config.pipeline_timeout}s")
+                error_response = Response(result=GENERIC_PIPELINE_ERROR)
                 envelope = router.build_response_envelope(error_response, event)
                 await _publish_result(envelope)
             except Exception as exc:
-                logger.exception("Pipeline failed for event type %s: %s", type(event).__name__, exc)
+                logger.error("Pipeline failed for event type %s: error_type=%s", type(event).__name__, type(exc).__name__)
                 if root is not None:
                     record_failure(root, exc, classify_failure(exc), config=config)
                 from core.events.response import Response
-                error_response = Response(result=f"Error: {exc}")
+                error_response = Response(result=GENERIC_PIPELINE_ERROR)
                 envelope = router.build_response_envelope(error_response, event)
                 await _publish_result(envelope)
 
@@ -677,6 +709,9 @@ def build_message_handler(
                             plugin.handle(event),
                             timeout=config.pipeline_timeout,
                         )
+                        if root is not None:
+                            from core.tracing import set_content_attribute
+                            set_content_attribute(root, "vc.message", getattr(event, "message", None), config)
                         envelope = router.build_response_envelope(response, event)
                         await _publish_result(envelope)
                         published = True
@@ -694,7 +729,7 @@ def build_message_handler(
                         await _retry_or_reject(
                             message, body,
                             event=event,
-                            error_text=f"Error: {exc}",
+                            error_text=GENERIC_PIPELINE_ERROR,
                         )
                     except asyncio.TimeoutError as exc:
                         logger.error(
@@ -713,7 +748,7 @@ def build_message_handler(
                             ),
                         )
                     except Exception as exc:
-                        logger.exception("Error handling engine query: %s", exc)
+                        logger.error("Engine query failed: error_type=%s", type(exc).__name__)
                         if root is not None:
                             record_failure(root, exc, classify_failure(exc), config=config)
                         # If the answer already reached the result queue and only
@@ -724,11 +759,13 @@ def build_message_handler(
                             await _retry_or_reject(
                                 message, body,
                                 event=event,
-                                error_text=f"Error: {exc}",
+                                error_text=GENERIC_PIPELINE_ERROR,
+                                force_terminal=_is_embedding_error(exc),
+                                acknowledge_terminal=_is_permanent_embedding_error(exc),
                             )
         except Exception as exc:
             # parse_event failed — reject the message
-            logger.exception("Failed to parse message: %s", exc)
+            logger.error("Failed to parse message: error_type=%s", type(exc).__name__)
             await _retry_or_reject(message, body)
 
     async def _retry_or_reject(
@@ -737,6 +774,8 @@ def build_message_handler(
         *,
         event: object | None = None,
         error_text: str | None = None,
+        force_terminal: bool = False,
+        acknowledge_terminal: bool = False,
     ) -> None:
         """Requeue for another attempt or publish a final error.
 
@@ -749,7 +788,7 @@ def build_message_handler(
         retry_count = int(headers.get("x-retry-count", 0))
         max_retries = config.rabbitmq_max_retries
 
-        if retry_count < max_retries - 1:
+        if not force_terminal and retry_count < max_retries - 1:
             logger.warning(
                 "Message failed (attempt %d/%d), requeuing",
                 retry_count + 1, max_retries,
@@ -763,7 +802,7 @@ def build_message_handler(
                     new_headers,
                 )
             except Exception as pub_exc:
-                logger.error("Failed to republish retry message: %s", pub_exc)
+                logger.error("Failed to republish retry message: error_type=%s", type(pub_exc).__name__)
                 # Republish failed — the message will be lost after reject.
                 # Publish the error response now so the user isn't left hanging.
                 if event is not None and error_text:
@@ -791,11 +830,11 @@ def build_message_handler(
                     )
                     await _publish_result(envelope)
                 except Exception as pub_exc:
-                    logger.error(
-                        "Failed to publish terminal error response: %s",
-                        pub_exc,
-                    )
-            await message.reject(requeue=False)  # type: ignore[union-attr]
+                    logger.error("Failed to publish terminal error response: error_type=%s", type(pub_exc).__name__)
+            if acknowledge_terminal:
+                await message.ack()  # type: ignore[union-attr]
+            else:
+                await message.reject(requeue=False)  # type: ignore[union-attr]
 
     return on_message
 

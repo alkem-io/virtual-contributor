@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import AsyncContextManager, Protocol, runtime_checkable
 
 
 @dataclass
@@ -102,4 +102,17 @@ class KnowledgeStorePort(Protocol):
         where: dict | None = None,
     ) -> None:
         """Delete chunks by ID list and/or metadata filter."""
+        ...
+
+
+@runtime_checkable
+class QueryEmbeddingScopePort(Protocol):
+    """Optional capability for one request-local query embedding scope.
+
+    This deliberately sits beside, rather than inside, ``KnowledgeStorePort``:
+    stores that cannot reuse query vectors retain the stable query contract.
+    """
+
+    def query_embedding_scope(self) -> AsyncContextManager[None]:
+        """Create a scope whose successful query vectors die on exit."""
         ...

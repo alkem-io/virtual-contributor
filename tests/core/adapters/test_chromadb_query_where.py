@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -93,3 +94,26 @@ async def test_retry_fast_fails_validation_errors_but_retries_decode_errors() ->
 
     assert attempts["validation"] == 1  # fast-fail, no backoff burn
     assert attempts["decode"] == 3  # transient — full retry ladder
+
+
+async def test_chromadb_embedding_scope_reuses_exact_input_only(adapter: ChromaDBAdapter) -> None:
+    adapter._query_embedding_cache = contextvars.ContextVar("test-cache", default=None)
+    async with adapter.query_embedding_scope():
+        await adapter._embed_query(["same"])
+        await adapter._embed_query(["same"])
+        await adapter._embed_query(["different"])
+    assert adapter._embeddings.embed_query.await_count == 2
+
+
+async def test_chromadb_embedding_scope_does_not_reuse_across_requests(adapter: ChromaDBAdapter) -> None:
+    adapter._query_embedding_cache = contextvars.ContextVar("test-cache-2", default=None)
+    async with adapter.query_embedding_scope():
+        await adapter._embed_query(["same"])
+    async with adapter.query_embedding_scope():
+        await adapter._embed_query(["same"])
+    assert adapter._embeddings.embed_query.await_count == 2
+
+
+def test_chromadb_query_signature_remains_knowledge_store_compatible() -> None:
+    from core.ports.knowledge_store import KnowledgeStorePort
+    assert isinstance(ChromaDBAdapter.__new__(ChromaDBAdapter), KnowledgeStorePort)

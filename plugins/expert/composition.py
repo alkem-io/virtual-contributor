@@ -130,3 +130,15 @@ def expert_composition_fingerprint(
     )
     serialized = json.dumps(descriptor, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def expert_full_composition_fingerprint(invariant: str, mode: str) -> str:
+    """Bind a valid invariant composition fingerprint to its experiment mode."""
+    if mode not in {"flat", "hierarchical"}:
+        raise ValueError("Expert composition mode must be flat or hierarchical")
+    if len(invariant) != 64 or any(c not in "0123456789abcdef" for c in invariant):
+        raise ValueError("Expert invariant fingerprint must be a SHA-256 hex digest")
+    payload = {"schema": "expert-composition/v4", "invariant": invariant, "mode": mode}
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()

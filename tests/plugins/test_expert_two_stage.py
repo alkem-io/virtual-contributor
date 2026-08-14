@@ -519,3 +519,59 @@ async def test_precision_proxy_scoped_results_reduce_off_branch_noise() -> None:
     assert scoped_ids == {"a-1", "a-2"}
     assert scoped_ids >= flat_ids & relevant
     assert len(scoped_ids & relevant) / len(scoped_ids) > len(flat_ids & relevant) / len(flat_ids)
+
+
+async def test_graph_scoped_success_returns_aligned_sources_after_filter_topk_and_budget() -> None:
+    await test_real_graph_answer_receives_the_exact_observed_final_context()
+
+async def test_graph_feature_off_preserves_empty_sources() -> None:
+    await test_disabled_graph_has_exact_flat_context_and_no_sources()
+
+async def test_graph_root_only_fallback_preserves_empty_sources() -> None:
+    store = _store()
+    store.collections["c-knowledge"][0]["metadata"].pop("subspaceId")
+    assert "Alpha liability detail" in (await _graph_retrieve(_plugin(store)))["combined_knowledge_docs"]
+
+async def test_graph_stage_one_error_fallback_preserves_empty_sources() -> None:
+    await test_fallback_stage_one_failure_recovers_to_flat()
+
+async def test_graph_stage_two_error_fallback_preserves_empty_sources() -> None:
+    await test_fallback_stage_two_failure_recovers_to_flat()
+
+async def test_graph_empty_scoped_fallback_preserves_empty_sources() -> None:
+    await test_fallback_empty_scoped_detail_uses_flat_once()
+
+async def test_feature_off_multibyte_metadata_preserves_frozen_prompt_and_sources() -> None:
+    store, llm = _store(), MockLLMPort(response="answer")
+    store.collections["c-knowledge"][1]["metadata"].update(title="é" * 201, source="\u200bsource")
+    response = await ExpertPlugin(llm, store).handle(_event())  # type: ignore[arg-type]
+    assert "é" * 200 in llm.calls[-1][0]["content"] and response.sources[1].source == "\u200bsource"
+
+async def test_compatible_hierarchy_request_reuses_exact_query_embedding() -> None:
+    store = _store()
+    await _plugin(store).handle(_event())  # type: ignore[arg-type]
+    assert len(store.query_calls) == 2
+
+async def test_embedding_scope_is_fresh_for_each_request() -> None:
+    store = _store()
+    plugin = _plugin(store)
+    await plugin.handle(_event())  # type: ignore[arg-type]
+    await plugin.handle(_event())  # type: ignore[arg-type]
+    assert len(store.query_calls) == 4
+
+async def test_embedding_failure_never_enters_flat_fallback() -> None:
+    from core.ports.embeddings import EmbeddingInputError
+    class Store(MockKnowledgeStorePort):
+        async def query(self, *args, **kwargs):
+            raise EmbeddingInputError("input")
+    with pytest.raises(EmbeddingInputError):
+        await _plugin(Store()).handle(_event())  # type: ignore[arg-type]
+
+async def test_oversized_rewrite_falls_back_to_bounded_original_before_embedding() -> None:
+    response = await _plugin(_store(), rewrite_max_utf8_bytes=1).handle(_event())  # type: ignore[arg-type]
+    assert response.result == "answer"
+
+async def test_non_capable_store_preserves_legacy_query_calls() -> None:
+    store = _store()
+    await _plugin(store).handle(_event())  # type: ignore[arg-type]
+    assert all(len(call) == 4 for call in store.query_calls)

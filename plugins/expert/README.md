@@ -2,6 +2,14 @@
 
 PromptGraph-based plugin with single-collection RAG retrieval for knowledge-grounded Q&A.
 
+Hierarchy is opt-in. Only a nonempty scoped Stage-2 result supplies PromptGraph
+sources; feature-off and all flat fallbacks retain empty graph sources. Legacy
+metadata retains its frozen rendering behavior, while hierarchy display names
+alone are UTF-8/control-character hardened. Compatible Chroma stores open one
+request-local embedding scope around Stage 1 and Stage 2/fallback, cache only
+successful exact inputs, and clear on exit. Typed embedding errors bypass flat
+fallback and RabbitMQ redelivery; external error delivery is generic and safe.
+
 ## Overview
 
 | Property | Value |

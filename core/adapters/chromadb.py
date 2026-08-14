@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 import json
 import re
+from contextlib import asynccontextmanager
 from typing import Any, Protocol
 
 import chromadb
@@ -46,6 +48,31 @@ class ChromaDBAdapter:
         )
         self._embeddings = embeddings
         self._distance_fn = distance_fn
+        self._query_embedding_cache: contextvars.ContextVar[dict[tuple[str, ...], list[list[float]]] | None] = contextvars.ContextVar(
+            "chroma_query_embedding_cache", default=None,
+        )
+
+    @asynccontextmanager
+    async def query_embedding_scope(self):
+        """Reuse successful exact query vectors only inside this task scope."""
+        token = self._query_embedding_cache.set({})
+        try:
+            yield
+        finally:
+            self._query_embedding_cache.reset(token)
+
+    async def _embed_query(self, query_texts: list[str]) -> list[list[float]]:
+        if self._embeddings is None:
+            raise ValueError("ChromaDBAdapter requires an embeddings provider when embedding_function=None")
+        key = tuple(query_texts)
+        cache_var = getattr(self, "_query_embedding_cache", None)
+        cache = cache_var.get() if cache_var is not None else None
+        if cache is not None and key in cache:
+            return cache[key]
+        vectors = await self._embeddings.embed_query(query_texts)
+        if cache is not None:
+            cache[key] = vectors
+        return vectors
 
     async def query(
         self,
@@ -54,12 +81,7 @@ class ChromaDBAdapter:
         n_results: int = 10,
         where: dict | None = None,
     ) -> QueryResult:
-        if self._embeddings is None:
-            raise ValueError(
-                "ChromaDBAdapter requires an embeddings provider when "
-                "embedding_function=None"
-            )
-        query_embeddings = await self._embeddings.embed_query(query_texts)
+        query_embeddings = await self._embed_query(query_texts)
 
         def _query():
             col = self._client.get_or_create_collection(
@@ -117,15 +139,10 @@ class ChromaDBAdapter:
         if not terms:
             # Nothing to match literally — say so without troubling the store.
             return QueryResult(documents=[[]], metadatas=[[]], distances=[[]], ids=[[]])
-        if self._embeddings is None:
-            raise ValueError(
-                "ChromaDBAdapter requires an embeddings provider when "
-                "embedding_function=None"
-            )
 
         # The store has no text-only query: a vector is still required, and the
         # document predicate narrows the candidates it ranks.
-        query_embeddings = await self._embeddings.embed_query([" ".join(terms)])
+        query_embeddings = await self._embed_query([" ".join(terms)])
         where_document = self._document_predicate(terms)
 
         def _query():

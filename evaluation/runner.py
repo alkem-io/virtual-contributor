@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import math
@@ -12,7 +13,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from evaluation.dataset import TestCase
+from evaluation.dataset import TestCase, canonical_test_set_digest, successful_case_digest
 from evaluation.report import (
     AggregateMetrics,
     EvaluationCase,
@@ -85,12 +86,20 @@ class EvaluationRunner:
         plugin_type: str,
         label: str | None = None,
         test_set_path: str = "evaluation/golden/test_set.jsonl",
+        body_of_knowledge_id: str | None = None,
+        corpus_revision: str | None = None,
     ) -> EvaluationRun:
         """Execute the full evaluation suite.
 
         Processes each test case sequentially, capturing responses and scores.
         Failed cases are recorded but do not stop the run (FR-010).
         """
+        normalized_plugin = plugin_type.lower().replace("-", "_")
+        if normalized_plugin == "expert" and (
+            not isinstance(corpus_revision, str)
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}", corpus_revision) is None
+        ):
+            raise ValueError("Expert evaluation requires a safe corpus revision")
         run_start = time.monotonic()
         ts = datetime.now(timezone.utc)
         ts_str = ts.strftime("%Y%m%dT%H%M%S")
@@ -192,12 +201,22 @@ class EvaluationRunner:
         # protocol property; only persist an actual deterministic fingerprint.
         if not isinstance(fingerprint, str):
             fingerprint = None
+        invariant = getattr(self._invoker, "composition_fingerprint", None)
+        full = getattr(self._invoker, "full_composition_fingerprint", None)
+        mode = "hierarchical" if getattr(getattr(self._invoker, "_config", None), "expert_hierarchical_retrieval_enabled", False) else "flat"
         run = EvaluationRun(
             id=run_id,
             timestamp=ts.isoformat(),
             label=label,
             plugin_type=plugin_type,
             composition_fingerprint=fingerprint,
+            hierarchy_mode=mode if normalized_plugin == "expert" else None,
+            test_set_digest=canonical_test_set_digest(test_cases) if normalized_plugin == "expert" else None,
+            body_of_knowledge_digest=hashlib.sha256((body_of_knowledge_id or "").encode("utf-8")).hexdigest() if normalized_plugin == "expert" else None,
+            corpus_revision=corpus_revision if normalized_plugin == "expert" else None,
+            successful_case_digests=[successful_case_digest(test_cases[c.index]) for c in cases if c.error is None] if normalized_plugin == "expert" else None,
+            invariant_composition_fingerprint=invariant if normalized_plugin == "expert" and isinstance(invariant, str) else None,
+            full_composition_fingerprint=full if normalized_plugin == "expert" and isinstance(full, str) else None,
             test_set_path=test_set_path,
             test_case_count=total,
             success_count=success_count,

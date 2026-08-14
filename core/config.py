@@ -191,6 +191,25 @@ class BaseConfig(BaseSettings):
                 f"(1.0, 100.0], got {self.query_rewrite_max_expansion_ratio}"
             )
 
+        if self.embeddings_query_max_utf8_bytes <= 0:
+            raise ValueError("EMBEDDINGS_QUERY_MAX_UTF8_BYTES must be greater than 0")
+        if self.query_rewrite_max_utf8_bytes <= 0:
+            raise ValueError("QUERY_REWRITE_MAX_UTF8_BYTES must be greater than 0")
+        if self.query_rewrite_max_utf8_bytes > self.embeddings_query_max_utf8_bytes:
+            raise ValueError(
+                "QUERY_REWRITE_MAX_UTF8_BYTES must not exceed EMBEDDINGS_QUERY_MAX_UTF8_BYTES"
+            )
+        if not 1 <= self.embeddings_max_attempts <= 5:
+            raise ValueError("EMBEDDINGS_MAX_ATTEMPTS must be between 1 and 5")
+        if self.embeddings_attempt_timeout_seconds <= 0:
+            raise ValueError("EMBEDDINGS_ATTEMPT_TIMEOUT_SECONDS must be greater than 0")
+        if self.embeddings_total_deadline_seconds <= 0:
+            raise ValueError("EMBEDDINGS_TOTAL_DEADLINE_SECONDS must be greater than 0")
+        if self.embeddings_attempt_timeout_seconds > self.embeddings_total_deadline_seconds:
+            raise ValueError("EMBEDDINGS_ATTEMPT_TIMEOUT_SECONDS must not exceed EMBEDDINGS_TOTAL_DEADLINE_SECONDS")
+        if self.embeddings_total_deadline_seconds > self.pipeline_timeout:
+            raise ValueError("EMBEDDINGS_TOTAL_DEADLINE_SECONDS must not exceed PIPELINE_TIMEOUT")
+
         if self.summarize_llm_timeout is not None and self.summarize_llm_timeout <= 0:
             raise ValueError(
                 f"SUMMARIZE_LLM_TIMEOUT must be greater than 0, "
@@ -484,6 +503,10 @@ class BaseConfig(BaseSettings):
     # the Qwen3 retrieval prompt when the model name starts with
     # "qwen3-embedding"; any explicit value (including "") is used verbatim.
     embeddings_query_instruction: str | None = None
+    embeddings_query_max_utf8_bytes: int = 32768
+    embeddings_max_attempts: int = 3
+    embeddings_attempt_timeout_seconds: int = 20
+    embeddings_total_deadline_seconds: int = 45
 
     # Summarization LLM — optional separate model for summarization tasks
     summarize_llm_provider: LLMProvider | None = None
@@ -601,6 +624,7 @@ class BaseConfig(BaseSettings):
     # takes the smaller of the two — see main.py.
     query_rewrite_max_history_turns: int = 20
     query_rewrite_max_history_chars: int = 12000
+    query_rewrite_max_utf8_bytes: int = 4096
 
     # Health
     health_port: int = 8080

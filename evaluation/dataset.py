@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 from pathlib import Path
 
@@ -19,6 +20,19 @@ class TestCase(BaseModel):
     question: str = Field(min_length=1)
     expected_answer: str = Field(min_length=1)
     relevant_documents: list[str] = Field(min_length=1)
+
+
+def canonical_test_set_digest(cases: list[TestCase]) -> str:
+    """Hash ordered canonical case JSON, independent of its source path."""
+    payload = [case.model_dump() for case in cases]
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def successful_case_digest(case: TestCase) -> str:
+    """Stable identity for the successful input case, excluding model output."""
+    encoded = json.dumps(case.model_dump(), ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def load_test_set(path: Path = DEFAULT_TEST_SET_PATH) -> list[TestCase]:
