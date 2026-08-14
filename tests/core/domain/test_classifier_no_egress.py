@@ -101,6 +101,51 @@ class TestStaticNoNetworkImport:
         assert not inspect.iscoroutinefunction(RuleQueryClassifier().classify)
 
 
+class TestEveryImplementationIsLocal:
+    """The guarantee belongs to the SEAM, not to one module.
+
+    Scanning only the shipped classifier proves the shipped classifier is
+    clean — it says nothing about which implementation gets injected. A
+    sibling module implementing the same port and POSTing each question to
+    Mistral would satisfy `QueryRouterPort`, be accepted by both plugins, and
+    pass a module-pinned scan without a single test failing. So the scan is
+    applied to every implementation of the port that exists in the tree.
+    """
+
+    @staticmethod
+    def _port_implementations() -> dict[str, Path]:
+        """Every module under core/ defining a class with a `classify` method."""
+        found: dict[str, Path] = {}
+        for path in (_REPO_ROOT / "core").rglob("*.py"):
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.ClassDef):
+                    continue
+                methods = {
+                    b.name for b in node.body
+                    if isinstance(b, (ast.FunctionDef, ast.AsyncFunctionDef))
+                }
+                if "classify" in methods:
+                    found[str(path.relative_to(_REPO_ROOT))] = path
+        return found
+
+    def test_the_shipped_classifier_is_discovered(self) -> None:
+        """Guard the guard — an empty sweep would pass vacuously."""
+        assert "core/domain/rule_classifier.py" in self._port_implementations()
+
+    def test_no_port_implementation_can_perform_io(self) -> None:
+        for module, path in self._port_implementations().items():
+            for name in _imported_names(path):
+                root = name.split(".")[0]
+                assert name not in _FORBIDDEN_IMPORTS, f"{module} imports {name}"
+                assert root not in _FORBIDDEN_IMPORTS, f"{module} imports {name}"
+
+    def test_main_injects_the_rule_classifier(self) -> None:
+        """The injection point itself, so substitution is a visible change."""
+        source = (_REPO_ROOT / "main.py").read_text(encoding="utf-8")
+        assert 'deps["query_router"] = RuleQueryClassifier()' in source
+
+
 class TestRuntimeNoEgress:
     def test_classification_completes_with_sockets_poisoned(
         self, monkeypatch: pytest.MonkeyPatch,

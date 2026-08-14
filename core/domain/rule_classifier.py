@@ -124,15 +124,20 @@ class RuleQueryClassifier:
         skips retrieval, so it is also the only one with a hard gate in front
         of it.
         """
-        if not message or not message.strip():
-            # Nothing to classify. Behave as today rather than guessing.
+        if not message:
             return RoutingDecision(RouteClass.SIMPLE, "empty message")
 
-        # Bounded before any scanning. Truncation can only ever move a message
-        # AWAY from the retrieval-skipping route (a truncated message is still
-        # too long to be small talk), so it cannot cause the one harmful
-        # misclassification.
+        # Bounded FIRST, before any pass over the string — `strip()` on a
+        # multi-megabyte message is itself an O(n) scan on the event loop.
+        # Truncation can only ever move a message AWAY from the
+        # retrieval-skipping route (a message long enough to be truncated is
+        # far past the six-word small-talk limit), so it cannot cause the one
+        # harmful misclassification.
         message = message[:MAX_CLASSIFIED_CHARS]
+
+        if not message.strip():
+            # Nothing to classify. Behave as today rather than guessing.
+            return RoutingDecision(RouteClass.SIMPLE, "empty message")
 
         if self._is_conversational(message):
             return RoutingDecision(

@@ -12,7 +12,7 @@ from core.events.response import Response, Source
 from core.domain.routing import DEFAULT_ROUTING_TABLE, RetrievalProfile
 from core.ports.llm import LLMPort
 from core.ports.knowledge_store import KnowledgeStorePort
-from core.ports.query_router import QueryRouterPort
+from core.ports.query_router import QueryRouterPort, RouteClass, RoutingDecision
 
 logger = logging.getLogger(__name__)
 
@@ -72,21 +72,47 @@ class GuidancePlugin:
             return unrouted
         try:
             decision = self._query_router.classify(message)
+            # Validated, not trusted. The port is a Protocol with no runtime
+            # return-type enforcement, so a substituted router may hand back
+            # None, a bare string, or an object with no `route`. Every one of
+            # those would raise out of here and turn a query that would
+            # otherwise be answered into a retried, then failed, request —
+            # breaking the promise this method's docstring makes.
+            if not isinstance(decision, RoutingDecision):
+                logger.warning(
+                    "Query router returned %s, not a RoutingDecision; "
+                    "using unrouted defaults",
+                    type(decision).__name__,
+                )
+                return unrouted
+            if not isinstance(decision.route, RouteClass):
+                logger.warning(
+                    "Query router returned an unknown route type (%s); "
+                    "using unrouted defaults",
+                    type(decision.route).__name__,
+                )
+                return unrouted
+            profile = self._routing_table.get(decision.route)
+            if profile is None:
+                logger.warning(
+                    "No profile for route %s; using defaults", decision.route,
+                )
+                return unrouted
+            # The route, never the reason. `reason` is free text a substituted
+            # classifier could build from the member's own question, and this
+            # line goes to stdout and on to central logging.
+            logger.info(
+                "Routed query as %s: retrieve=%s n_results=%d budget=%d",
+                decision.route.value,
+                profile.retrieve, profile.n_results, profile.max_context_chars,
+            )
+            logger.debug("Routing reason: %s", decision.reason)
         except Exception:
             logger.warning(
                 "Query classification failed; using unrouted defaults",
                 exc_info=True,
             )
             return unrouted
-        profile = self._routing_table.get(decision.route)
-        if profile is None:
-            logger.warning("No profile for route %s; using defaults", decision.route)
-            return unrouted
-        logger.info(
-            "Routed query as %s (%s): retrieve=%s n_results=%d budget=%d",
-            decision.route.value, decision.reason,
-            profile.retrieve, profile.n_results, profile.max_context_chars,
-        )
         return profile
 
     async def startup(self) -> None:

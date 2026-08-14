@@ -179,6 +179,28 @@ class BaseConfig(BaseSettings):
                 f"ROUTING_COMPLEX_CONTEXT_CHARS must be greater than 0, "
                 f"got {self.routing_complex_context_chars}"
             )
+        if self.routing_simple_n_results > self.retrieval_n_results:
+            # Documented in .env.example and on the field itself: a simple
+            # query must never become slower than it is today. Enforced here
+            # so the promise is not merely written down.
+            raise ValueError(
+                f"ROUTING_SIMPLE_N_RESULTS ({self.routing_simple_n_results}) "
+                f"must not exceed RETRIEVAL_N_RESULTS "
+                f"({self.retrieval_n_results})"
+            )
+        if self.routing_complex_n_results > 100:
+            # An extra zero in an env var should not start the pod and then
+            # degrade it under load.
+            raise ValueError(
+                f"ROUTING_COMPLEX_N_RESULTS must be at most 100, "
+                f"got {self.routing_complex_n_results}"
+            )
+        if self.routing_complex_context_chars > 10 * self.max_context_chars:
+            raise ValueError(
+                f"ROUTING_COMPLEX_CONTEXT_CHARS "
+                f"({self.routing_complex_context_chars}) must be at most 10x "
+                f"MAX_CONTEXT_CHARS ({self.max_context_chars})"
+            )
         if self.routing_complex_n_results < self.routing_simple_n_results:
             # Incoherent: the route meant to see more would see less.
             raise ValueError(

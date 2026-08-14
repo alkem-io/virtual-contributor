@@ -254,3 +254,58 @@ class TestGraphPathRoutesToo:
         await _run_graph_retrieve(_plugin(store, n_results=7), "thanks!")
         assert len(store.query_calls) == 1
         assert store.query_calls[0][2] == 7
+
+
+class TestMalformedRoutersStillAnswer:
+    """The port is a Protocol — nothing enforces what a router returns.
+
+    The docstring promises classification is "never a dependency of answering".
+    Before this was widened, only a *raising* router honoured that: a router
+    returning None, a bare string, or an object without `.route` raised
+    straight through, turning every query into a retried-then-failed request.
+    """
+
+    @pytest.mark.parametrize(
+        "router",
+        [
+            _Raises(),
+            type("ReturnsNone", (), {"classify": lambda self, m: None})(),
+            type("ReturnsStr", (), {"classify": lambda self, m: "conversational"})(),
+            type("NoAttrs", (), {"classify": lambda self, m: object()})(),
+            type("BadRoute", (), {
+                "classify": lambda self, m: RoutingDecision("nonsense", "x"),  # type: ignore[arg-type]
+            })(),
+        ],
+    )
+    async def test_a_malformed_router_answers_with_defaults(
+        self, router: object,
+    ) -> None:
+        store = MockKnowledgeStorePort()
+        plugin = _plugin(store, n_results=5, query_router=router)
+        response = await plugin.handle(make_input(message="who is the lead?"))
+        assert response is not None
+        assert store.query_calls[0][2] == 5
+
+    async def test_the_reason_string_is_not_logged_at_info(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """`reason` is free text a router could build from the question.
+
+        This line goes to stdout and on to central logging, so it carries the
+        route and nothing a substituted classifier controls.
+        """
+        import logging
+
+        leaky = type("Leaky", (), {
+            "classify": lambda self, m: RoutingDecision(
+                RouteClass.SIMPLE, f"echoing {m}",
+            ),
+        })()
+        store = MockKnowledgeStorePort()
+        plugin = _plugin(store, query_router=leaky)
+        with caplog.at_level(logging.INFO, logger="plugins.expert.plugin"):
+            await plugin.handle(make_input(message="SECRET-SPACE-QUESTION"))
+        info_lines = [
+            r.getMessage() for r in caplog.records if r.levelno >= logging.INFO
+        ]
+        assert not any("SECRET-SPACE-QUESTION" in line for line in info_lines)

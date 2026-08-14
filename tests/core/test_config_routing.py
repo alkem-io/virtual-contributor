@@ -48,9 +48,34 @@ class TestValidation:
             _config(routing_complex_context_chars=value)
 
     def test_rejects_complex_narrower_than_simple(self) -> None:
-        """The route meant to see more must not see less."""
+        """The route meant to see more must not see less.
+
+        Simple stays within RETRIEVAL_N_RESULTS here so this isolates the
+        ordering rule rather than tripping the "never slower than today" one.
+        """
         with pytest.raises(ValidationError, match="ROUTING_COMPLEX_N_RESULTS"):
-            _config(routing_simple_n_results=8, routing_complex_n_results=2)
+            _config(routing_simple_n_results=4, routing_complex_n_results=2)
+
+    def test_rejects_simple_wider_than_the_global_default(self) -> None:
+        """A simple query must never become slower than it is today.
+
+        Documented on the field and in .env.example — enforced here so the
+        promise is not merely written down.
+        """
+        with pytest.raises(ValidationError, match="ROUTING_SIMPLE_N_RESULTS"):
+            _config(routing_simple_n_results=99, routing_complex_n_results=99)
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"routing_complex_n_results": 10_000},
+            {"routing_complex_context_chars": 10**12},
+        ],
+    )
+    def test_rejects_absurd_upper_values(self, overrides: dict) -> None:
+        """An extra zero should not start the pod and degrade it under load."""
+        with pytest.raises(ValidationError, match="ROUTING_COMPLEX"):
+            _config(**overrides)
 
     def test_equal_widths_are_valid(self) -> None:
         config = _config(routing_simple_n_results=5, routing_complex_n_results=5)
