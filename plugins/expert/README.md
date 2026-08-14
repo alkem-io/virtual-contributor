@@ -38,7 +38,7 @@ Query → KnowledgeStore.query(collection, message, n_results)
 
 Every surviving retrieved passage is presented to the model as a separate block:
 
-```
+```text
 [Document 1 · Document title · callout · origin: https://example.org/source]
 <verbatim retrieved passage>
 ```
@@ -47,7 +47,11 @@ Numbers are 1-based and apply only to the documents supplied for that answer.
 Labels use existing metadata only: title falls back to URI, source, then
 `Untitled`; kind and origin are included when present. No space/subspace/callout
 hierarchy is invented. The model is instructed to cite substantive claims as
-`[Document N]` and never cite a number it did not receive. These inline
+`[Document N]` and never cite a number it did not receive. Because passage
+bodies are verbatim and untrusted, the prompt also names the exact citable
+range for that answer (`[Document 1]` through `[Document N]`) and states that
+bracketed text *inside* a passage body is quoted content, not a citable label.
+These inline
 citations are LLM-visible answer text only: they are not positions in, and do
 not change, the platform's structured `sources[]` list. Two expert passages
 from one origin may therefore have two document numbers but one source entry.

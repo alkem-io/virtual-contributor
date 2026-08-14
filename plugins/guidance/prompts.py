@@ -23,6 +23,8 @@ retrieve_prompt = (
     "{empty_context_instruction}"
     + "\n\n"
     + CITATION_INSTRUCTIONS
+    + "\n"
+    "{citation_scope_instruction}"
     + "\n\n"
     "Context:\n{context}\n\n"
     "Question: {question}\n\n"

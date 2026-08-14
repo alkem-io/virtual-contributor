@@ -38,7 +38,7 @@ The LLM is prompted to respond in structured JSON format. The plugin parses JSON
 Every surviving retrieved passage is supplied as an independently delimited
 block, for example:
 
-```
+```text
 [Document 1 · Document title · callout · origin: https://example.org/source]
 <verbatim retrieved passage>
 ```
@@ -48,6 +48,10 @@ metadata: title falls back to URI, source, then `Untitled`; kind and origin are
 included only when available. The plugin never fabricates a space/subspace/
 callout hierarchy. The model is instructed to support substantive claims with
 `[Document N]` citations and to cite only numbers in the supplied context.
+Because passage bodies are verbatim and untrusted, the prompt also names the
+exact citable range for that answer (`[Document 1]` through `[Document N]`) and
+states that bracketed text *inside* a passage body is quoted content, not a
+citable label.
 Those markers are LLM-visible answer text; the structured platform `sources[]`
 envelope, including its source population, is unchanged.
 

@@ -15,6 +15,8 @@ combined_expert_prompt = (
     "{empty_context_instruction}"
     + "\n\n"
     + CITATION_INSTRUCTIONS
+    + "\n"
+    "{citation_scope_instruction}"
     + "\n\n"
     "Knowledge:\n{knowledge}\n\n"
     "Question: {question}\n\n"

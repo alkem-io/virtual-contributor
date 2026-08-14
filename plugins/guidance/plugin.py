@@ -9,6 +9,7 @@ import re
 
 from core.domain.prompts_shared import (
     STEP_BY_STEP_ANSWER_INSTRUCTIONS,
+    citation_scope_instruction,
     empty_context_instruction,
     join_document_blocks,
     render_document_block,
@@ -207,6 +208,7 @@ class GuidancePlugin:
             question=question,
             language=language,
             empty_context_instruction=empty_context_instruction(bool(deduped)),
+            citation_scope_instruction=citation_scope_instruction(len(deduped)),
         )
         complexity_instruction = self._complexity_instruction(question)
         if complexity_instruction:
