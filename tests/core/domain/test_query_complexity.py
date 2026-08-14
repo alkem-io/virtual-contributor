@@ -136,11 +136,17 @@ def test_interrogative_scan_cost_is_linear_in_token_count() -> None:
             steps += 1
             return tracer
 
+        # coverage.py measures through the SAME hook, so `settrace(None)`
+        # would uninstall it for the rest of the session — every module
+        # imported after this point reads as unexecuted. Measured: the suite
+        # reported 58% with the naive restore and 91% without this test at
+        # all. Save and put back whatever was installed instead.
+        previous = sys.gettrace()
         sys.settrace(tracer)
         try:
             _has_conjoined_interrogatives(_WORD_RE.findall(text))
         finally:
-            sys.settrace(None)
+            sys.settrace(previous)
         return steps
 
     small = count_steps("what " + "and x " * 400)
@@ -148,3 +154,36 @@ def test_interrogative_scan_cost_is_linear_in_token_count() -> None:
 
     # Linear would be ~2x; allow generous slack but reject quadratic (~4x).
     assert large < small * 3, f"{small} -> {large} steps looks super-linear"
+
+
+def test_no_test_uninstalls_the_coverage_tracer() -> None:
+    """`sys.settrace(None)` silently destroys the coverage measurement.
+
+    coverage.py measures through the same hook, so clearing it leaves every
+    module imported afterwards reading as unexecuted. This is invisible
+    locally — the suite still passes — and only surfaces as a CI coverage-gate
+    failure with no failing test to point at. Measured when it happened here:
+    **58% reported, 91% actual**, a 33-point phantom drop across modules the
+    change never touched.
+
+    Save and restore whatever was installed instead of clearing it.
+    """
+    import ast
+    from pathlib import Path
+
+    offenders: list[str] = []
+    for path in (Path(__file__).resolve().parents[3] / "tests").rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"settrace", "setprofile"}
+                and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and node.args[0].value is None
+            ):
+                offenders.append(f"{path.name}:{node.lineno}")
+    assert not offenders, (
+        f"these clear the tracer instead of restoring it: {offenders}"
+    )
