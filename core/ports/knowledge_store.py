@@ -6,11 +6,18 @@ from typing import Protocol, runtime_checkable
 
 @dataclass
 class QueryResult:
-    """Result returned from a knowledge store query."""
+    """Result returned from a knowledge store query.
+
+    A distance may be ``None``. Lexical matching answers "does this passage
+    contain the term", which has no distance to report — so a passage found
+    only that way carries ``None`` rather than a fabricated ``0.0``, which
+    would read as a perfect semantic match. Callers must treat ``None`` as
+    "no semantic distance available", never as a number.
+    """
 
     documents: list[list[str]]
     metadatas: list[list[dict]]
-    distances: list[list[float]]
+    distances: list[list[float | None]]
     ids: list[list[str]]
 
 
@@ -39,6 +46,27 @@ class KnowledgeStorePort(Protocol):
 
         ``where=None`` leaves the query unfiltered.  A supplied Chroma ``where``
         predicate is applied before ranking and is used verbatim.
+        """
+        ...
+
+    async def query_lexical(
+        self,
+        collection: str,
+        terms: list[str],
+        n_results: int = 10,
+        where: dict | None = None,
+    ) -> QueryResult:
+        """Find passages containing any of ``terms``, matched literally.
+
+        Complements :meth:`query`, which matches on meaning and can miss an
+        exact name or identifier whose surrounding wording is unremarkable.
+
+        Matching is case-insensitive and the terms are literals, not patterns —
+        a member's punctuation must never be interpreted. Results carry no
+        distance (see :class:`QueryResult`); their order is a ranking, not a
+        score, which is why callers fuse by rank rather than by value.
+
+        An empty ``terms`` list yields an empty result without querying.
         """
         ...
 

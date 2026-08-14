@@ -3,6 +3,7 @@ from __future__ import annotations
 from enum import Enum
 
 import logging
+import math
 
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings
@@ -197,6 +198,49 @@ class BaseConfig(BaseSettings):
                 f"GUIDANCE_MIN_SCORE must be between 0.0 and 1.0, got {self.guidance_min_score}"
             )
 
+        # Hybrid retrieval validation — rejected at startup rather than
+        # degrading retrieval quietly at query time.
+        if self.hybrid_rrf_k <= 0:
+            raise ValueError(
+                f"HYBRID_RRF_K must be greater than 0, got {self.hybrid_rrf_k}"
+            )
+        if not math.isfinite(self.hybrid_dense_weight) or not math.isfinite(
+            self.hybrid_lexical_weight
+        ):
+            # NaN compares false against everything, so it would slip past the
+            # bounds below and then make every ordering comparison arbitrary.
+            raise ValueError(
+                "HYBRID_DENSE_WEIGHT and HYBRID_LEXICAL_WEIGHT must be finite "
+                f"numbers, got {self.hybrid_dense_weight} and "
+                f"{self.hybrid_lexical_weight}"
+            )
+        if self.hybrid_dense_weight < 0:
+            raise ValueError(
+                f"HYBRID_DENSE_WEIGHT must not be negative, "
+                f"got {self.hybrid_dense_weight}"
+            )
+        if self.hybrid_lexical_weight < 0:
+            raise ValueError(
+                f"HYBRID_LEXICAL_WEIGHT must not be negative, "
+                f"got {self.hybrid_lexical_weight}"
+            )
+        if self.hybrid_dense_weight == 0 and self.hybrid_lexical_weight == 0:
+            raise ValueError(
+                "HYBRID_DENSE_WEIGHT and HYBRID_LEXICAL_WEIGHT must not both "
+                "be 0 — every result would score 0 and ordering would be "
+                "arbitrary"
+            )
+        if self.hybrid_max_terms <= 0:
+            raise ValueError(
+                f"HYBRID_MAX_TERMS must be greater than 0, "
+                f"got {self.hybrid_max_terms}"
+            )
+        if self.hybrid_min_term_len <= 0:
+            raise ValueError(
+                f"HYBRID_MIN_TERM_LEN must be greater than 0, "
+                f"got {self.hybrid_min_term_len}"
+            )
+
         # Context budget validation
         if self.max_context_chars <= 0:
             raise ValueError(
@@ -351,6 +395,16 @@ class BaseConfig(BaseSettings):
     expert_min_score: float = 0.3
     guidance_n_results: int = 5
     guidance_min_score: float = 0.3
+
+    # Hybrid retrieval — a lexical arm alongside the embedding arm, fused by
+    # reciprocal rank. Off by default: it changes what every answer is grounded
+    # in, so it is opted into rather than inherited.
+    hybrid_retrieval_enabled: bool = False
+    hybrid_dense_weight: float = 1.0
+    hybrid_lexical_weight: float = 1.0
+    hybrid_rrf_k: int = 60
+    hybrid_max_terms: int = 8
+    hybrid_min_term_len: int = 3
 
     # Context budget
     max_context_chars: int = 20000

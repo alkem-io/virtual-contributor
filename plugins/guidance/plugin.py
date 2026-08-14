@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from typing import Any
 import re
 
 from core.domain.prompts_shared import (
@@ -16,6 +17,7 @@ from core.domain.prompts_shared import (
     rendered_document_budget_size,
 )
 from core.domain.query_complexity import QueryComplexity, classify_question
+from core.domain import hybrid_retrieval
 from core.events.input import Input
 from core.events.response import Response, Source
 from core.domain.retrieval_filters import FACTUAL_WHERE
@@ -52,6 +54,7 @@ class GuidancePlugin:
         max_context_chars: int = 20000,
         answering_temperature: float | None = None,
         chain_of_thought_enabled: bool = True,
+        hybrid_config: Any = None,
     ) -> None:
         self._llm = llm
         self._knowledge_store = knowledge_store
@@ -60,6 +63,9 @@ class GuidancePlugin:
         self._max_context_chars = max_context_chars
         self._answering_temperature = answering_temperature
         self._chain_of_thought_enabled = chain_of_thought_enabled
+        # None keeps retrieval exactly as it was — the helper reads the flag
+        # off this and falls through to the dense path.
+        self._hybrid_config = hybrid_config
 
     async def startup(self) -> None:
         logger.info("GuidancePlugin started")
@@ -113,24 +119,32 @@ class GuidancePlugin:
 
         # Query multiple collections in parallel
         n_results = self._n_results
+        # Which ordering applies below. Read once here, from the same flag the
+        # retrieval helper reads, so the ordering can never disagree with the
+        # shape of the results it is ordering.
+        hybrid_enabled = bool(
+            getattr(self._hybrid_config, "hybrid_retrieval_enabled", False)
+        )
 
-        async def _query_collection(collection: str) -> list[tuple[str, Source, dict]]:
-            pairs: list[tuple[str, Source, dict]] = []
+        async def _query_collection(collection: str):
+            # Rank within the collection is carried out of here: it is the
+            # fused order, the only ordering that means anything across arms.
+            # A score cannot stand in for it — a literally-matched passage has
+            # none. The metadata rides alongside solely for the LLM-visible
+            # context label (#109); the factual filter (#107) applies to both
+            # arms inside the retrieval span (#108).
+            entries: list[tuple[int, str, Source, dict]] = []
             from opentelemetry.trace import SpanKind
 
             from core.tracing import optional_span
 
             try:
-                # #107's factual filter inside #108's retrieval span, over
-                # #109's 3-tuple shape (the metadata travels alongside the
-                # Source solely for the LLM-visible context label).
                 # optional_span records any failure (content-gated) and
                 # re-raises; the outer handler isolates this collection.
                 with optional_span("vc.retrieval", kind=SpanKind.CLIENT):
-                    result = await self._knowledge_store.query(
-                        collection=collection,
-                        query_texts=[question],
-                        n_results=n_results,
+                    result = await hybrid_retrieval.retrieve(
+                        self._knowledge_store, collection, question,
+                        self._hybrid_config, n_results=n_results,
                         where=FACTUAL_WHERE,
                     )
                     if result.documents:
@@ -138,7 +152,10 @@ class GuidancePlugin:
                             distance = (
                                 result.distances[0][i] if result.distances else 1.0
                             )
-                            score = 1.0 - distance
+                            # No distance means the passage was matched
+                            # literally, not by similarity — inventing a score
+                            # would misrepresent it as a semantic hit.
+                            score = None if distance is None else 1.0 - distance
                             metadata = (
                                 result.metadatas[0][i] if result.metadatas else {}
                             )
@@ -151,25 +168,60 @@ class GuidancePlugin:
                                 uri=source_url,
                                 score=score,
                             )
-                            pairs.append((doc, source, metadata))
+                            entries.append((i, doc, source, metadata))
             except Exception:
                 logger.warning("Failed to query collection %s", collection)
-            return pairs
+            return entries
 
         query_results = await asyncio.gather(
             *[_query_collection(c) for c in DEFAULT_COLLECTIONS]
         )
-        all_pairs: list[tuple[str, Source, dict]] = []
-        for pairs in query_results:
-            all_pairs.extend(pairs)
+        ranked: list[tuple[int, str, Source, dict]] = []
+        for entries in query_results:
+            ranked.extend(entries)
 
-        # Sort by relevance (highest score first)
-        all_pairs.sort(key=lambda p: p[1].score or 0, reverse=True)
+        if hybrid_enabled:
+            # Merge the collections by each passage's rank within its own
+            # collection, so the best of each competes with the best of the
+            # others. Ordering by score instead would sink every
+            # literally-matched passage below every scored one and then slice
+            # it away — discarding exactly what the lexical arm contributes.
+            #
+            # Within one rank, a passage with no score comes first. It was
+            # matched literally — a different kind of evidence, not weaker
+            # evidence — and it already earned its rank against the semantic
+            # hits inside its own collection. Ordering it behind its scored
+            # peers puts it just past wherever the list is truncated, which is
+            # how it was being discarded despite ranking well: three
+            # collections each contribute a rank-1, and the cut lands mid-tier.
+            ranked.sort(
+                key=lambda r: (
+                    r[0],
+                    r[2].score is not None,
+                    -(r[2].score if r[2].score is not None else 0.0),
+                )
+            )
+        else:
+            # Dense-only. Every passage has a comparable semantic score, so the
+            # collections merge on that score globally — which is what this
+            # code did before hybrid retrieval existed.
+            #
+            # Rank-first ordering must NOT be used here. It interleaves the
+            # collections round-robin, so a weak collection's best hit outranks
+            # a strong collection's second — and since the list is truncated to
+            # n_results straight after, that does not merely reorder the
+            # sources, it changes which ones survive. This path is reached
+            # whenever the feature is off, so it must be a true rollback.
+            ranked.sort(key=lambda r: -(r[2].score if r[2].score is not None else 0.0))
+        all_pairs: list[tuple[str, Source, dict]] = [(d, s, m) for _, d, s, m in ranked]
 
-        # Filter by score threshold — discard low-relevance chunks
+        # Filter by score threshold — discard low-relevance chunks. A passage
+        # with no score was matched literally rather than by similarity, so the
+        # threshold does not apply to it; treating its absent score as 0 would
+        # drop exactly the exact-name matches the lexical arm exists to find.
         all_pairs = [
             (doc, src, metadata) for doc, src, metadata in all_pairs
-            if (src.score or 0) >= self._score_threshold
+            if src.score is None or src.score >= self._score_threshold
         ]
 
         # Deduplicate by source URL, keeping the highest-scoring chunk per page

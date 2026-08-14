@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 from core.domain.prompts_shared import (
     STEP_BY_STEP_ANSWER_INSTRUCTIONS,
@@ -13,6 +14,7 @@ from core.domain.prompts_shared import (
     rendered_document_budget_size,
 )
 from core.domain.query_complexity import QueryComplexity, classify_question
+from core.domain import hybrid_retrieval
 from core.events.input import Input
 from core.events.response import Response, Source
 from core.domain.retrieval_filters import FACTUAL_WHERE
@@ -37,10 +39,25 @@ def _filter_and_format(
 
     kept_docs, kept_distances, kept_metadatas, kept_ids = [], [], [], []
     for i, doc in enumerate(docs):
-        score = 1.0 - distances[i] if i < len(distances) else 0.0
-        if score >= score_threshold:
+        # Two different things look like "no distance" and must not be
+        # conflated. A distance explicitly recorded as None means the passage
+        # was matched literally: the threshold is defined on semantic distance,
+        # so it has nothing to say, and dropping the passage would discard
+        # exactly the exact-name match the lexical arm exists to find.
+        #
+        # A distance simply missing from a short list is a malformed result,
+        # not a literal match. It scored zero before this feature and is
+        # dropped exactly as it was, so turning the feature off restores what
+        # the code did before it.
+        if i < len(distances):
+            distance = distances[i]
+            keep = True if distance is None else (1.0 - distance) >= score_threshold
+        else:
+            distance = None
+            keep = 0.0 >= score_threshold
+        if keep:
             kept_docs.append(doc)
-            kept_distances.append(distances[i] if i < len(distances) else 1.0)
+            kept_distances.append(distance)
             kept_metadatas.append(metadatas[i] if i < len(metadatas) else {})
             kept_ids.append(ids[i] if i < len(ids) else "")
 
@@ -78,6 +95,7 @@ class ExpertPlugin:
         max_context_chars: int = 20000,
         answering_temperature: float | None = None,
         chain_of_thought_enabled: bool = True,
+        hybrid_config: Any = None,
     ) -> None:
         self._llm = llm
         self._knowledge_store = knowledge_store
@@ -86,6 +104,9 @@ class ExpertPlugin:
         self._max_context_chars = max_context_chars
         self._answering_temperature = answering_temperature
         self._chain_of_thought_enabled = chain_of_thought_enabled
+        # None keeps retrieval exactly as it was: hybrid_retrieval.retrieve
+        # reads the flag off this and falls through to the dense path.
+        self._hybrid_config = hybrid_config
 
     async def startup(self) -> None:
         logger.info("ExpertPlugin started")
@@ -194,13 +215,12 @@ class ExpertPlugin:
                 or state.get("current_question")
                 or event.message
             )
-            # #107's factual filter inside #108's retrieval span: the filter
-            # decides WHAT is fetched, the span records what came back.
+            # #114's hybrid retrieval inside #108's span, carrying #107's
+            # factual filter through to both arms.
             with optional_span("vc.retrieval", kind=SpanKind.CLIENT) as span:
-                result = await self._knowledge_store.query(
-                    collection=collection,
-                    query_texts=[query],
-                    n_results=n_results,
+                result = await hybrid_retrieval.retrieve(
+                    self._knowledge_store, collection, query,
+                    self._hybrid_config, n_results=n_results,
                     where=FACTUAL_WHERE,
                 )
                 docs, filtered_result = _filter_and_format(result, score_threshold)
@@ -269,10 +289,9 @@ class ExpertPlugin:
         from core.tracing import mark_empty_retrieval, optional_span
 
         with optional_span("vc.retrieval", kind=SpanKind.CLIENT) as span:
-            result = await self._knowledge_store.query(
-                collection=collection,
-                query_texts=[event.message],
-                n_results=self._n_results,
+            result = await hybrid_retrieval.retrieve(
+                self._knowledge_store, collection, event.message,
+                self._hybrid_config, n_results=self._n_results,
                 where=FACTUAL_WHERE,
             )
             docs, result = _filter_and_format(result, self._score_threshold)

@@ -154,3 +154,22 @@ async def test_the_tracing_wrapper_forwards_the_metadata_filter() -> None:
     sentinel = {"embeddingType": {"$ne": "summary"}}
     await store.query("c", ["q"], 5, sentinel)
     assert seen["where"] == sentinel, "the tracing wrapper dropped the filter"
+
+
+async def test_lexical_none_distances_do_not_crash_the_span_stats() -> None:
+    """A literally-matched passage has distance None (#114); `1.0 - None`
+    raised TypeError inside the span writer, failing the very retrieval the
+    wrapper exists to observe."""
+
+    class _MixedStore:
+        async def query(self, collection, query_texts, n_results=10, where=None):
+            return QueryResult(
+                documents=[["semantic hit", "literal hit"]],
+                metadatas=[[{}, {}]],
+                distances=[[0.2, None]],
+                ids=[["a", "b"]],
+            )
+
+    store = TracedKnowledgeStore(_MixedStore())
+    result = await store.query("c", ["q"], 5)
+    assert result.documents == [["semantic hit", "literal hit"]]

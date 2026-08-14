@@ -28,8 +28,13 @@ class TracedKnowledgeStore:
         span.set_attribute("vc.retrieval.n_requested", n_results)
         span.set_attribute("vc.retrieval.n_returned", returned)
         distances = result.distances[0] if result.distances else []
-        if distances:
-            scores = [1.0 - distance for distance in distances]
+        # #114: a literally-matched passage has distance None — it has no
+        # semantic score, and 1.0 - None would raise TypeError here, failing
+        # the retrieval it was meant to observe. Score stats cover only the
+        # semantically-matched subset.
+        scored = [d for d in distances if d is not None]
+        if scored:
+            scores = [1.0 - distance for distance in scored]
             span.set_attribute("vc.retrieval.score_max", max(scores))
             span.set_attribute("vc.retrieval.score_min", min(scores))
             span.set_attribute("vc.retrieval.score_mean", sum(scores) / len(scores))
@@ -71,6 +76,23 @@ class TracedKnowledgeStore:
 
     async def delete_collection(self, collection: str) -> None:
         await self._operation("delete_collection", collection, None, self._delegate.delete_collection(collection))
+
+    async def query_lexical(
+        self,
+        collection: str,
+        terms: list[str],
+        n_results: int = 10,
+        where: dict | None = None,
+    ) -> QueryResult:
+        # Without this passthrough the wrapper no longer satisfies
+        # KnowledgeStorePort (which gained query_lexical in #114), and worse:
+        # hybrid_retrieval detects the lexical arm by getattr, so a traced
+        # store would silently lose lexical retrieval and log a capability
+        # warning on every request.
+        return await self._operation(
+            "query_lexical", collection, n_results,
+            self._delegate.query_lexical(collection, terms, n_results, where),
+        )
 
     async def get(self, collection: str, ids: list[str] | None = None, where: dict | None = None, include: list[str] | None = None) -> GetResult:
         return await self._operation("get", collection, len(ids) if ids else None, self._delegate.get(collection, ids, where, include))
