@@ -36,9 +36,14 @@ from core.ports.faithfulness import FaithfulnessVerdict
 #: one silently does nothing for half the traffic.
 NO_CONTEXT_SENTINEL = "No relevant context found."
 
-#: Characters of the answer examined for hedging. An answer opens by declining
-#: or it does not; scanning further finds nothing and costs real time on the
-#: response path. Measured: a 100 kB answer goes from 70 ms to 1.4 ms.
+#: Characters of the answer examined for hedging, at each end. An answer
+#: declines at its opening or in its closing caveat; scanning the whole body
+#: costs real time on the response path. Measured: a 100 kB answer goes from
+#: 70 ms to 1.4 ms.
+#:
+#: Both ends are scanned because review showed a long answer that hedges only
+#: in a trailing sentence was missed by a head-only scan. The cost stays O(1):
+#: two fixed windows regardless of answer size.
 MAX_SCANNED_CHARS = 2_000
 
 #: Ways of saying "I cannot answer this from what I was given". A model doing
@@ -67,6 +72,30 @@ _HEDGE_PHRASES = (
     "i could not find",
     "i couldn't find",
     "no details are available",
+    # Apologetic and colloquial declines. Added after review measured 13/13
+    # spurious flags on this class: every one is the model correctly refusing,
+    # and flagging a refusal is the worst error this feature can make.
+    "i don't have that",
+    "i do not have that",
+    "i don't have access",
+    "i don't have anything",
+    "i don't have an answer",
+    "i don't have enough",
+    "i'm afraid i can't",
+    "i am afraid i can't",
+    "i'm not sure",
+    "i am not sure",
+    "i'd need more",
+    "i would need more",
+    "not something i'm able to",
+    "not something i am able to",
+    "outside what i can",
+    "i'm sorry",
+    "i am sorry",
+    "sorry, i don't",
+    "sorry, i do not",
+    "unfortunately, i don't",
+    "unfortunately, i do not",
 )
 
 #: A bounded negation near an information noun, for phrasings the list misses.
@@ -74,12 +103,39 @@ _HEDGE_PHRASES = (
 #: alone missed 3 of 13 realistic phrasings and the regex alone missed
 #: "I don't know" — ``\bn't\b`` cannot match inside ``don't``.
 _HEDGE_RE = re.compile(
-    r"\b(?:no|not|n't|cannot|can't|unable|lack(?:s|ing)?|without)\b"
+    # Contracted negations are matched as whole words (don't, doesn't, isn't,
+    # can't, won't). `\bn't\b` cannot work: the apostrophe form leaves no word
+    # boundary before the "n", which is why "I don't know" needed the phrase
+    # list before this was widened.
+    r"\b(?:no|not|cannot|unable|lack(?:s|ing)?|without"
+    r"|(?:do|does|did|is|are|was|were|has|have|had|ca|wo|would|could|should)n't"
+    r")\b"
     r"[^.!?]{0,60}?"
     r"\b(?:information|context|knowledge|details?|data|evidence|records?|"
     r"sources?|documentation)\b",
     re.IGNORECASE,
 )
+
+
+#: Reason codes this feature emits. Anything else came from a substituted
+#: validator and is not trusted into a log line.
+KNOWN_REASONS = frozenset({
+    "context_present", "empty_answer", "declined", "no_context", "disabled",
+})
+
+
+def safe_reason(reason: object) -> str:
+    """Reduce a verdict reason to a known code before it is logged.
+
+    `reason` is free text on the port, so a substituted validator could build
+    it from the member's answer. Logs go to stdout and on to central logging,
+    where they are readable by anyone with log access rather than by space
+    membership — so only codes this module defines get through.
+    """
+    # `reason` is deliberately typed `object`: the point is that a substituted
+    # validator may return anything at all, including a non-str carrying member
+    # content. Membership in the allow-list is what makes it a str.
+    return reason if isinstance(reason, str) and reason in KNOWN_REASONS else "unknown"
 
 
 def is_context_empty(context: str) -> bool:
@@ -90,7 +146,10 @@ def is_context_empty(context: str) -> bool:
     if not context:
         return True
     stripped = context.strip()
-    return not stripped or stripped == NO_CONTEXT_SENTINEL
+    # Case-folded: the sentinel is a literal in the guidance plugin today, but
+    # a reworded constant differing only in case would silently turn this check
+    # off for half the traffic rather than fail loudly.
+    return not stripped or stripped.casefold() == NO_CONTEXT_SENTINEL.casefold()
 
 
 def is_hedged(answer: str) -> bool:
@@ -101,7 +160,13 @@ def is_hedged(answer: str) -> bool:
     """
     if not answer:
         return False
-    text = answer[:MAX_SCANNED_CHARS].replace("’", "'").lower()
+    # Head and tail. A hedge in a closing caveat is still a decline, and
+    # missing it costs a spurious flag on an answer that behaved correctly.
+    if len(answer) <= 2 * MAX_SCANNED_CHARS:
+        window = answer
+    else:
+        window = f"{answer[:MAX_SCANNED_CHARS]}\n{answer[-MAX_SCANNED_CHARS:]}"
+    text = window.replace("’", "'").lower()
     if any(phrase in text for phrase in _HEDGE_PHRASES):
         return True
     return bool(_HEDGE_RE.search(text))

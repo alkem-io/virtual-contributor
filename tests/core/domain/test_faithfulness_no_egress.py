@@ -28,11 +28,14 @@ _ENTRY_MODULES = (
     "core/domain/faithfulness.py",
 )
 
-_FORBIDDEN_IMPORTS = frozenset({
-    "httpx", "requests", "aiohttp", "openai", "socket", "urllib",
-    "http", "http.client", "asyncio", "ssl", "importlib",
-    "core.adapters", "plugins", "core.ports.llm",
-    "core.ports.knowledge_store", "core.ports.embeddings",
+#: An ALLOW-list, not a deny-list. A deny-list can only name the clients
+#: someone has already thought of — review demonstrated a bypass using
+#: `langchain_openai`, which is how this repo's own LLM adapters reach
+#: Mistral, and which no plausible deny-list would have contained. Permitting
+#: a tiny set instead means an unknown future client fails by construction.
+_ALLOWED_IMPORTS = frozenset({
+    "__future__", "re", "dataclasses", "typing", "enum", "math", "string",
+    "core.ports.faithfulness", "core.domain.faithfulness",
 })
 
 
@@ -84,7 +87,12 @@ def _port_implementations() -> dict[str, Path]:
     both plugins would accept it.
     """
     found: dict[str, Path] = {}
-    for path in (_REPO_ROOT / "core").rglob("*.py"):
+    # The whole repo, not just core/. Injection imposes no location
+    # constraint, so review showed the same class in plugins/ was invisible to
+    # a core/-only sweep while importing httpx outright.
+    for path in _REPO_ROOT.rglob("*.py"):
+        if any(part in {"tests", ".venv", "__pycache__"} for part in path.parts):
+            continue
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
             if not isinstance(node, ast.ClassDef):
@@ -108,9 +116,10 @@ class TestStaticNoNetworkImport:
     def test_no_module_on_the_path_can_perform_io(self) -> None:
         for module, path in _reachable_modules().items():
             for name in _imported_names(path):
-                root = name.split(".")[0]
-                assert name not in _FORBIDDEN_IMPORTS, f"{module} imports {name}"
-                assert root not in _FORBIDDEN_IMPORTS, f"{module} imports {name}"
+                assert name in _ALLOWED_IMPORTS, (
+                    f"{module} imports {name}, which is not on the allow-list; "
+                    f"the validation path must stay pure"
+                )
 
     def test_the_shipped_validator_is_discovered(self) -> None:
         assert "core/domain/faithfulness.py" in _port_implementations()
@@ -118,9 +127,10 @@ class TestStaticNoNetworkImport:
     def test_no_port_implementation_can_perform_io(self) -> None:
         for module, path in _port_implementations().items():
             for name in _imported_names(path):
-                root = name.split(".")[0]
-                assert name not in _FORBIDDEN_IMPORTS, f"{module} imports {name}"
-                assert root not in _FORBIDDEN_IMPORTS, f"{module} imports {name}"
+                assert name in _ALLOWED_IMPORTS, (
+                    f"{module} implements the validator port and imports "
+                    f"{name}, which is not on the allow-list"
+                )
 
 
 class TestRuntimeNoEgress:

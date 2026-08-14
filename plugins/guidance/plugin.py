@@ -10,6 +10,7 @@ import re
 from core.events.input import Input
 from core.events.response import Response, Source
 from core.ports.llm import LLMPort
+from core.domain.faithfulness import safe_reason as _safe_reason
 from core.ports.faithfulness import FaithfulnessValidatorPort
 from core.ports.knowledge_store import KnowledgeStorePort
 
@@ -68,14 +69,20 @@ class GuidancePlugin:
                 answer=answer, context=context,
             )
             if not verdict.supported:
-                # Counts and reasons only — never member content.
+                # The reason CODE only. `detail` is free text a substituted
+                # validator could build from the member's own answer, and this
+                # record goes to stdout and on to central logging.
                 logger.warning(
-                    "Unsupported answer: plugin=guidance reason=%s detail=%s "
-                    "answer_chars=%d",
-                    verdict.reason, verdict.detail, len(answer),
+                    "Unsupported answer: plugin=guidance reason=%s answer_chars=%d",
+                    _safe_reason(verdict.reason), len(answer),
                 )
-        except Exception:
-            logger.warning("Faithfulness validation failed", exc_info=True)
+        except Exception as exc:
+            # The exception TYPE, not the traceback: a raised message could
+            # otherwise carry the answer out through the failure path.
+            logger.warning(
+                "Faithfulness validation failed: error_type=%s",
+                type(exc).__name__,
+            )
 
     async def startup(self) -> None:
         logger.info("GuidancePlugin started")

@@ -12,11 +12,14 @@ import time
 import pytest
 
 from core.domain.faithfulness import (
+    KNOWN_REASONS,
+    MAX_SCANNED_CHARS,
     NO_CONTEXT_SENTINEL,
     ContextSufficiencyValidator,
     NoopValidator,
     is_context_empty,
     is_hedged,
+    safe_reason,
 )
 from core.ports.faithfulness import FaithfulnessValidatorPort
 
@@ -229,3 +232,114 @@ class TestNoOverlapScoringExists:
             line.split("#")[0] for line in source.splitlines()
             if not line.strip().startswith(("#", '"', "'"))
         )
+
+
+class TestReviewFindings:
+    """Each of these failed before the fix. Written from the review's own probes."""
+
+    @pytest.mark.parametrize(
+        "answer",
+        [
+            "I'm sorry, I don't have that information.",
+            "I’m sorry, I don’t have that information.",
+            "I don't have information about that.",
+            "I don't have details on that.",
+            "I'm afraid I can't help with that.",
+            "I don’t have access to that.",
+            "Unfortunately, I don't have anything on that topic.",
+            "That's not something I'm able to help with.",
+            "I'm sorry, but that's outside what I can help with.",
+            "Sorry, I don't have an answer for you.",
+            "I don't have enough to go on here.",
+            "Hmm, I'm not sure about that one.",
+            "I'd need more to answer that.",
+        ],
+    )
+    def test_apologetic_declines_are_not_flagged(self, answer: str) -> None:
+        """Review measured 13/13 of these spuriously flagged.
+
+        Every one is the model correctly refusing on no evidence. Flagging a
+        refusal is the worst error this feature can make — it condemns the
+        behaviour the prompt asks for.
+        """
+        assert VALIDATOR.validate(answer=answer, context="").supported is True
+
+    def test_a_contracted_negation_is_matched_by_the_regex(self) -> None:
+        r"""`\bn't\b` cannot match inside `don't` — the apostrophe form leaves
+        no word boundary before the "n"."""
+        assert is_hedged("I don't presently hold records on that subject.")
+
+    def test_a_hedge_in_a_closing_caveat_is_found(self) -> None:
+        """A head-only scan missed a decline that arrives at the end."""
+        answer = (
+            "The platform supports many collaboration features. " * 200
+            + " That said, I don't have enough information to answer that."
+        )
+        assert len(answer) > 2 * MAX_SCANNED_CHARS
+        assert VALIDATOR.validate(answer=answer, context="").supported is True
+
+    def test_the_sentinel_is_compared_case_insensitively(self) -> None:
+        """A reworded constant differing only in case would silently disable
+        the check for guidance traffic rather than fail loudly."""
+        assert is_context_empty(NO_CONTEXT_SENTINEL.upper())
+        assert is_context_empty(NO_CONTEXT_SENTINEL.lower())
+
+    @pytest.mark.parametrize(
+        "fabrication",
+        [
+            "The space was founded in 1997 by Dr. Amelia Hartwell.",
+            "The mission is to accelerate renewable energy adoption.",
+            "There are 4,200 registered contributors and no fewer than five callouts.",
+        ],
+    )
+    def test_broadening_the_hedges_did_not_blunt_detection(
+        self, fabrication: str
+    ) -> None:
+        """Every suppression widening risks suppressing the real signal too."""
+        assert VALIDATOR.validate(answer=fabrication, context="").supported is False
+
+    def test_scan_cost_stays_bounded_with_two_windows(self) -> None:
+        """Scanning both ends must stay O(1), not O(len(answer))."""
+        answer = "The mission is to accelerate collaboration. " * 250_000  # ~10 MB
+        start = time.perf_counter()
+        VALIDATOR.validate(answer=answer, context="")
+        assert (time.perf_counter() - start) * 1000 < 50
+
+
+class TestReasonCodesAreNotFreeText:
+    def test_a_substituted_reason_is_reduced_to_unknown(self) -> None:
+        """`reason` is free text on the port, so a substituted validator could
+        build it from the member's answer. Logs reach central logging, which is
+        readable by log access rather than by space membership."""
+        assert safe_reason("members: alice@example.com, bob@example.com") == "unknown"
+
+    def test_a_non_string_cannot_spoof_membership(self) -> None:
+        """`in` calls `__eq__`, so an object can claim to be a known code while
+        carrying anything at all. The isinstance check is what stops it."""
+
+        class Spoof:
+            def __eq__(self, other: object) -> bool:
+                return True
+
+            def __hash__(self) -> int:
+                return hash("no_context")
+
+            def __str__(self) -> str:
+                return "members: alice@example.com"
+
+        assert safe_reason(Spoof()) == "unknown"
+
+    @pytest.mark.parametrize("reason", sorted(KNOWN_REASONS))
+    def test_this_features_own_codes_pass_through(self, reason: str) -> None:
+        assert safe_reason(reason) == reason
+
+    def test_every_verdict_this_module_emits_uses_a_known_code(self) -> None:
+        emitted = {
+            VALIDATOR.validate(answer="x", context=REAL_CONTEXT).reason,
+            VALIDATOR.validate(answer="", context="").reason,
+            VALIDATOR.validate(answer="I don't know.", context="").reason,
+            VALIDATOR.validate(answer="A fabrication.", context="").reason,
+            NoopValidator().validate(answer="x", context="").reason,
+        }
+        assert emitted <= KNOWN_REASONS
+        assert emitted == KNOWN_REASONS, "a documented code is unreachable"

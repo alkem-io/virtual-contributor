@@ -38,6 +38,16 @@ class FaithfulnessValidatorPort(Protocol):
     """Judges one answer against the context it was generated from."""
 
     def validate(self, *, answer: str, context: str) -> FaithfulnessVerdict:
+        """Judge one answer against the context it was generated from.
+
+        **Synchronous on purpose, and that is a constraint on implementers,
+        not a convenience.** This is called from the plugin's async handler, so
+        the call occupies the event loop for its whole duration — an
+        implementation that blocks blocks every other message this worker is
+        serving, not just this one. Anything needing a model or a network call
+        does not belong behind this signature; it belongs in an out-of-band
+        path. An async signature here would have invited exactly that.
+        """
         """Return a verdict for ``answer`` given ``context``.
 
         Must never raise and never perform I/O. Callers treat a verdict as an

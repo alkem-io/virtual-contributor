@@ -7,6 +7,7 @@ import logging
 from core.events.input import Input
 from core.events.response import Response, Source
 from core.ports.llm import LLMPort
+from core.domain.faithfulness import safe_reason as _safe_reason
 from core.ports.faithfulness import FaithfulnessValidatorPort
 from core.ports.knowledge_store import KnowledgeStorePort, QueryResult
 
@@ -91,15 +92,23 @@ class ExpertPlugin:
                 answer=answer, context=context,
             )
             if not verdict.supported:
-                # Counts and reasons only — never the answer or the context,
-                # which are member content bound for central logging.
+                # The reason CODE only. `detail` is free text a substituted
+                # validator could build from the member's own answer, and this
+                # record goes to stdout and on to central logging — where it is
+                # readable by anyone with log access rather than by space
+                # membership. Never widen this to include verdict.detail.
                 logger.warning(
-                    "Unsupported answer: plugin=expert reason=%s detail=%s "
-                    "answer_chars=%d",
-                    verdict.reason, verdict.detail, len(answer),
+                    "Unsupported answer: plugin=expert reason=%s answer_chars=%d",
+                    _safe_reason(verdict.reason), len(answer),
                 )
-        except Exception:
-            logger.warning("Faithfulness validation failed", exc_info=True)
+        except Exception as exc:
+            # The exception TYPE, not the traceback: a substituted validator
+            # raising ValueError(f"could not judge: {answer}") would otherwise
+            # export the answer through the failure path.
+            logger.warning(
+                "Faithfulness validation failed: error_type=%s",
+                type(exc).__name__,
+            )
 
     async def startup(self) -> None:
         logger.info("ExpertPlugin started")
@@ -225,10 +234,15 @@ class ExpertPlugin:
         final_state = await graph.invoke(initial_state)
 
         answer = final_state.get("final_answer", final_state.get("result", ""))
-        self._validate_faithfulness(
-            answer=answer,
-            context=final_state.get("combined_knowledge_docs", ""),
-        )
+        # A graph with no retrieve node never sets this key at all. That is a
+        # graph making no claim about retrieved context, not a retrieval that
+        # came back empty — validating it would flag every answer from every
+        # non-RAG graph, and prompt graphs are configurable per space.
+        if "combined_knowledge_docs" in final_state:
+            self._validate_faithfulness(
+                answer=answer,
+                context=final_state["combined_knowledge_docs"],
+            )
         sources = self._extract_sources(final_state)
 
         return Response(
