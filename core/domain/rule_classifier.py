@@ -38,6 +38,14 @@ from core.ports.query_router import RouteClass, RoutingDecision, QueryRouterPort
 #: acknowledging, even if it opens with a greeting.
 MAX_CONVERSATIONAL_WORDS = 6
 
+#: Characters actually examined. Classification is synchronous and runs on the
+#: event loop, so an oversized message would block every other message in the
+#: process while being scanned — measured at 437ms for a 10MB query, against a
+#: pod limited to ~1.5 CPU. Nothing a person types approaches this, and the
+#: routes that matter are decided by the opening words in any case: a message
+#: longer than this is not small talk, and truncating it cannot make it so.
+MAX_CLASSIFIED_CHARS = 4_096
+
 #: Whole-message small talk. **Anchored on purpose** — an earlier substring
 #: form routed "Which subspaces exist here?" to skip retrieval, because "hi"
 #: appears inside "which". Matching the entire message is what makes that
@@ -119,6 +127,12 @@ class RuleQueryClassifier:
         if not message or not message.strip():
             # Nothing to classify. Behave as today rather than guessing.
             return RoutingDecision(RouteClass.SIMPLE, "empty message")
+
+        # Bounded before any scanning. Truncation can only ever move a message
+        # AWAY from the retrieval-skipping route (a truncated message is still
+        # too long to be small talk), so it cannot cause the one harmful
+        # misclassification.
+        message = message[:MAX_CLASSIFIED_CHARS]
 
         if self._is_conversational(message):
             return RoutingDecision(

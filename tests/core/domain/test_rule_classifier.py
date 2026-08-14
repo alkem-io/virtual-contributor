@@ -212,3 +212,41 @@ class TestAdversarialSmallTalkPrefixes:
     def test_bare_acknowledgements_do_skip_retrieval(self, message: str) -> None:
         """The other half of the property: it must not be uselessly strict."""
         assert _route(message) is RouteClass.CONVERSATIONAL
+
+
+class TestInputIsBounded:
+    """Classification runs synchronously on the event loop.
+
+    An unbounded message would block every other message in the process while
+    being scanned — measured at 437ms for a 10MB query against a pod limited
+    to roughly 1.5 CPU.
+    """
+
+    def test_an_oversized_message_is_cheap(self) -> None:
+        import time
+
+        classifier = RuleQueryClassifier()
+        start = time.perf_counter()
+        classifier.classify("word " * 2_000_000)      # ~10 MB
+        assert (time.perf_counter() - start) * 1000 < 100
+
+    def test_an_oversized_single_token_is_cheap(self) -> None:
+        import time
+
+        classifier = RuleQueryClassifier()
+        start = time.perf_counter()
+        classifier.classify("a" * 25_000_000)
+        assert (time.perf_counter() - start) * 1000 < 100
+
+    def test_truncation_can_never_create_small_talk(self) -> None:
+        """The cap must not be able to cause the one harmful misclassification.
+
+        A message long enough to be truncated is, by construction, far longer
+        than the six-word small-talk limit — so truncating it can only move it
+        away from the retrieval-skipping route, never toward it.
+        """
+        long_question = "thanks " + "and please tell me about the mission " * 500
+        assert _route(long_question) is not RouteClass.CONVERSATIONAL
+
+    def test_a_long_message_that_starts_like_small_talk_still_retrieves(self) -> None:
+        assert _route("hi " + "x" * 10_000) is not RouteClass.CONVERSATIONAL
