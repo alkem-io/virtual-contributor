@@ -98,6 +98,15 @@ class TestChunkStep:
         indices = [c.chunk_index for c in ctx.chunks]
         assert indices == list(range(len(ctx.chunks)))
 
+    async def test_document_shorter_than_chunk_size_stays_single_and_nonempty(self):
+        document = _make_doc(content="Short document")
+        context = _make_context([document])
+
+        await ChunkStep(chunk_size=2500, chunk_overlap=300).execute(context)
+
+        assert len(context.chunks) == 1
+        assert context.chunks[0].content == "Short document"
+
     async def test_step_name(self):
         assert ChunkStep().name == "chunk"
 

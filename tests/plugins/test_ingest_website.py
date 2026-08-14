@@ -459,6 +459,39 @@ class TestIngestWebsitePlugin:
         # (websites are URL-identified, not UUID-keyed) — lock in the contract.
         assert result.body_of_knowledge_id == ""
 
+    async def test_chunking_unchanged_and_summary_length_is_shared(self, plugin):
+        """Website CHUNKING is untouched at 2,000/400 (this feature is
+        space-scoped for chunk sizing), while SUMMARY_LENGTH is a shared
+        setting: story #12's rationale — a summary is embedded as one passage,
+        so an oversized one is maximally diluted — applies to every ingest
+        path, so website summaries follow the new 2,500 default too."""
+        mock_pages = [
+            {
+                "url": "https://example.com",
+                "html": "<p>Content for ingestion test.</p>",
+            },
+        ]
+
+        with (
+            patch("plugins.ingest_website.plugin.crawl", return_value=mock_pages),
+            patch("plugins.ingest_website.plugin.IngestEngine") as mock_engine,
+        ):
+            mock_engine.return_value.run = AsyncMock(
+                return_value=MagicMock(success=True, errors=[]),
+            )
+            await plugin.handle(make_ingest_website())
+
+        batch_steps = mock_engine.call_args.kwargs["batch_steps"]
+        chunk_step = batch_steps[0]
+        assert chunk_step._chunk_size == 2000
+        assert chunk_step._chunk_overlap == 400
+        # Shared summary sizing: deliberate, and enforced rather than incidental.
+        summary_steps = [
+            step for step in batch_steps if hasattr(step, "_summary_length")
+        ]
+        assert summary_steps, "expected a summary step in the website pipeline"
+        assert all(step._summary_length == 2500 for step in summary_steps)
+
     async def test_empty_crawl_runs_cleanup(self):
         """When crawl returns [], cleanup deletes pre-existing chunks."""
         store = MockKnowledgeStorePort()
@@ -757,3 +790,51 @@ class TestWebsitePagesAreNotMistakenForSummaries:
         }
         assert gone not in remaining
         assert kept in remaining
+class TestSizingConfigReachesWebsiteIngestion:
+    """`main.py` injects by signature, so a parameter this plugin does not
+    declare is silently never passed.
+
+    `ingest_space` declared `chunk_size`, `chunk_overlap` and `summary_length`;
+    `ingest_website` did not — so its chunking and *both* summary steps used
+    constructor defaults no matter what an operator configured. The existing
+    test only checked the shared default, which is identical either way.
+    """
+
+    @pytest.mark.parametrize(
+        "parameter", ["chunk_size", "chunk_overlap", "summary_length"]
+    )
+    def test_the_plugin_declares_the_sizing_parameter(self, parameter: str) -> None:
+        import inspect
+
+        from plugins.ingest_website.plugin import IngestWebsitePlugin
+
+        assert parameter in inspect.signature(IngestWebsitePlugin.__init__).parameters
+
+    def test_both_ingest_plugins_accept_the_same_sizing_knobs(self) -> None:
+        """A knob honoured by one ingest path and ignored by the other is worse
+        than one honoured by neither — it looks configured and is not."""
+        import inspect
+
+        from plugins.ingest_space.plugin import IngestSpacePlugin
+        from plugins.ingest_website.plugin import IngestWebsitePlugin
+
+        knobs = {"chunk_size", "chunk_overlap", "summary_length"}
+        website = set(inspect.signature(IngestWebsitePlugin.__init__).parameters)
+        space = set(inspect.signature(IngestSpacePlugin.__init__).parameters)
+        assert knobs <= website
+        assert knobs <= space
+
+    def test_a_non_default_summary_length_is_stored(self) -> None:
+        from plugins.ingest_website.plugin import IngestWebsitePlugin
+
+        plugin = IngestWebsitePlugin(
+            llm=MockLLMPort(response="s"),
+            embeddings=MockEmbeddingsPort(),
+            knowledge_store=MockKnowledgeStorePort(),
+            summary_length=9_999,
+            chunk_size=1_234,
+            chunk_overlap=56,
+        )
+        assert plugin._summary_length == 9_999
+        assert plugin._chunk_size == 1_234
+        assert plugin._chunk_overlap == 56

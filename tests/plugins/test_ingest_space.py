@@ -457,6 +457,188 @@ class TestIngestSpacePlugin:
         assert len(store.collections[collection]) == 1
 
 
+class TestIngestSpaceSizing:
+    """Regression coverage for configuration reaching the space pipeline."""
+
+    async def test_configured_chunk_size_controls_stored_chunk_boundaries(self):
+        from core.domain.ingest_pipeline import Document, DocumentMetadata
+
+        chunk_size = 137
+        store = MockKnowledgeStorePort()
+        plugin = IngestSpacePlugin(
+            llm=MockLLMPort(),
+            embeddings=MockEmbeddingsPort(),
+            knowledge_store=store,
+            graphql_client=AsyncMock(),
+            chunk_size=chunk_size,
+            chunk_overlap=11,
+            summarize_enabled=False,
+        )
+        document = Document(
+            content=" ".join(f"token-{index}" for index in range(120)),
+            metadata=DocumentMetadata(
+                document_id="sizing-doc",
+                source="graphql",
+                title="Sizing document",
+            ),
+        )
+
+        with patch(
+            "plugins.ingest_space.space_reader.read_body_of_knowledge",
+            new=AsyncMock(return_value=[document]),
+        ):
+            result = await plugin.handle(make_ingest_body_of_knowledge())
+
+        stored_chunks = store.collections["bok-123-knowledge"]
+        assert result.result == "success"
+        assert len(stored_chunks) > 1
+        assert all(len(entry["document"]) <= chunk_size for entry in stored_chunks)
+
+    async def test_summarize_disabled_keeps_chunk_sizing_without_summary_passages(self):
+        from core.domain.ingest_pipeline import Document, DocumentMetadata
+
+        chunk_size = 137
+        store = MockKnowledgeStorePort()
+        plugin = IngestSpacePlugin(
+            llm=MockLLMPort(),
+            embeddings=MockEmbeddingsPort(),
+            knowledge_store=store,
+            graphql_client=AsyncMock(),
+            chunk_size=chunk_size,
+            chunk_overlap=11,
+            summarize_enabled=False,
+        )
+        document = Document(
+            content=" ".join(f"token-{index}" for index in range(200)),
+            metadata=DocumentMetadata(
+                document_id="no-summary-doc",
+                source="graphql",
+                title="No summary document",
+            ),
+        )
+
+        with patch(
+            "plugins.ingest_space.space_reader.read_body_of_knowledge",
+            new=AsyncMock(return_value=[document]),
+        ):
+            result = await plugin.handle(make_ingest_body_of_knowledge())
+
+        stored_chunks = store.collections["bok-123-knowledge"]
+        assert result.result == "success"
+        assert len(stored_chunks) >= 4
+        assert all(len(entry["document"]) <= chunk_size for entry in stored_chunks)
+        assert all(
+            entry["metadata"]["embeddingType"] == "chunk"
+            for entry in stored_chunks
+        )
+
+
+class _RecordingKnowledgeStore(MockKnowledgeStorePort):
+    """Knowledge-store fake that records write/delete ordering."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.call_order: list[tuple[str, list[str]]] = []
+
+    async def ingest(self, collection, documents, metadatas, ids, embeddings=None):
+        self.call_order.append(("ingest", list(ids)))
+        await super().ingest(collection, documents, metadatas, ids, embeddings)
+
+    async def delete(self, collection, ids=None, where=None):
+        self.call_order.append(("delete", list(ids or [])))
+        await super().delete(collection, ids, where)
+
+
+class TestIngestSpaceReingestion:
+    """Regression coverage for changing the space chunk boundary."""
+
+    @staticmethod
+    def _document():
+        from core.domain.ingest_pipeline import Document, DocumentMetadata
+
+        return Document(
+            content=" ".join(f"word-{index}" for index in range(1200)),
+            metadata=DocumentMetadata(
+                document_id="reingestion-doc",
+                source="graphql",
+                title="Reingestion document",
+            ),
+        )
+
+    @staticmethod
+    async def _ingest(plugin, document):
+        with patch(
+            "plugins.ingest_space.space_reader.read_body_of_knowledge",
+            new=AsyncMock(return_value=[document]),
+        ):
+            return await plugin.handle(make_ingest_body_of_knowledge())
+
+    @staticmethod
+    def _plugin(store, *, chunk_size: int, chunk_overlap: int):
+        return IngestSpacePlugin(
+            llm=MockLLMPort(),
+            embeddings=MockEmbeddingsPort(),
+            knowledge_store=store,
+            graphql_client=AsyncMock(),
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            summarize_enabled=False,
+        )
+
+    async def test_reingestion_replaces_old_chunks_with_new_boundaries(self):
+        store = _RecordingKnowledgeStore()
+        document = self._document()
+
+        old_result = await self._ingest(
+            self._plugin(store, chunk_size=9000, chunk_overlap=500),
+            document,
+        )
+        old_ids = {entry["id"] for entry in store.collections["bok-123-knowledge"]}
+
+        new_result = await self._ingest(
+            self._plugin(store, chunk_size=2500, chunk_overlap=300),
+            document,
+        )
+        current_entries = store.collections["bok-123-knowledge"]
+
+        assert old_result.result == "success"
+        assert new_result.result == "success"
+        assert all(len(entry["document"]) <= 2500 for entry in current_entries)
+        assert old_ids.isdisjoint(entry["id"] for entry in current_entries)
+        assert {
+            entry["metadata"]["documentId"] for entry in current_entries
+        } == {"reingestion-doc"}
+
+    async def test_reingestion_stores_replacements_before_deleting_orphans(self):
+        store = _RecordingKnowledgeStore()
+        document = self._document()
+        await self._ingest(
+            self._plugin(store, chunk_size=9000, chunk_overlap=500),
+            document,
+        )
+        store.call_order.clear()
+
+        await self._ingest(
+            self._plugin(store, chunk_size=2500, chunk_overlap=300),
+            document,
+        )
+
+        write_indices = [
+            index
+            for index, (operation, _) in enumerate(store.call_order)
+            if operation == "ingest"
+        ]
+        delete_indices = [
+            index
+            for index, (operation, _) in enumerate(store.call_order)
+            if operation == "delete"
+        ]
+
+        assert write_indices
+        assert delete_indices
+        assert max(write_indices) < min(delete_indices)
+
+
 class TestIngestSpaceSummarizationBehavior:
     """Verify summarization step inclusion based on summarize_enabled and concurrency."""
 
@@ -523,6 +705,32 @@ class TestIngestSpaceSummarizationBehavior:
         finalize_names = [type(s).__name__ for s in call_kwargs.kwargs["finalize_steps"]]
         assert "DocumentSummaryStep" in batch_names
         assert "BodyOfKnowledgeSummaryStep" in finalize_names
+
+    async def test_configured_summary_length_reaches_both_summary_steps(self):
+        summary_length = 911
+        plugin = IngestSpacePlugin(
+            llm=MockLLMPort(),
+            embeddings=MockEmbeddingsPort(),
+            knowledge_store=MockKnowledgeStorePort(),
+            graphql_client=MagicMock(),
+            summary_length=summary_length,
+        )
+
+        mock_engine = await self._run_with_mock_graphql(plugin)
+        call_kwargs = mock_engine.call_args
+        document_summary = next(
+            step
+            for step in call_kwargs.kwargs["batch_steps"]
+            if type(step).__name__ == "DocumentSummaryStep"
+        )
+        bok_summary = next(
+            step
+            for step in call_kwargs.kwargs["finalize_steps"]
+            if type(step).__name__ == "BodyOfKnowledgeSummaryStep"
+        )
+
+        assert document_summary._summary_length == summary_length
+        assert bok_summary._summary_length == summary_length
 
     async def test_summarize_disabled(self):
         """When summarize_enabled=False, no summary steps are included."""
