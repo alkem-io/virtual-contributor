@@ -310,6 +310,13 @@ class BaseConfig(BaseSettings):
     # enough that only a model which started explaining is rejected.
     query_rewrite_gating_enabled: bool = False
     query_rewrite_max_expansion_ratio: float = 8.0
+    # Turn and character bounds on the history embedded in a rewrite prompt.
+    # `history_length` exists on ExpertConfig/OpenAIAssistantConfig only, so it
+    # cannot serve guidance or generic; these live on the base so every plugin
+    # that rewrites is bounded. A plugin that also defines `history_length`
+    # takes the smaller of the two — see main.py.
+    query_rewrite_max_history_turns: int = 20
+    query_rewrite_max_history_chars: int = 12000
 
     # Health
     health_port: int = 8080

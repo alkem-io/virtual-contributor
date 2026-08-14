@@ -13,6 +13,8 @@ from core.ports.llm import LLMPort
 from core.ports.knowledge_store import KnowledgeStorePort
 from core.domain.query_rewrite import (
     DEFAULT_MAX_EXPANSION_RATIO,
+    DEFAULT_MAX_HISTORY_CHARS,
+    DEFAULT_MAX_HISTORY_TURNS,
     RewritePolicy,
     recent_history,
     rewrite_query,
@@ -49,6 +51,8 @@ class GuidancePlugin:
         max_context_chars: int = 20000,
         rewrite_policy: RewritePolicy | None = None,
         max_expansion_ratio: float = DEFAULT_MAX_EXPANSION_RATIO,
+        max_history_turns: int = DEFAULT_MAX_HISTORY_TURNS,
+        max_history_chars: int = DEFAULT_MAX_HISTORY_CHARS,
     ) -> None:
         self._llm = llm
         self._knowledge_store = knowledge_store
@@ -59,6 +63,8 @@ class GuidancePlugin:
         # deployment behaves exactly as before apart from output validation.
         self._rewrite_policy = rewrite_policy
         self._max_expansion_ratio = max_expansion_ratio
+        self._max_history_turns = max_history_turns
+        self._max_history_chars = max_history_chars
 
     async def startup(self) -> None:
         logger.info("GuidancePlugin started")
@@ -77,7 +83,7 @@ class GuidancePlugin:
         if should_rewrite(question, event.history, self._rewrite_policy):
             from plugins.guidance.prompts import condense_prompt
             history_text = "\n".join(
-                f"{h.role}: {h.content}" for h in recent_history(event.history)
+                f"{h.role}: {h.content}" for h in recent_history(event.history, self._max_history_turns, self._max_history_chars)
             )
             question = await rewrite_query(
                 self._llm,

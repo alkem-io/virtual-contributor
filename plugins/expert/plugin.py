@@ -10,6 +10,8 @@ from core.ports.llm import LLMPort
 from core.ports.knowledge_store import KnowledgeStorePort, QueryResult
 from core.domain.query_rewrite import (
     DEFAULT_MAX_EXPANSION_RATIO,
+    DEFAULT_MAX_HISTORY_CHARS,
+    DEFAULT_MAX_HISTORY_TURNS,
     RewritePolicy,
     recent_history,
     rewrite_query,
@@ -72,6 +74,8 @@ class ExpertPlugin:
         max_context_chars: int = 20000,
         rewrite_policy: RewritePolicy | None = None,
         max_expansion_ratio: float = DEFAULT_MAX_EXPANSION_RATIO,
+        max_history_turns: int = DEFAULT_MAX_HISTORY_TURNS,
+        max_history_chars: int = DEFAULT_MAX_HISTORY_CHARS,
     ) -> None:
         self._llm = llm
         self._knowledge_store = knowledge_store
@@ -81,6 +85,8 @@ class ExpertPlugin:
         # None means "never skip" — see GuidancePlugin.
         self._rewrite_policy = rewrite_policy
         self._max_expansion_ratio = max_expansion_ratio
+        self._max_history_turns = max_history_turns
+        self._max_history_chars = max_history_chars
 
     async def startup(self) -> None:
         logger.info("ExpertPlugin started")
@@ -202,7 +208,7 @@ class ExpertPlugin:
         # graph's LLM nodes. Measured unbounded: 5 000 turns built a 2.5 MB
         # conversation string — larger than the rewrite prompt this feature
         # already bounded, so bounding only that one was incoherent.
-        history = recent_history(event.history)
+        history = recent_history(event.history, self._max_history_turns, self._max_history_chars)
         messages = [
             {
                 "role": h.role.value if hasattr(h.role, "value") else str(h.role),
@@ -264,7 +270,7 @@ class ExpertPlugin:
         from plugins.guidance.prompts import condense_prompt
 
         history_text = "\n".join(
-            f"{h.role}: {h.content}" for h in recent_history(event.history)
+            f"{h.role}: {h.content}" for h in recent_history(event.history, self._max_history_turns, self._max_history_chars)
         )
         return await rewrite_query(
             self._llm,
@@ -292,7 +298,12 @@ class ExpertPlugin:
         prompt = combined_expert_prompt.format(
             vc_name=event.display_name or "Expert",
             knowledge=knowledge,
-            question=event.message,
+            # The RESOLVED question, not the raw message. This prompt carries no
+            # conversation history, so an anaphor like "and the other one?"
+            # arrives with nothing to resolve against — the model would be asked
+            # a question it cannot read, over chunks retrieved for a different
+            # one. When no resolution happened, `question` IS `event.message`.
+            question=question,
         )
 
         answer = await self._llm.invoke([{"role": "human", "content": prompt}])

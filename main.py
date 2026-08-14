@@ -337,6 +337,17 @@ async def _run(config: BaseConfig) -> None:
     # Inject the query-rewrite gate
     if "max_expansion_ratio" in sig.parameters:
         deps["max_expansion_ratio"] = config.query_rewrite_max_expansion_ratio
+    if "max_history_turns" in sig.parameters:
+        # Honour a plugin's own `history_length` when it declares one — it is
+        # that plugin's statement about how much history is meaningful, and it
+        # should never be exceeded by the rewrite prompt.
+        plugin_history = getattr(config, "history_length", None)
+        turns = config.query_rewrite_max_history_turns
+        deps["max_history_turns"] = (
+            min(turns, plugin_history) if plugin_history else turns
+        )
+    if "max_history_chars" in sig.parameters:
+        deps["max_history_chars"] = config.query_rewrite_max_history_chars
     if "rewrite_policy" in sig.parameters and config.query_rewrite_gating_enabled:
         policy = _build_rewrite_policy()
         if policy is not None:

@@ -453,3 +453,66 @@ class TestPrecedenceIsExplicit:
                 )
             )
         assert store.query_calls[0][1] == [RESOLVED]
+
+
+class TestTheAnswerModelSeesTheResolvedQuestion:
+    """Retrieval got the resolved question; the answer prompt did not.
+
+    `combined_expert_prompt` carries **no conversation history**, so an anaphor
+    arrived there with nothing to resolve against — the model was asked a
+    question it could not read, over chunks retrieved for a different one.
+    """
+
+    class _Recording(MockLLMPort):
+        def __init__(self) -> None:
+            super().__init__(response="an answer")
+            self.prompts: list[str] = []
+
+        async def invoke(self, messages, **kw):  # type: ignore[override]
+            self.prompts.append(messages[0]["content"])
+            return RESOLVED if len(self.prompts) == 1 else "an answer"
+
+    async def test_the_answer_prompt_carries_the_resolution(self) -> None:
+        llm = self._Recording()
+        await ExpertPlugin(
+            llm=llm, knowledge_store=MockKnowledgeStorePort()
+        ).handle(make_input(message="and the other one?", history=HISTORY))
+        assert RESOLVED in llm.prompts[1]
+        assert "and the other one?" not in llm.prompts[1]
+
+    async def test_without_history_the_raw_message_is_used(self) -> None:
+        """When nothing was resolved, `question` IS `event.message`."""
+        llm = self._Recording()
+        await ExpertPlugin(
+            llm=llm, knowledge_store=MockKnowledgeStorePort()
+        ).handle(make_input(message="What is a space?"))
+        assert "What is a space?" in llm.prompts[0]
+
+
+class TestHistoryBoundsAreConfigurable:
+    async def test_an_injected_turn_bound_is_honoured(self) -> None:
+        class _Capturing(MockLLMPort):
+            def __init__(self) -> None:
+                super().__init__(response="an answer")
+                self.sizes: list[int] = []
+
+            async def invoke(self, messages, **kw):  # type: ignore[override]
+                self.sizes.append(len(messages[0]["content"]))
+                return RESOLVED if len(self.sizes) == 1 else "an answer"
+
+        history = [{"role": "human", "content": "x" * 100} for _ in range(50)]
+        tight = _Capturing()
+        await ExpertPlugin(
+            llm=tight,
+            knowledge_store=MockKnowledgeStorePort(),
+            max_history_turns=2,
+        ).handle(make_input(message="and the other one?", history=history))
+
+        loose = _Capturing()
+        await ExpertPlugin(
+            llm=loose,
+            knowledge_store=MockKnowledgeStorePort(),
+            max_history_turns=40,
+        ).handle(make_input(message="and the other one?", history=history))
+
+        assert tight.sizes[0] < loose.sizes[0]

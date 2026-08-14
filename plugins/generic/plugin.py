@@ -10,6 +10,8 @@ from core.ports.llm import LLMPort
 from plugins.generic.prompts import condenser_system_prompt
 from core.domain.query_rewrite import (
     DEFAULT_MAX_EXPANSION_RATIO,
+    DEFAULT_MAX_HISTORY_CHARS,
+    DEFAULT_MAX_HISTORY_TURNS,
     RewritePolicy,
     recent_history,
     rewrite_query,
@@ -45,11 +47,15 @@ class GenericPlugin:
         *,
         rewrite_policy: RewritePolicy | None = None,
         max_expansion_ratio: float = DEFAULT_MAX_EXPANSION_RATIO,
+        max_history_turns: int = DEFAULT_MAX_HISTORY_TURNS,
+        max_history_chars: int = DEFAULT_MAX_HISTORY_CHARS,
     ) -> None:
         self._llm = llm
         # None means "never skip" — see GuidancePlugin.
         self._rewrite_policy = rewrite_policy
         self._max_expansion_ratio = max_expansion_ratio
+        self._max_history_turns = max_history_turns
+        self._max_history_chars = max_history_chars
 
     async def startup(self) -> None:
         logger.info("GenericPlugin started")
@@ -62,7 +68,7 @@ class GenericPlugin:
 
         # Resolve the question against history when that is worth a call.
         if should_rewrite(question, event.history, self._rewrite_policy):
-            history_text = _history_as_text(recent_history(event.history))
+            history_text = _history_as_text(recent_history(event.history, self._max_history_turns, self._max_history_chars))
             condenser_messages = [
                 {"role": "system", "content": condenser_system_prompt},
                 {"role": "human", "content": f"History:\n{history_text}\n\nLatest question: {question}"},
