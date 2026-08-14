@@ -508,6 +508,11 @@ class BaseConfig(BaseSettings):
     # Summarization threshold
     summary_chunk_threshold: int = 4
 
+    # Faithfulness validation — off by default. It only observes: an answer is
+    # never changed, delayed, or withheld by it. Disabled, no validator is
+    # constructed at all.
+    faithfulness_validation_enabled: bool = False
+
     # Retrieval — deprecated global fields (kept for backward compat)
     retrieval_n_results: int = 5
     retrieval_score_threshold: float = 0.3

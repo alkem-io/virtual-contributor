@@ -361,6 +361,38 @@ a real question to skip retrieval answers it ungrounded — so that is the only
 route with a hard gate: the whole message must match an anchored small-talk
 list, carry no question mark, and be at most six words. Everything else falls
 through to retrieval, so every misclassification degrades to "retrieve anyway".
+### Faithfulness validation
+
+Logs a warning when an answer **asserts** something after retrieval returned
+**nothing**. That is the one case provably unsupportable without a model or
+citations: there was no evidence, so whatever was said came from elsewhere.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FAITHFULNESS_VALIDATION_ENABLED` | `false` | Enable the check |
+
+**Observation only.** The answer a member receives is never changed, delayed,
+or withheld — enabling this adds a log line and nothing else. Runs in-process:
+no model, no network call, no dependency.
+
+**What it deliberately does not do.** Checking whether the answer's words appear
+in the context was built, measured, and rejected: no threshold separates a
+fabrication from a faithful paraphrase, and because the platform answers in the
+member's language, a Dutch answer over English context scores the same as a
+lie. It would have flagged every non-English answer. So this checks *context
+sufficiency*, not content matching — which is why paraphrase and translation
+are structurally incapable of being flagged.
+
+**Honest limit.** It does not catch a fabrication built on thin-but-nonempty
+context. That needs either citation verification (which requires the model to
+be asked to cite — a separate change) or a judge.
+
+**Citation verification** is a string check against the context, so it can
+occupy this port directly. **A judge cannot.** `validate()` is synchronous by
+design and runs on the response path, so an implementation that calls a model
+would block the event loop for every message this worker is serving — not just
+its own. A judge belongs out of band: the port is the seam for recording the
+verdict, not for fetching it.
 
 ### Embeddings
 

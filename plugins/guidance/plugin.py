@@ -23,6 +23,8 @@ from core.events.input import Input
 from core.events.response import Response, Source
 from core.domain.retrieval_filters import FACTUAL_WHERE
 from core.ports.llm import LLMPort
+from core.domain.faithfulness import safe_reason as _safe_reason
+from core.ports.faithfulness import FaithfulnessValidatorPort
 from core.ports.knowledge_store import KnowledgeStorePort
 from core.ports.reranker import RerankerPort
 from core.domain.routing import DEFAULT_ROUTING_TABLE, RetrievalProfile
@@ -58,10 +60,12 @@ class GuidancePlugin:
         max_context_chars: int = 20000,
         answering_temperature: float | None = None,
         chain_of_thought_enabled: bool = True,
-        hybrid_config: Any = None,        reranker: RerankerPort | None = None,
+        hybrid_config: Any = None,
+        reranker: RerankerPort | None = None,
         rerank_candidate_n: int = 20,
-        rerank_top_k: int = 5,        query_router: QueryRouterPort | None = None,
-        routing_table: dict | None = None,
+        rerank_top_k: int = 5,
+        query_router: QueryRouterPort | None = None,
+        routing_table: dict | None = None,        faithfulness_validator: FaithfulnessValidatorPort | None = None,
     ) -> None:
         self._llm = llm
         self._knowledge_store = knowledge_store
@@ -71,7 +75,8 @@ class GuidancePlugin:
         # exactly its current merge behaviour.
         self._reranker = reranker
         self._rerank_candidate_n = rerank_candidate_n
-        self._rerank_top_k = rerank_top_k
+        self._rerank_top_k = rerank_top_k        # Absent unless validation is enabled. Its absence is the off switch.
+        self._faithfulness_validator = faithfulness_validator
         self._max_context_chars = max_context_chars
         self._answering_temperature = answering_temperature
         self._chain_of_thought_enabled = chain_of_thought_enabled
@@ -141,6 +146,38 @@ class GuidancePlugin:
             )
             return unrouted
         return profile
+
+    def _validate_faithfulness(self, *, answer: str, context: str) -> None:
+        """Observe whether the answer was supportable. Never changes it.
+
+        Guidance represents "nothing retrieved" as a sentinel string rather
+        than an empty one, which the detector handles explicitly — checking
+        only for emptiness would silently do nothing here.
+
+        Wrapped defensively: a fault in a diagnostic must never cost a member
+        their answer.
+        """
+        if self._faithfulness_validator is None:
+            return
+        try:
+            verdict = self._faithfulness_validator.validate(
+                answer=answer, context=context,
+            )
+            if not verdict.supported:
+                # The reason CODE only. `detail` is free text a substituted
+                # validator could build from the member's own answer, and this
+                # record goes to stdout and on to central logging.
+                logger.warning(
+                    "Unsupported answer: plugin=guidance reason=%s answer_chars=%d",
+                    _safe_reason(verdict.reason), len(answer),
+                )
+        except Exception as exc:
+            # The exception TYPE, not the traceback: a raised message could
+            # otherwise carry the answer out through the failure path.
+            logger.warning(
+                "Faithfulness validation failed: error_type=%s",
+                type(exc).__name__,
+            )
 
     async def startup(self) -> None:
         logger.info("GuidancePlugin started")
@@ -419,9 +456,23 @@ class GuidancePlugin:
                 1,
             )
         answer = await self._invoke_answering(prompt)
-
         # Try to parse JSON response for source scores
         parsed_sources = self._parse_json_sources(answer)
+
+        # Validate the string the MEMBER receives, not the JSON envelope.
+        # retrieve_prompt asks for {"answer": ..., "sources": [...]}, and the
+        # envelope's own "sources" key is an information-noun — so validating
+        # the raw output made detection depend on the model's serialisation
+        # format rather than on what it said. It also made the logged
+        # answer_chars the envelope's length instead of the answer's, which
+        # corrupts the measurement this feature exists to collect.
+        member_answer = (
+            parsed_sources.get("answer", answer)
+            if parsed_sources is not None
+            else answer
+        )
+        self._validate_faithfulness(answer=member_answer, context=context)
+
         if parsed_sources is not None:
             return Response(
                 result=parsed_sources.get("answer", answer),

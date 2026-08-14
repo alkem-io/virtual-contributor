@@ -18,6 +18,7 @@ from core.config import BaseConfig, IngestSpaceConfig
 from core.container import Container
 from core.domain.rerank import LexicalReranker
 from core.domain.rule_classifier import RuleQueryClassifier
+from core.domain.faithfulness import ContextSufficiencyValidator
 from core.health import HealthServer
 from core.logging import setup_logging
 from core.ports.llm import LLMPort
@@ -145,6 +146,7 @@ def _log_config(config: BaseConfig, plugin_class: type | None = None) -> None:
         "routing_simple_n_results",
         "routing_complex_n_results",
         "routing_complex_context_chars",
+        "faithfulness_validation_enabled",
         "summary_chunk_threshold",
         "chunk_size",
         "chunk_overlap",
@@ -772,6 +774,14 @@ async def _run(config: BaseConfig) -> None:
                     "max_context_chars", config.max_context_chars,
                 ),
             )
+    # None means disabled, and is checked before any validation code runs — so
+    # disabling is a structural absence rather than a branch inside the check.
+    if "faithfulness_validator" in sig.parameters:
+        deps["faithfulness_validator"] = (
+            ContextSufficiencyValidator()
+            if config.faithfulness_validation_enabled
+            else None
+        )
     # Inject summarization LLM for ingest plugins
     if "summarize_llm" in sig.parameters:
         deps["summarize_llm"] = summarize_llm

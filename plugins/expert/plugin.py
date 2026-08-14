@@ -20,6 +20,8 @@ from core.events.input import Input
 from core.events.response import Response, Source
 from core.domain.retrieval_filters import FACTUAL_WHERE
 from core.ports.llm import LLMPort
+from core.domain.faithfulness import safe_reason as _safe_reason
+from core.ports.faithfulness import FaithfulnessValidatorPort
 from core.ports.knowledge_store import KnowledgeStorePort, QueryResult
 from core.ports.reranker import RerankerPort
 from core.domain.routing import DEFAULT_ROUTING_TABLE, RetrievalProfile
@@ -168,6 +170,7 @@ class ExpertPlugin:
         rerank_top_k: int = 5,
         query_router: QueryRouterPort | None = None,
         routing_table: dict | None = None,
+        faithfulness_validator: FaithfulnessValidatorPort | None = None,
     ) -> None:
         self._llm = llm
         self._knowledge_store = knowledge_store
@@ -189,6 +192,8 @@ class ExpertPlugin:
         # literally today's branch, not a table that happens to agree with it.
         self._query_router = query_router
         self._routing_table = routing_table or DEFAULT_ROUTING_TABLE
+        # Absent unless validation is enabled. Its absence is the off switch.
+        self._faithfulness_validator = faithfulness_validator
 
     @property
     def _retrieval_n_results(self) -> int:
@@ -289,6 +294,41 @@ class ExpertPlugin:
             )
             return unrouted
         return profile
+
+    def _validate_faithfulness(self, *, answer: str, context: str) -> None:
+        """Observe whether the answer was supportable. Never changes it.
+
+        Keyed off the CONTEXT STRING, never ``Response.sources``: the graph
+        path returns no sources by design, so a sources-keyed check would flag
+        every graph answer.
+
+        Wrapped defensively because this is pure observation — a fault in a
+        diagnostic must never cost a member their answer.
+        """
+        if self._faithfulness_validator is None:
+            return
+        try:
+            verdict = self._faithfulness_validator.validate(
+                answer=answer, context=context,
+            )
+            if not verdict.supported:
+                # The reason CODE only. `detail` is free text a substituted
+                # validator could build from the member's own answer, and this
+                # record goes to stdout and on to central logging — where it is
+                # readable by anyone with log access rather than by space
+                # membership. Never widen this to include verdict.detail.
+                logger.warning(
+                    "Unsupported answer: plugin=expert reason=%s answer_chars=%d",
+                    _safe_reason(verdict.reason), len(answer),
+                )
+        except Exception as exc:
+            # The exception TYPE, not the traceback: a substituted validator
+            # raising ValueError(f"could not judge: {answer}") would otherwise
+            # export the answer through the failure path.
+            logger.warning(
+                "Faithfulness validation failed: error_type=%s",
+                type(exc).__name__,
+            )
 
     async def startup(self) -> None:
         logger.info("ExpertPlugin started")
@@ -415,6 +455,15 @@ class ExpertPlugin:
         rerank_candidate_n = self._rerank_candidate_n
         truncate_to_top_k = self._truncate_to_top_k
 
+        # What retrieval actually produced, captured where it happens rather
+        # than read back from the final state. The graph definition arrives on
+        # the event, so its state schema is caller-supplied: LangGraph drops
+        # any key the schema does not declare, and a RAG graph omitting
+        # ``combined_knowledge_docs`` would make a real zero-context answer
+        # indistinguishable from a graph that never retrieved. This closure
+        # knows the difference; the final state does not.
+        retrieved: dict[str, str] = {}
+
         async def retrieve_node(state: dict) -> dict:
             from opentelemetry.trace import SpanKind
             from core.tracing import mark_empty_retrieval, optional_span
@@ -467,6 +516,10 @@ class ExpertPlugin:
                     mark_empty_retrieval()
             # #109: numbered blocks, so the model can cite [Document N].
             knowledge = join_document_blocks(docs)
+            # #117: captured where retrieval happens — the graph's state
+            # schema is caller-supplied and drops undeclared keys, so the
+            # closure, not the state, carries what was actually retrieved.
+            retrieved["context"] = knowledge
             # The expert state schema expects ``combined_knowledge_docs``
             # — that's what the answer_question node reads via its
             # ``{combined_knowledge_docs}`` prompt variable.  ``sources``
@@ -505,6 +558,12 @@ class ExpertPlugin:
         final_state = await graph.invoke(initial_state)
 
         answer = final_state.get("final_answer", final_state.get("result", ""))
+        # Validate only when retrieval actually ran. A graph with no retrieve
+        # node makes no claim about retrieved context — validating it would
+        # flag every answer from every non-RAG graph, and prompt graphs are
+        # configurable per space.
+        if "context" in retrieved:
+            self._validate_faithfulness(answer=answer, context=retrieved["context"])
         sources = self._extract_sources(final_state)
 
         return Response(
@@ -566,6 +625,7 @@ class ExpertPlugin:
             prompt = f"{prompt}\n\n{complexity_instruction}"
 
         answer = await self._invoke_answering(prompt)
+        self._validate_faithfulness(answer=answer, context=knowledge)
         sources = self._build_sources(result)
 
         return Response(
