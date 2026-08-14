@@ -315,8 +315,9 @@ handler before exactly one flat attempt; an error from that flat attempt remains
 visible. Hierarchy labels, when disclosure is enabled, are sanitized and
 rendered before the context budget, so all model-visible label bytes are
 charged before eviction. Both hierarchy retrieval and display-name disclosure
-can be returned immediately to flat-compatible behaviour by setting their
-controls to `false`.
+are independently controlled: setting hierarchy retrieval to `false` restores
+flat retrieval, while setting display names to `false` omits model-visible
+hierarchy names without disabling scoped retrieval.
 
 Enable only after deployment with both controls off, re-ingestion of selected
 spaces, and the required human gates. `RG-05` is the representative paired

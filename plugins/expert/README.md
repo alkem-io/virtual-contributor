@@ -56,8 +56,9 @@ one flat attempt. A flat-path error is not hidden or retried by hierarchy logic.
 of retrieval. When allowed, labels use only sanitized display names; they are
 rendered before context-budget eviction, and their model-visible bytes are
 charged before rows are dropped. With disclosure disabled or names unavailable,
-the hierarchy segment is omitted. Both controls can be set to `false` for an
-immediate flat-compatible rollback.
+the hierarchy segment is omitted. Setting hierarchy retrieval to `false`
+restores flat retrieval; setting display names to `false` independently omits
+model-visible names while scoped retrieval remains available.
 
 Provider processing/minimization approval is a human `RG-05P` gate before
 display names may be enabled; this code does not grant or imply that approval.
