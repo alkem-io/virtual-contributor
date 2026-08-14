@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import logging
-import hashlib
-import json
 
 from core.config import BaseConfig
 from core.container import Container, ContainerError
@@ -14,6 +12,7 @@ from core.ports.llm import LLMPort
 from core.provider_factory import create_llm_adapter  # noqa: F401 - test seam
 from core.registry import PluginRegistry
 from evaluation.tracing import TracingKnowledgeStore
+from plugins.expert.composition import expert_composition_fingerprint
 
 logger = logging.getLogger(__name__)
 
@@ -25,17 +24,7 @@ def effective_composition_fingerprint(config: BaseConfig) -> str:
     deliberately does not alter the paired-run fingerprint. Display-name
     rendering remains included because it changes model-visible context.
     """
-    values = config.model_dump()
-    effective = {
-        key: value for key, value in values.items()
-        if any(token in key for token in (
-            "expert_", "hybrid_", "rerank_", "routing_", "query_rewrite",
-            "answering_", "embeddings_", "vector_db_distance",
-        )) and not any(secret in key for secret in ("key", "credentials", "endpoint"))
-    }
-    effective.pop("expert_hierarchical_retrieval_enabled", None)
-    serialized = json.dumps(effective, sort_keys=True, default=str, separators=(",", ":"))
-    return hashlib.sha256(serialized.encode()).hexdigest()
+    return expert_composition_fingerprint(config, {})
 
 
 class PipelineInvoker:
@@ -66,7 +55,11 @@ class PipelineInvoker:
         # Production owns adapter and expert dependency composition. Evaluation
         # differs only by wrapping the already-composed store for transparent
         # capture, preventing a paired run from silently using other settings.
-        from main import _create_adapters, _inject_answering_config, _inject_plugin_config
+        from main import (
+            _compose_expert_dependencies,
+            _create_adapters,
+            _expert_composition_fingerprint,
+        )
 
         container = Container()
         _create_adapters(self._config, container)
@@ -86,18 +79,28 @@ class PipelineInvoker:
         registry = PluginRegistry()
         plugin_class = registry.discover(self._plugin_type)
         deps = container.resolve_for_plugin(plugin_class)
-        signature = _inject_plugin_config(deps, plugin_class, self._config, None, None)
-        _inject_answering_config(self._config, deps, signature)
-        if "hybrid_config" in signature.parameters:
-            deps["hybrid_config"] = self._config
-        if "rerank_candidate_n" in signature.parameters:
-            deps["rerank_candidate_n"] = self._config.rerank_candidate_n
-        if "rerank_top_k" in signature.parameters:
-            deps["rerank_top_k"] = self._config.rerank_top_k
-        if "context_observer" in signature.parameters:
-            deps["context_observer"] = self._tracing_store.capture_generation_context
+        if self._plugin_type.lower().replace("-", "_") == "expert":
+            _compose_expert_dependencies(
+                self._config, deps, plugin_class,
+                context_observer=self._tracing_store.capture_generation_context,
+            )
+        else:
+            from main import _inject_answering_config, _inject_plugin_config
+
+            signature = _inject_plugin_config(deps, plugin_class, self._config, None, None)
+            _inject_answering_config(self._config, deps, signature)
+            if "hybrid_config" in signature.parameters:
+                deps["hybrid_config"] = self._config
+            if "rerank_candidate_n" in signature.parameters:
+                deps["rerank_candidate_n"] = self._config.rerank_candidate_n
+            if "rerank_top_k" in signature.parameters:
+                deps["rerank_top_k"] = self._config.rerank_top_k
+            if "context_observer" in signature.parameters:
+                deps["context_observer"] = self._tracing_store.capture_generation_context
         self._plugin = plugin_class(**deps)
-        self._composition_fingerprint = effective_composition_fingerprint(self._config)
+        self._composition_fingerprint = _expert_composition_fingerprint(
+            self._config, deps, container,
+        )
 
         await self._plugin.startup()
         logger.info("Pipeline initialized: plugin=%s", self._plugin_type)

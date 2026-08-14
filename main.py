@@ -28,6 +28,7 @@ from core.ports.knowledge_store import KnowledgeStorePort
 from core.ports.reranker import RerankerPort
 from core.registry import PluginRegistry
 from core.router import Router
+from plugins.expert.composition import expert_composition_fingerprint
 
 logger = logging.getLogger(__name__)
 
@@ -363,6 +364,66 @@ def _inject_answering_config(
         deps["answering_temperature"] = config.answering_llm_temperature
     if "chain_of_thought_enabled" in signature.parameters:
         deps["chain_of_thought_enabled"] = config.answering_chain_of_thought_enabled
+
+
+def _compose_expert_dependencies(
+    config: BaseConfig,
+    deps: dict[str, Any],
+    plugin_class: type,
+    *,
+    context_observer: object | None = None,
+) -> inspect.Signature:
+    """Apply every Expert setting at the one production/evaluation boundary."""
+    sig = _inject_plugin_config(deps, plugin_class, config, None, None)
+    _inject_answering_config(config, deps, sig)
+    if "hybrid_config" in sig.parameters:
+        deps["hybrid_config"] = config
+    if "reranker" in deps:
+        if "rerank_candidate_n" in sig.parameters:
+            deps["rerank_candidate_n"] = config.rerank_candidate_n
+        if "rerank_top_k" in sig.parameters:
+            deps["rerank_top_k"] = config.rerank_top_k
+    if config.routing_enabled and "query_router" in sig.parameters:
+        deps["query_router"] = RuleQueryClassifier()
+        if "routing_table" in sig.parameters:
+            deps["routing_table"] = _build_routing_table(
+                config,
+                n_results=deps.get("n_results", config.expert_n_results),
+                score_threshold=deps.get("score_threshold", config.expert_min_score),
+                max_context_chars=deps.get("max_context_chars", config.max_context_chars),
+            )
+    if "faithfulness_validator" in sig.parameters:
+        deps["faithfulness_validator"] = (
+            ContextSufficiencyValidator()
+            if config.faithfulness_validation_enabled else None
+        )
+    if "max_expansion_ratio" in sig.parameters:
+        deps["max_expansion_ratio"] = config.query_rewrite_max_expansion_ratio
+    if "max_history_turns" in sig.parameters:
+        plugin_history = getattr(config, "history_length", None)
+        turns = config.query_rewrite_max_history_turns
+        deps["max_history_turns"] = min(turns, plugin_history) if plugin_history else turns
+    if "max_history_chars" in sig.parameters:
+        deps["max_history_chars"] = config.query_rewrite_max_history_chars
+    if "rewrite_policy" in sig.parameters and config.query_rewrite_gating_enabled:
+        policy = _build_rewrite_policy()
+        if policy is not None:
+            deps["rewrite_policy"] = policy
+    if context_observer is not None and "context_observer" in sig.parameters:
+        deps["context_observer"] = context_observer
+    return sig
+
+
+def _expert_composition_fingerprint(
+    config: BaseConfig, deps: dict[str, Any], container: Container,
+) -> str:
+    """Build the shared paired-evaluation fingerprint from live adapters."""
+    return expert_composition_fingerprint(
+        config,
+        deps,
+        embeddings=container._bindings.get(EmbeddingsPort),
+        llm_config=_resolve_plugin_llm_config(config),
+    )
 
 
 def _resolve_plugin_llm_config(config: BaseConfig) -> BaseConfig:
@@ -817,43 +878,43 @@ async def _run(config: BaseConfig) -> None:
 
     # Construct plugin with dependencies
     deps = container.resolve_for_plugin(plugin_class)
-    sig = _inject_plugin_config(
-        deps,
-        plugin_class,
-        config,
-        summarize_llm,
-        bok_llm,
-    )
-    # Inject per-plugin retrieval config
-    sig = inspect.signature(plugin_class.__init__)
     plugin_name = config.plugin_type.lower().replace("-", "_") if config.plugin_type else ""
-    if "n_results" in sig.parameters:
+    expert_composed = plugin_name == "expert"
+    if expert_composed:
+        sig = _compose_expert_dependencies(config, deps, plugin_class)
+    else:
+        sig = _inject_plugin_config(
+            deps, plugin_class, config, summarize_llm, bok_llm,
+        )
+    # Non-Expert plugins retain their established, plugin-generic wiring.
+    if not expert_composed and "n_results" in sig.parameters:
         if plugin_name == "expert":
             deps["n_results"] = config.expert_n_results
         elif plugin_name == "guidance":
             deps["n_results"] = config.guidance_n_results
         else:
             deps["n_results"] = config.retrieval_n_results
-    if "score_threshold" in sig.parameters:
+    if not expert_composed and "score_threshold" in sig.parameters:
         if plugin_name == "expert":
             deps["score_threshold"] = config.expert_min_score
         elif plugin_name == "guidance":
             deps["score_threshold"] = config.guidance_min_score
         else:
             deps["score_threshold"] = config.retrieval_score_threshold
-    if "max_context_chars" in sig.parameters:
+    if not expert_composed and "max_context_chars" in sig.parameters:
         deps["max_context_chars"] = config.max_context_chars
-    _inject_answering_config(config, deps, sig)
+    if not expert_composed:
+        _inject_answering_config(config, deps, sig)
     # The whole config object, so the retrieval helper reads the hybrid
     # settings from one place rather than each plugin re-listing them.
-    if "hybrid_config" in sig.parameters:
+    if not expert_composed and "hybrid_config" in sig.parameters:
         deps["hybrid_config"] = config
     # The re-ranker itself now arrives via `resolve_for_plugin` above, which
     # resolves the `RerankerPort | None` annotation to the registration made
     # in `_create_adapters`. Only its scalar settings still need injecting,
     # and only when it is actually present — otherwise a disabled deployment
     # would carry re-ranking numbers it never uses.
-    if "reranker" in deps:
+    if not expert_composed and "reranker" in deps:
         if "rerank_candidate_n" in sig.parameters:
             deps["rerank_candidate_n"] = config.rerank_candidate_n
         if "rerank_top_k" in sig.parameters:
@@ -862,7 +923,7 @@ async def _run(config: BaseConfig) -> None:
     # plugins keep their `query_router=None` default and take their existing
     # code path — which is what makes disabling this a true rollback rather
     # than a routing table that merely happens to agree with today.
-    if config.routing_enabled and "query_router" in sig.parameters:
+    if not expert_composed and config.routing_enabled and "query_router" in sig.parameters:
         deps["query_router"] = RuleQueryClassifier()
         if "routing_table" in sig.parameters:
             deps["routing_table"] = _build_routing_table(
@@ -877,16 +938,16 @@ async def _run(config: BaseConfig) -> None:
             )
     # None means disabled, and is checked before any validation code runs — so
     # disabling is a structural absence rather than a branch inside the check.
-    if "faithfulness_validator" in sig.parameters:
+    if not expert_composed and "faithfulness_validator" in sig.parameters:
         deps["faithfulness_validator"] = (
             ContextSufficiencyValidator()
             if config.faithfulness_validation_enabled
             else None
         )
     # Inject the query-rewrite gate
-    if "max_expansion_ratio" in sig.parameters:
+    if not expert_composed and "max_expansion_ratio" in sig.parameters:
         deps["max_expansion_ratio"] = config.query_rewrite_max_expansion_ratio
-    if "max_history_turns" in sig.parameters:
+    if not expert_composed and "max_history_turns" in sig.parameters:
         # Honour a plugin's own `history_length` when it declares one — it is
         # that plugin's statement about how much history is meaningful, and it
         # should never be exceeded by the rewrite prompt.
@@ -895,9 +956,10 @@ async def _run(config: BaseConfig) -> None:
         deps["max_history_turns"] = (
             min(turns, plugin_history) if plugin_history else turns
         )
-    if "max_history_chars" in sig.parameters:
+    if not expert_composed and "max_history_chars" in sig.parameters:
         deps["max_history_chars"] = config.query_rewrite_max_history_chars
-    if "rewrite_policy" in sig.parameters and config.query_rewrite_gating_enabled:
+    if (not expert_composed and "rewrite_policy" in sig.parameters
+            and config.query_rewrite_gating_enabled):
         policy = _build_rewrite_policy()
         if policy is not None:
             deps["rewrite_policy"] = policy
@@ -935,6 +997,11 @@ async def _run(config: BaseConfig) -> None:
         else:
             logger.warning("GraphQL client not configured — missing API_ENDPOINT_PRIVATE_GRAPHQL, AUTH_ADMIN_EMAIL, or AUTH_ADMIN_PASSWORD")
     plugin = plugin_class(**deps)
+    if expert_composed:
+        logger.info(
+            "Expert composition fingerprint=%s",
+            _expert_composition_fingerprint(config, deps, container),
+        )
 
     # Plugin lifecycle: startup
     await plugin.startup()

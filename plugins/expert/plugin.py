@@ -393,16 +393,12 @@ class ExpertPlugin:
         bok_id = event.body_of_knowledge_id or ""
         collection = f"{bok_id}-knowledge" if bok_id else "default-knowledge"
 
-        # One decision per query, made before either path branches, so the
-        # two paths cannot drift apart in how they route.
-        profile = self._resolve_profile(event.message)
-
         # If prompt_graph is defined, use graph execution
         if event.prompt_graph:
-            return await self._handle_with_graph(event, collection, profile)
+            return await self._handle_with_graph(event, collection)
 
         # Fallback: simple RAG
-        return await self._handle_simple(event, collection, profile)
+        return await self._handle_simple(event, collection)
 
     def _enforce_context_budget(
         self, docs: list[str], filtered_result: QueryResult,
@@ -551,9 +547,7 @@ class ExpertPlugin:
             logger.warning("Hierarchy detail fallback: error_type=%s", type(exc).__name__)
         return await flat()
 
-    async def _handle_with_graph(
-        self, event: Input, collection: str, profile: RetrievalProfile,
-    ) -> Response:
+    async def _handle_with_graph(self, event: Input, collection: str) -> Response:
         from core.domain.prompt_graph import PromptGraph
 
         graph = PromptGraph.from_definition(event.prompt_graph)
@@ -729,9 +723,7 @@ class ExpertPlugin:
             max_expansion_ratio=self._max_expansion_ratio,
         )
 
-    async def _handle_simple(
-        self, event: Input, collection: str, profile: RetrievalProfile,
-    ) -> Response:
+    async def _handle_simple(self, event: Input, collection: str) -> Response:
         """Simple RAG without graph execution."""
         from opentelemetry.trace import SpanKind
 

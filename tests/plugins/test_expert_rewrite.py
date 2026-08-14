@@ -102,6 +102,29 @@ async def test_ambiguous_acknowledgement_is_rewritten_then_reclassified_for_widt
     assert store.query_calls[0][2] == 7
 
 
+@pytest.mark.parametrize("graph", [False, True])
+async def test_router_classifies_only_the_resolved_retrieval_query(graph: bool) -> None:
+    """The discarded raw follow-up must never influence routing."""
+    class CountingRouter:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def classify(self, message: str) -> RoutingDecision:
+            self.calls.append(message)
+            return RoutingDecision(RouteClass.MODERATE, "test")
+
+    router = CountingRouter()
+    plugin = ExpertPlugin(
+        llm=CountingLLM(), knowledge_store=MockKnowledgeStorePort(),
+        query_router=router,
+    )
+    if graph:
+        await TestExpertGraphPath()._run(plugin, "and the other one?")
+    else:
+        await plugin.handle(make_input(message="and the other one?", history=HISTORY))
+    assert router.calls == [RESOLVED]
+
+
 async def test_unambiguous_small_talk_still_has_zero_retrieval_calls() -> None:
     class Router:
         def classify(self, message: str) -> RoutingDecision:

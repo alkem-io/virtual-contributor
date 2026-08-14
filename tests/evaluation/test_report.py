@@ -49,6 +49,7 @@ def _make_run(
         success_count=48,
         failure_count=2,
         duration_seconds=842.5,
+        composition_fingerprint="matched-composition",
         aggregate=aggregate,
         cases=[
             EvaluationCase(
@@ -125,6 +126,16 @@ class TestComputeComparison:
         baseline.composition_fingerprint = "flat-and-on-compatible"
         current.composition_fingerprint = "reranker-drift"
         with pytest.raises(ValueError, match="fingerprints differ"):
+            compute_comparison(baseline, current)
+
+    @pytest.mark.parametrize("missing", ["baseline", "current"])
+    def test_rejects_comparison_when_a_fingerprint_is_missing(self, missing):
+        baseline, current = _make_run("baseline"), _make_run("current")
+        if missing == "baseline":
+            baseline.composition_fingerprint = None
+        else:
+            current.composition_fingerprint = ""
+        with pytest.raises(ValueError, match="fingerprints are required"):
             compute_comparison(baseline, current)
 
     def test_summary_count(self):

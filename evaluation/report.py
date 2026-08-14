@@ -159,8 +159,11 @@ def compute_comparison(
     baseline: EvaluationRun, current: EvaluationRun
 ) -> ComparisonReport:
     """Compute per-metric deltas between two runs."""
-    if (baseline.composition_fingerprint and current.composition_fingerprint
-            and baseline.composition_fingerprint != current.composition_fingerprint):
+    if not baseline.composition_fingerprint or not current.composition_fingerprint:
+        raise ValueError(
+            "Evaluation composition fingerprints are required; comparison is not a hierarchy-only experiment"
+        )
+    if baseline.composition_fingerprint != current.composition_fingerprint:
         raise ValueError(
             "Evaluation composition fingerprints differ; comparison is not a hierarchy-only experiment"
         )
