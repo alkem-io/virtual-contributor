@@ -8,16 +8,58 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
+from typing import Any, ClassVar
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import AIMessage, BaseMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
+
+from core.adapters.langchain_llm import LangChainLLMAdapter
 from core.ports.query_router import RouteClass, RoutingDecision
 from plugins.expert.plugin import ExpertPlugin
 from tests.conftest import MockKnowledgeStorePort, MockLLMPort, make_input
 
 
 GRAPH = {"nodes": [{"name": "n"}], "edges": [{"from": "START", "to": "END"}]}
+
+
+class _CapturingGraphModel(BaseChatModel):
+    """Real LCEL model used to inspect the graph answer-node input."""
+
+    calls: ClassVar[list[list[BaseMessage]]] = []
+
+    @property
+    def _llm_type(self) -> str:
+        return "capturing-graph"
+
+    def _generate(
+        self, messages: list[BaseMessage], stop: list[str] | None = None,
+        run_manager: Any = None, **kwargs: Any,
+    ) -> ChatResult:
+        type(self).calls.append(messages)
+        return ChatResult(generations=[ChatGeneration(message=AIMessage(content="graph answer"))])
+
+
+REAL_ANSWER_GRAPH = {
+    "nodes": [
+        {"name": "retrieve", "input_variables": [], "prompt": "unused"},
+        {
+            "name": "answer", "input_variables": ["combined_knowledge_docs"],
+            "prompt": "FINAL ANSWER CONTEXT:\n{combined_knowledge_docs}", "output": {},
+        },
+    ],
+    "edges": [{"from": "START", "to": "retrieve"}, {"from": "retrieve", "to": "answer"}, {"from": "answer", "to": "END"}],
+    "state": {"type": "object", "properties": {
+        "messages": {"type": "array", "items": {"type": "object"}},
+        "current_question": {"type": "string"}, "conversation": {"type": "string"},
+        "bok_id": {"type": "string"}, "description": {"type": "string"},
+        "display_name": {"type": "string"}, "combined_knowledge_docs": {"type": "string"},
+        "result": {"type": "string"},
+    }},
+}
 
 
 def _entries() -> list[dict]:
@@ -262,6 +304,31 @@ async def test_graph_observer_equals_retrieve_node_context_and_excludes_sibling(
     assert "Beta liability noise" not in result["combined_knowledge_docs"]
     assert "a-sub" not in result["combined_knowledge_docs"]
     assert "route-a" not in result["combined_knowledge_docs"]
+
+
+async def test_real_graph_answer_receives_the_exact_observed_final_context() -> None:
+    """C-15: execution reaches the real answer node, not just retrieve parity."""
+    _CapturingGraphModel.calls = []
+    observed: list[list[str]] = []
+    store = _store()
+    # Stage 2 has two relevant rows; threshold drops the second. The orienting
+    # overview is never answer context regardless of its high rank.
+    plugin = ExpertPlugin(
+        LangChainLLMAdapter(_CapturingGraphModel()), store,
+        hierarchical_retrieval_enabled=True, score_threshold=0.85,
+        context_observer=observed.append,
+    )
+    response = await plugin.handle(make_input(
+        message="Alpha liability", bodyOfKnowledgeID="c", promptGraph=REAL_ANSWER_GRAPH,
+    ))
+    assert response.result == "graph answer"
+    assert len(_CapturingGraphModel.calls) == 1
+    rendered = "\n\n".join(observed[-1])
+    answer_prompt = str(_CapturingGraphModel.calls[-1][0].content)
+    assert answer_prompt.encode() == f"FINAL ANSWER CONTEXT:\n{rendered}".encode()
+    assert "Alpha overview" not in answer_prompt  # Stage 1 orienting row
+    assert "Alpha evidence" not in answer_prompt  # threshold-dropped candidate
+    assert "Beta liability noise" not in answer_prompt  # sibling scoped out
 
 
 class _Conversational:
