@@ -209,3 +209,32 @@ class TestEnabledReorders:
         )
         response = await plugin.handle(make_input(message="zzz qqq wwww"))
         assert response.sources[0].uri == "https://example.org/0"
+
+
+class TestObservability:
+    async def test_rerank_logs_metrics(self, caplog: object) -> None:
+        """FR-028 — the stage must be visible without inferring it from quality."""
+        import logging
+
+        store = _FixtureStore()
+        plugin = _plugin(
+            store, n_results=4,
+            reranker=LexicalReranker(), rerank_candidate_n=4, rerank_top_k=2,
+        )
+        with caplog.at_level(logging.INFO, logger="plugins.expert.plugin"):  # type: ignore[attr-defined]
+            await plugin.handle(make_input(message="how do I invite members to a space"))
+
+        messages = [r.getMessage() for r in caplog.records]  # type: ignore[attr-defined]
+        assert any("Re-ranked 4 candidates to 2" in m for m in messages)
+
+    async def test_no_rerank_log_when_disabled(self, caplog: object) -> None:
+        import logging
+
+        store = _FixtureStore()
+        plugin = _plugin(store, n_results=4)
+        with caplog.at_level(logging.INFO, logger="plugins.expert.plugin"):  # type: ignore[attr-defined]
+            await plugin.handle(make_input(message="how do I invite members to a space"))
+
+        assert not any(
+            "Re-ranked" in r.getMessage() for r in caplog.records  # type: ignore[attr-defined]
+        )

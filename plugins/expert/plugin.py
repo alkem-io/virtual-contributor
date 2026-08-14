@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 
 from core.events.input import Input
 from core.events.response import Response, Source
@@ -35,6 +36,7 @@ def _apply_rerank(
     if not docs:
         return result
 
+    started = time.perf_counter()
     distances = result.distances[0] if result.distances else []
     metadatas = result.metadatas[0] if result.metadatas else []
     ids = result.ids[0] if result.ids else []
@@ -47,6 +49,13 @@ def _apply_rerank(
     ]
 
     order = reranker.rerank(query, docs, vector_scores, top_k=top_k)
+
+    # Logged so an operator can see the stage is running and what it costs
+    # without having to reason about it from answer quality alone.
+    logger.info(
+        "Re-ranked %d candidates to %d in %.1fms",
+        len(docs), len(order), (time.perf_counter() - started) * 1000,
+    )
 
     return QueryResult(
         documents=[[docs[i] for i in order]],

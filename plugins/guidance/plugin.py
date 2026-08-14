@@ -5,12 +5,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 import re
 
 from core.events.input import Input
 from core.events.response import Response, Source
 from core.ports.llm import LLMPort
 from core.ports.knowledge_store import KnowledgeStorePort
+from core.ports.reranker import RerankerPort
 
 logger = logging.getLogger(__name__)
 
@@ -40,11 +42,19 @@ class GuidancePlugin:
         n_results: int = 5,
         score_threshold: float = 0.3,
         max_context_chars: int = 20000,
+        reranker: RerankerPort | None = None,
+        rerank_candidate_n: int = 20,
+        rerank_top_k: int = 5,
     ) -> None:
         self._llm = llm
         self._knowledge_store = knowledge_store
         self._n_results = n_results
         self._score_threshold = score_threshold
+        # Absent unless re-ranking is enabled, so an existing deployment keeps
+        # exactly its current merge behaviour.
+        self._reranker = reranker
+        self._rerank_candidate_n = rerank_candidate_n
+        self._rerank_top_k = rerank_top_k
         self._max_context_chars = max_context_chars
 
     async def startup(self) -> None:
@@ -72,7 +82,9 @@ class GuidancePlugin:
             question = condensed
 
         # Query multiple collections in parallel
-        n_results = self._n_results
+        n_results = (
+            self._rerank_candidate_n if self._reranker else self._n_results
+        )
 
         async def _query_collection(collection: str):
             docs, sources = [], []
@@ -104,8 +116,31 @@ class GuidancePlugin:
         for docs, sources in query_results:
             all_pairs.extend(zip(docs, sources))
 
-        # Sort by relevance (highest score first)
-        all_pairs.sort(key=lambda p: p[1].score or 0, reverse=True)
+        # Order the merged pool.
+        #
+        # Sorting on `score` alone compares distances produced by three
+        # separately-populated collections, which are only loosely comparable:
+        # a sparsely-populated corpus returns systematically worse distances,
+        # so its passages lose every cross-collection comparison regardless of
+        # how well they answer the question. Re-ranking applies one scorer
+        # uniformly across the whole pool, which is what makes the merge sound.
+        #
+        # No truncation here. Cutting to top-K before the dedupe below would
+        # let several chunks from one page consume the budget and return fewer
+        # distinct sources than asked for.
+        if self._reranker is not None:
+            docs_only = [doc for doc, _ in all_pairs]
+            vector_scores = [src.score or 0.0 for _, src in all_pairs]
+            started = time.perf_counter()
+            order = self._reranker.rerank(question, docs_only, vector_scores)
+            all_pairs = [all_pairs[i] for i in order]
+            logger.info(
+                "Re-ranked %d merged candidates across %d collections in %.1fms",
+                len(docs_only), len(DEFAULT_COLLECTIONS),
+                (time.perf_counter() - started) * 1000,
+            )
+        else:
+            all_pairs.sort(key=lambda p: p[1].score or 0, reverse=True)
 
         # Filter by score threshold — discard low-relevance chunks
         all_pairs = [
@@ -122,7 +157,11 @@ class GuidancePlugin:
                 seen_sources.add(key)
                 deduped.append((doc, src))
 
-        deduped = deduped[:self._n_results]
+        # Truncate only now, after dedupe, so K distinct sources are returned
+        # whenever K distinct sources exist.
+        deduped = deduped[
+            : (self._rerank_top_k if self._reranker else self._n_results)
+        ]
 
         # Context budget enforcement — drop lowest-scoring chunks if over budget
         total_chars = sum(len(doc) for doc, _ in deduped)
