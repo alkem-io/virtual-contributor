@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from typing import AsyncIterator
 
@@ -50,9 +51,33 @@ class LangChainLLMAdapter:
         self._llm = llm
         self._timeout = timeout
 
-    def _sync_invoke(self, lc_messages: list[BaseMessage]) -> str:
+    def _model_accepts_temperature(self) -> bool:
+        """Return whether this model accepts generation kwargs on ``invoke``."""
+
+        try:
+            parameters = inspect.signature(self._llm.invoke).parameters.values()
+        except (TypeError, ValueError):
+            return False
+        return any(
+            parameter.name == "temperature"
+            or parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        )
+
+    def _sync_invoke(
+        self, lc_messages: list[BaseMessage], temperature: float | None = None
+    ) -> str:
         """Synchronous LLM call — runs in a thread to avoid blocking the event loop."""
-        result = self._llm.invoke(lc_messages)
+        if temperature is None:
+            # Preserve the existing model invocation exactly when no per-call
+            # answering override is configured.
+            result = self._llm.invoke(lc_messages)
+        elif self._model_accepts_temperature():
+            result = self._llm.invoke(lc_messages, temperature=temperature)
+        else:
+            # Binding creates a per-call runnable and leaves the shared model
+            # (also used by ingest and summarization) unchanged.
+            result = self._llm.bind(temperature=temperature).invoke(lc_messages)
         # Log token usage if available (FR-011)
         usage = getattr(result, "usage_metadata", None)
         if usage:
@@ -63,15 +88,22 @@ class LangChainLLMAdapter:
             )
         return str(result.content)
 
-    async def invoke(self, messages: list[dict]) -> str:
+    async def invoke(
+        self, messages: list[dict], temperature: float | None = None
+    ) -> str:
         lc_messages = _to_langchain_messages(messages)
         last_exc: Exception | None = None
         for attempt in range(MAX_RETRIES):
             try:
                 # Run sync invoke in a thread so the event loop stays free
                 # for RabbitMQ heartbeats and other async tasks
+                invoke_in_thread = (
+                    asyncio.to_thread(self._sync_invoke, lc_messages)
+                    if temperature is None
+                    else asyncio.to_thread(self._sync_invoke, lc_messages, temperature)
+                )
                 result = await asyncio.wait_for(
-                    asyncio.to_thread(self._sync_invoke, lc_messages),
+                    invoke_in_thread,
                     timeout=self._timeout,
                 )
                 return result

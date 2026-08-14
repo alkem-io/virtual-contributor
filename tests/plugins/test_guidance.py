@@ -6,6 +6,10 @@ import pytest
 
 from core.domain.retrieval_filters import FACTUAL_WHERE
 from core.events.response import Response
+from core.domain.prompts_shared import (
+    render_document_block,
+    rendered_document_budget_size,
+)
 from core.ports.knowledge_store import QueryResult
 from plugins.guidance.plugin import GuidancePlugin
 from tests.conftest import MockLLMPort, MockKnowledgeStorePort, make_input
@@ -55,13 +59,61 @@ class TestGuidancePlugin:
         # Only the high-score chunk should survive filtering
         assert all(s.source == "a" for s in result.sources)
 
+    async def test_context_budget_counts_rendered_document_labels(self):
+        """Rendered labels are charged before deciding which chunks survive."""
+        store = MockKnowledgeStorePort()
+        for index, collection in enumerate(
+            [
+                "alkem.io-knowledge",
+                "welcome.alkem.io-knowledge",
+                "www.alkemio.org-knowledge",
+            ]
+        ):
+            await store.ingest(
+                collection,
+                [chr(ord("A") + index) * 20],
+                [
+                    {
+                        "source": f"https://example.test/{index}",
+                        "embeddingType": "chunk",
+                        "type": "knowledge",
+                    }
+                ],
+                [f"id-{index}"],
+            )
+
+        first_content = "A" * 20
+        first_block = render_document_block(
+            1,
+            first_content,
+            {
+                "source": "https://example.test/0",
+                "embeddingType": "chunk",
+                "type": "knowledge",
+            },
+        )
+        context_budget = rendered_document_budget_size(first_block, first_content)
+        plugin = GuidancePlugin(
+            llm=MockLLMPort(response='{"answer": "ok"}'),
+            knowledge_store=store,
+            n_results=3,
+            max_context_chars=context_budget,
+        )
+
+        response = await plugin.handle(make_input())
+        prompt = plugin._llm.calls[-1][0]["content"]
+
+        assert "A" * 20 in prompt
+        assert "B" * 20 not in prompt
+        assert "C" * 20 not in prompt
+        assert len(response.sources) == 1
+
     async def test_source_prefix_formatting(self, plugin):
-        """Context passed to LLM should have [source:N] prefixes."""
+        """Context passed to LLM should have 1-based labelled document blocks."""
         event = make_input()
         await plugin.handle(event)
-        # The LLM call should contain [source:0] in the prompt
         llm_prompt = plugin._llm.calls[-1][0]["content"]
-        assert "[source:0]" in llm_prompt
+        assert "[Document 1 · test · origin: test]" in llm_prompt
 
     async def test_history_condensation(self, plugin):
         event = make_input(

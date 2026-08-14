@@ -280,6 +280,17 @@ class BaseConfig(BaseSettings):
                 f"got {self.bok_llm_timeout}"
             )
 
+        # Answering generation validation. This setting is intentionally
+        # separate from LLM_TEMPERATURE: it applies only at answer call sites
+        # and is opt-in so existing deployments retain provider defaults.
+        if self.answering_llm_temperature is not None and not (
+            0.0 <= self.answering_llm_temperature <= 2.0
+        ):
+            raise ValueError(
+                "ANSWERING_LLM_TEMPERATURE must be between 0.0 and 2.0, "
+                f"got {self.answering_llm_temperature}"
+            )
+
         # Partial BoK config warning
         bok_fields = [
             self.bok_llm_provider,
@@ -328,6 +339,12 @@ class BaseConfig(BaseSettings):
     bok_llm_base_url: str | None = None
     bok_llm_temperature: float | None = None
     bok_llm_timeout: int | None = None
+
+    # Answering generation — opt-in per-call override for retrieval-backed
+    # answering only. Unset preserves the shared LLM adapter's existing
+    # provider defaults for answering, ingestion, and summarization.
+    answering_llm_temperature: float | None = None
+    answering_chain_of_thought_enabled: bool = True
 
     # Retrieval — per-plugin parameters
     expert_n_results: int = 5

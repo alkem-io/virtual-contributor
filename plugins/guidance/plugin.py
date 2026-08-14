@@ -7,6 +7,15 @@ import json
 import logging
 import re
 
+from core.domain.prompts_shared import (
+    STEP_BY_STEP_ANSWER_INSTRUCTIONS,
+    citation_scope_instruction,
+    empty_context_instruction,
+    join_document_blocks,
+    render_document_block,
+    rendered_document_budget_size,
+)
+from core.domain.query_complexity import QueryComplexity, classify_question
 from core.events.input import Input
 from core.events.response import Response, Source
 from core.domain.retrieval_filters import FACTUAL_WHERE
@@ -41,18 +50,42 @@ class GuidancePlugin:
         n_results: int = 5,
         score_threshold: float = 0.3,
         max_context_chars: int = 20000,
+        answering_temperature: float | None = None,
+        chain_of_thought_enabled: bool = True,
     ) -> None:
         self._llm = llm
         self._knowledge_store = knowledge_store
         self._n_results = n_results
         self._score_threshold = score_threshold
         self._max_context_chars = max_context_chars
+        self._answering_temperature = answering_temperature
+        self._chain_of_thought_enabled = chain_of_thought_enabled
 
     async def startup(self) -> None:
         logger.info("GuidancePlugin started")
 
     async def shutdown(self) -> None:
         logger.info("GuidancePlugin stopped")
+
+    def _complexity_instruction(self, question: str) -> str:
+        """Return the private-reasoning instruction only for complex questions."""
+
+        if not self._chain_of_thought_enabled:
+            return ""
+        complexity, _ = classify_question(question)
+        if complexity is QueryComplexity.COMPLEX:
+            return STEP_BY_STEP_ANSWER_INSTRUCTIONS
+        return ""
+
+    async def _invoke_answering(self, prompt: str) -> str:
+        """Invoke the shared adapter without changing non-answering calls."""
+
+        messages = [{"role": "human", "content": prompt}]
+        if self._answering_temperature is None:
+            return await self._llm.invoke(messages)
+        return await self._llm.invoke(
+            messages, temperature=self._answering_temperature
+        )
 
     async def handle(self, event: Input, **ports) -> Response:
         question = event.message
@@ -61,6 +94,7 @@ class GuidancePlugin:
         # Condense history if present
         if event.history:
             from plugins.guidance.prompts import condense_prompt
+
             history_text = "\n".join(
                 f"{h.role}: {h.content}" for h in event.history
             )
@@ -80,13 +114,16 @@ class GuidancePlugin:
         # Query multiple collections in parallel
         n_results = self._n_results
 
-        async def _query_collection(collection: str):
-            docs, sources = [], []
+        async def _query_collection(collection: str) -> list[tuple[str, Source, dict]]:
+            pairs: list[tuple[str, Source, dict]] = []
             from opentelemetry.trace import SpanKind
+
             from core.tracing import optional_span
 
             try:
-                # #107's factual filter inside #108's retrieval span.
+                # #107's factual filter inside #108's retrieval span, over
+                # #109's 3-tuple shape (the metadata travels alongside the
+                # Source solely for the LLM-visible context label).
                 # optional_span records any failure (content-gated) and
                 # re-raises; the outer handler isolates this collection.
                 with optional_span("vc.retrieval", kind=SpanKind.CLIENT):
@@ -98,74 +135,90 @@ class GuidancePlugin:
                     )
                     if result.documents:
                         for i, doc in enumerate(result.documents[0]):
-                            distance = result.distances[0][i] if result.distances else 1.0
+                            distance = (
+                                result.distances[0][i] if result.distances else 1.0
+                            )
                             score = 1.0 - distance
-                            docs.append(doc)
-                            meta = result.metadatas[0][i] if result.metadatas else {}
-                            source_url = meta.get("source", collection)
-                            sources.append(Source(
+                            metadata = (
+                                result.metadatas[0][i] if result.metadatas else {}
+                            )
+                            source_url = metadata.get("source", collection)
+                            # Source construction stays byte-for-byte
+                            # compatible with the pre-feature envelope.
+                            source = Source(
                                 source=source_url,
-                                title=meta.get("title"),
+                                title=metadata.get("title"),
                                 uri=source_url,
                                 score=score,
-                            ))
+                            )
+                            pairs.append((doc, source, metadata))
             except Exception:
-                logger.warning(
-                    "Failed to query collection %s", collection, exc_info=True
-                )
-            return docs, sources
+                logger.warning("Failed to query collection %s", collection)
+            return pairs
 
         query_results = await asyncio.gather(
             *[_query_collection(c) for c in DEFAULT_COLLECTIONS]
         )
-        all_pairs: list[tuple[str, Source]] = []
-        for docs, sources in query_results:
-            all_pairs.extend(zip(docs, sources))
+        all_pairs: list[tuple[str, Source, dict]] = []
+        for pairs in query_results:
+            all_pairs.extend(pairs)
 
         # Sort by relevance (highest score first)
         all_pairs.sort(key=lambda p: p[1].score or 0, reverse=True)
 
         # Filter by score threshold — discard low-relevance chunks
         all_pairs = [
-            (doc, src) for doc, src in all_pairs
+            (doc, src, metadata) for doc, src, metadata in all_pairs
             if (src.score or 0) >= self._score_threshold
         ]
 
         # Deduplicate by source URL, keeping the highest-scoring chunk per page
         seen_sources: set[str] = set()
-        deduped: list[tuple[str, Source]] = []
-        for idx, (doc, src) in enumerate(all_pairs):
+        deduped: list[tuple[str, Source, dict]] = []
+        for idx, (doc, src, metadata) in enumerate(all_pairs):
             key = src.source or f"__no_source_{idx}__"
             if key not in seen_sources:
                 seen_sources.add(key)
-                deduped.append((doc, src))
+                deduped.append((doc, src, metadata))
 
         deduped = deduped[:self._n_results]
 
         # Context budget enforcement — drop lowest-scoring chunks if over budget
+        # #109's rendered-block budgeting, keeping #108's `dropped` counter
+        # so the span attribute still reports what the budget discarded.
         dropped = 0
-        total_chars = sum(len(doc) for doc, _ in deduped)
-        if total_chars > self._max_context_chars:
-            kept: list[tuple[str, Source]] = []
+        formatted_blocks = [
+            render_document_block(number, doc, metadata)
+            for number, (doc, _, metadata) in enumerate(deduped, start=1)
+        ]
+        total_budget_size = sum(
+            rendered_document_budget_size(block, doc)
+            for block, (doc, _, _) in zip(formatted_blocks, deduped)
+        )
+        if total_budget_size > self._max_context_chars:
+            kept: list[tuple[str, Source, dict]] = []
+            kept_blocks: list[str] = []
             accumulated = 0
-            for doc, src in deduped:
-                if accumulated + len(doc) > self._max_context_chars:
+            for block, (doc, src, metadata) in zip(formatted_blocks, deduped):
+                document_budget_size = rendered_document_budget_size(block, doc)
+                if accumulated + document_budget_size > self._max_context_chars:
                     break
-                kept.append((doc, src))
-                accumulated += len(doc)
+                kept.append((doc, src, metadata))
+                kept_blocks.append(block)
+                accumulated += document_budget_size
             dropped = len(deduped) - len(kept)
-            dropped_chars = total_chars - accumulated
+            dropped_budget = total_budget_size - accumulated
             logger.warning(
-                "Context budget exceeded: dropped %d chunks (%d chars)",
-                dropped, dropped_chars,
+                "Context budget exceeded: dropped %d chunks (%d budget units)",
+                dropped, dropped_budget,
             )
             deduped = kept
+            formatted_blocks = kept_blocks
 
-        all_docs = [doc for doc, _ in deduped]
-        all_sources = [src for _, src in deduped]
+        all_sources = [src for _, src, _ in deduped]
 
-        # These are cross-collection signals, so they belong on the root
-        # rather than incorrectly attributing merged filtering to one query.
+        # Cross-collection signals belong on the root rather than incorrectly
+        # attributing merged filtering to one query.
         from core.tracing import current_root_span, mark_empty_retrieval
 
         root = current_root_span()
@@ -174,22 +227,31 @@ class GuidancePlugin:
         if not deduped:
             mark_empty_retrieval()
 
-        # Prefix each chunk with [source:N] for LLM source attribution
-        if all_docs:
-            context = "\n\n".join(
-                f"[source:{i}] {doc}" for i, doc in enumerate(all_docs)
-            )
-        else:
-            context = "No relevant context found."
+        # #109 supersedes the old [source:N] prefixing: numbered blocks the
+        # model can cite as [Document N], with the empty case handled inside.
+        context = join_document_blocks(formatted_blocks)
 
         # Generate response
         from plugins.guidance.prompts import retrieve_prompt
-        answer = await self._llm.invoke([{
-            "role": "human",
-            "content": retrieve_prompt.format(
-                context=context, question=question, language=language
-            ),
-        }])
+        prompt = retrieve_prompt.format(
+            context=context,
+            question=question,
+            language=language,
+            empty_context_instruction=empty_context_instruction(bool(deduped)),
+            citation_scope_instruction=citation_scope_instruction(len(deduped)),
+        )
+        complexity_instruction = self._complexity_instruction(question)
+        if complexity_instruction:
+            # Keep the pre-existing structured JSON contract as the final
+            # instruction.  The conditional guidance is additive, but placing
+            # it before context avoids competing with the required response
+            # shape at the end of the prompt.
+            prompt = prompt.replace(
+                "\n\nContext:\n",
+                f"\n\n{complexity_instruction}\n\nContext:\n",
+                1,
+            )
+        answer = await self._invoke_answering(prompt)
 
         # Try to parse JSON response for source scores
         parsed_sources = self._parse_json_sources(answer)

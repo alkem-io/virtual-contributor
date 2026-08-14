@@ -7,7 +7,9 @@ from typing import AsyncIterator, Protocol, runtime_checkable
 class LLMPort(Protocol):
     """Port for LLM chat completion interactions."""
 
-    async def invoke(self, messages: list[dict]) -> str:
+    async def invoke(
+        self, messages: list[dict], temperature: float | None = None
+    ) -> str:
         """Single chat completion call."""
         ...
 

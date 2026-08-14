@@ -74,6 +74,8 @@ def _log_config(config: BaseConfig, plugin_class: type | None = None) -> None:
         "guidance_n_results",
         "guidance_min_score",
         "max_context_chars",
+        "answering_llm_temperature",
+        "answering_chain_of_thought_enabled",
         "summary_chunk_threshold",
         "chunk_size",
         "chunk_overlap",
@@ -180,6 +182,15 @@ def _inject_plugin_config(
         deps["summary_length"] = config.summary_length
 
     return sig
+def _inject_answering_config(
+    config: BaseConfig, deps: dict[str, object], signature: inspect.Signature
+) -> None:
+    """Inject answering-only settings only into plugins that declare them."""
+
+    if "answering_temperature" in signature.parameters:
+        deps["answering_temperature"] = config.answering_llm_temperature
+    if "chain_of_thought_enabled" in signature.parameters:
+        deps["chain_of_thought_enabled"] = config.answering_chain_of_thought_enabled
 
 
 def _resolve_plugin_llm_config(config: BaseConfig) -> BaseConfig:
@@ -631,6 +642,42 @@ async def _run(config: BaseConfig) -> None:
         summarize_llm,
         bok_llm,
     )
+    # Inject per-plugin retrieval config
+    sig = inspect.signature(plugin_class.__init__)
+    plugin_name = config.plugin_type.lower().replace("-", "_") if config.plugin_type else ""
+    if "n_results" in sig.parameters:
+        if plugin_name == "expert":
+            deps["n_results"] = config.expert_n_results
+        elif plugin_name == "guidance":
+            deps["n_results"] = config.guidance_n_results
+        else:
+            deps["n_results"] = config.retrieval_n_results
+    if "score_threshold" in sig.parameters:
+        if plugin_name == "expert":
+            deps["score_threshold"] = config.expert_min_score
+        elif plugin_name == "guidance":
+            deps["score_threshold"] = config.guidance_min_score
+        else:
+            deps["score_threshold"] = config.retrieval_score_threshold
+    if "max_context_chars" in sig.parameters:
+        deps["max_context_chars"] = config.max_context_chars
+    _inject_answering_config(config, deps, sig)
+    # Inject summarization LLM for ingest plugins
+    if "summarize_llm" in sig.parameters:
+        deps["summarize_llm"] = summarize_llm
+    # Inject BoK LLM for ingest plugins (large-context model for BoK summary)
+    if "bok_llm" in sig.parameters:
+        deps["bok_llm"] = bok_llm
+    # Inject chunk threshold for ingest plugins
+    if "chunk_threshold" in sig.parameters:
+        deps["chunk_threshold"] = config.summary_chunk_threshold
+    # Inject summarization toggle and concurrency for ingest plugins
+    if "summarize_enabled" in sig.parameters:
+        deps["summarize_enabled"] = config.summarize_enabled
+    if "summarize_concurrency" in sig.parameters:
+        deps["summarize_concurrency"] = config.summarize_concurrency
+    if "ingest_batch_size" in sig.parameters:
+        deps["ingest_batch_size"] = config.ingest_batch_size
     # Inject GraphQL client for ingest-space plugin
     if "graphql_client" in sig.parameters:
         from plugins.ingest_space.graphql_client import GraphQLClient

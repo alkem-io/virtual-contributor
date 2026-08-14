@@ -26,9 +26,11 @@ class MockLLMPort:
     def __init__(self, response: str = "Mock LLM response") -> None:
         self.response = response
         self.calls: list[list[dict]] = []
+        self.call_kwargs: list[dict] = []
 
-    async def invoke(self, messages: list[dict]) -> str:
+    async def invoke(self, messages: list[dict], **kwargs) -> str:
         self.calls.append(messages)
+        self.call_kwargs.append(kwargs)
         return self.response
 
     async def stream(self, messages: list[dict]) -> AsyncIterator[str]:

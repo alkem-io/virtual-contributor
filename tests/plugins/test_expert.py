@@ -6,6 +6,10 @@ import pytest
 
 from core.domain.retrieval_filters import FACTUAL_WHERE
 from core.events.response import Response
+from core.domain.prompts_shared import (
+    render_document_block,
+    rendered_document_budget_size,
+)
 from core.ports.knowledge_store import QueryResult
 from plugins.expert.plugin import ExpertPlugin
 from tests.conftest import MockLLMPort, MockKnowledgeStorePort, make_input
@@ -88,12 +92,12 @@ class TestExpertPlugin:
         assert sources[0].score is None
 
     async def test_source_prefix_formatting(self, plugin):
-        """Knowledge string should have [source:N] prefixes."""
+        """Knowledge string should have 1-based labelled document blocks."""
         event = make_input(bodyOfKnowledgeID="bok-123")
         await plugin.handle(event)
         llm_prompt = plugin._llm.calls[-1][0]["content"]
-        assert "[source:0]" in llm_prompt
-        assert "[source:1]" in llm_prompt
+        assert "[Document 1 · test · origin: test]" in llm_prompt
+        assert "[Document 2 · test · origin: test]" in llm_prompt
 
     async def test_low_score_chunks_filtered_out(self):
         """Chunks below the score threshold should be excluded."""
@@ -211,6 +215,33 @@ class TestExpertPlugin:
         prompt = plugin._llm.calls[-1][0]["content"]
         assert "document summary" not in prompt
         assert "overview" not in prompt
+    async def test_context_budget_counts_rendered_document_labels(self):
+        """Rendered labels are charged before deciding which chunks survive."""
+        class NearBudgetStore(MockKnowledgeStorePort):
+            async def query(self, collection, query_texts, n_results=10, where=None):
+                self.query_calls.append((collection, query_texts, n_results))
+                return QueryResult(
+                    documents=[["A" * 20, "B" * 20]],
+                    metadatas=[[{"source": "a"}, {"source": "b"}]],
+                    distances=[[0.1, 0.2]],
+                    ids=[["a", "b"]],
+                )
+
+        first_content = "A" * 20
+        first_block = render_document_block(1, first_content, {"source": "a"})
+        context_budget = rendered_document_budget_size(first_block, first_content)
+        plugin = ExpertPlugin(
+            llm=MockLLMPort(),
+            knowledge_store=NearBudgetStore(),
+            max_context_chars=context_budget,
+        )
+
+        response = await plugin.handle(make_input(bodyOfKnowledgeID="bok-123"))
+        prompt = plugin._llm.calls[-1][0]["content"]
+
+        assert "A" * 20 in prompt
+        assert "B" * 20 not in prompt
+        assert [source.source for source in response.sources] == ["a"]
 
     async def test_startup_shutdown(self, plugin):
         await plugin.startup()

@@ -161,7 +161,7 @@ virtual-contributor/
 │   └── plugins/                       # Plugin unit tests
 │
 ├── specs/                             # Feature specifications (001-025)
-├── docs/adr/                          # Architecture Decision Records (0001-0011)
+├── docs/adr/                          # Architecture Decision Records (0001–0013)
 ├── main.py                            # Single entry point
 ├── Dockerfile                         # Distroless build: 3.13-slim-trixie builder -> distroless/python3-debian13
 ├── docker/
@@ -621,6 +621,7 @@ PLUGIN_TYPE=guidance poetry run python main.py
 The same explicit endpoint/header configuration works with self-hosted Grafana
 Tempo or Elastic APM OTLP receivers. Never set an endpoint you do not control:
 trace content can include user messages and retrieved context.
+| [0013](docs/adr/0013-grounded-citable-generation-prompts.md) | Grounded, citable generation prompts |
 
 ## Feature Specifications
 
