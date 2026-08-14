@@ -18,6 +18,16 @@ def _config(**overrides: object) -> BaseConfig:
     return BaseConfig(llm_api_key="test-key", **overrides)  # type: ignore[arg-type]
 
 
+def _table(config: BaseConfig) -> dict:
+    """Build with the plugin's effective knobs, as main.py does."""
+    return _build_routing_table(
+        config,
+        n_results=config.retrieval_n_results,
+        score_threshold=config.retrieval_score_threshold,
+        max_context_chars=config.max_context_chars,
+    )
+
+
 class TestDefaults:
     def test_routing_is_off_by_default(self) -> None:
         """It changes what every answer is grounded in — opt in, never inherit."""
@@ -84,12 +94,12 @@ class TestValidation:
 
 class TestBuiltRoutingTable:
     def test_every_route_has_a_profile(self) -> None:
-        table = _build_routing_table(_config())
+        table = _table(_config())
         for route in RouteClass:
             assert route in table
 
     def test_only_conversational_skips_retrieval(self) -> None:
-        table = _build_routing_table(_config())
+        table = _table(_config())
         for route, profile in table.items():
             assert profile.retrieve is (route is not RouteClass.CONVERSATIONAL)
 
@@ -99,10 +109,19 @@ class TestBuiltRoutingTable:
         If this drifts, the classifier's fallback silently stops being a no-op
         and every unmatched question changes behaviour.
         """
-        config = _config()
-        moderate = _build_routing_table(config)[RouteClass.MODERATE]
-        assert moderate.n_results == config.retrieval_n_results
-        assert moderate.score_threshold == config.retrieval_score_threshold
+        config = _config(expert_min_score=0.1, expert_n_results=8)
+        moderate = _build_routing_table(
+            config,
+            n_results=config.expert_n_results,
+            score_threshold=config.expert_min_score,
+            max_context_chars=config.max_context_chars,
+        )[RouteClass.MODERATE]
+        # The PLUGIN's settings, not the deprecated globals. Production sets
+        # EXPERT_MIN_SCORE=0.1 and never sets RETRIEVAL_SCORE_THRESHOLD, so
+        # building from the global would impose 0.3 on every routed query the
+        # moment routing was switched on.
+        assert moderate.n_results == 8
+        assert moderate.score_threshold == 0.1
         assert moderate.max_context_chars == config.max_context_chars
 
     def test_complex_is_not_inert_at_the_deployed_chunk_size(self) -> None:
@@ -112,12 +131,38 @@ class TestBuiltRoutingTable:
         same 2 chunks at a 9000-char chunk size — a route that looks
         implemented and does nothing.
         """
-        table = _build_routing_table(_config())
+        table = _table(_config())
         simple = effective_chunks(table[RouteClass.SIMPLE], DEPLOYED_CHUNK_SIZE)
         complex_ = effective_chunks(table[RouteClass.COMPLEX], DEPLOYED_CHUNK_SIZE)
         assert complex_ > simple
 
     def test_simple_is_never_wider_than_the_default(self) -> None:
         config = _config()
-        simple = _build_routing_table(config)[RouteClass.SIMPLE]
+        simple = _table(config)[RouteClass.SIMPLE]
         assert simple.n_results <= config.retrieval_n_results
+
+
+class TestProfilesInheritThePluginsSettings:
+    """corr-vc-1: production runs EXPERT_MIN_SCORE=0.1, not the 0.3 global."""
+
+    def test_threshold_comes_from_the_plugin_not_the_global(self) -> None:
+        config = _config(expert_min_score=0.1)
+        table = _build_routing_table(
+            config,
+            n_results=config.expert_n_results,
+            score_threshold=config.expert_min_score,
+            max_context_chars=config.max_context_chars,
+        )
+        assert config.retrieval_score_threshold == 0.3   # the global default
+        for profile in table.values():
+            assert profile.score_threshold == 0.1
+
+    def test_complex_is_never_narrower_than_the_plugins_width(self) -> None:
+        """A tuned width above the complex default must not be reduced."""
+        config = _config()
+        table = _build_routing_table(
+            config, n_results=20, score_threshold=0.3,
+            max_context_chars=config.max_context_chars,
+        )
+        assert table[RouteClass.COMPLEX].n_results >= 20
+        assert table[RouteClass.SIMPLE].n_results <= 20

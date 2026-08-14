@@ -50,17 +50,22 @@ MAX_CLASSIFIED_CHARS = 4_096
 #: form routed "Which subspaces exist here?" to skip retrieval, because "hi"
 #: appears inside "which". Matching the entire message is what makes that
 #: class of error impossible rather than unlikely.
+#:
+#: Bare affirmatives and negatives are deliberately **absent**: "yes", "no",
+#: "sure", "please", "right", "maybe". Unlike "thanks", none of those asserts
+#: that the member wants nothing looked up — after "Shall I list the templates
+#: in this space?", "yes" is the shortest possible way to say *do it*.
+#: Excluding them costs nothing, because they fall through to the retrieving
+#: route, which is exactly today's behaviour.
 _CONVERSATIONAL_RE = re.compile(
     r"^\s*(?:"
     r"(?:hi|hey|hello|yo|greetings)"
     r"|(?:good\s+(?:morning|afternoon|evening|day))"
     r"|(?:thanks?|thank\s+you|thx|ty|cheers|much\s+appreciated)"
-    r"|(?:ok|okay|k|alright|right|sure|cool|nice|great|awesome|perfect|excellent)"
+    r"|(?:ok|okay|alright|cool|nice|great|awesome|perfect|excellent)"
     r"|(?:got\s+it|understood|makes\s+sense|noted|fair\s+enough|will\s+do)"
     r"|(?:bye|goodbye|see\s+you|later|farewell|take\s+care)"
-    r"|(?:yes|yep|yeah|no|nope|maybe)"
     r"|(?:sorry|my\s+bad|no\s+worries|np)"
-    r"|(?:please|pls)"
     r"|(?:how\s+are\s+you|how's\s+it\s+going|what's\s+up|sup)"
     r")"
     r"(?:[\s,!.\-–—]+(?:"

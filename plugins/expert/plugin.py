@@ -225,13 +225,14 @@ class ExpertPlugin:
         graph = PromptGraph.from_definition(event.prompt_graph)
 
         # Create retrieve special node
-        # Read from the profile, not from self: the closure below captures
-        # these, and capturing instance constants is how one path silently
-        # keeps today's behaviour while the other routes.
-        n_results = profile.n_results
-        score_threshold = profile.score_threshold
-        budget_chars = profile.max_context_chars
-        should_retrieve = profile.retrieve
+        # NOT captured from the profile resolved in handle(). The graph may
+        # rephrase before retrieving — "yes" after "Shall I list the
+        # templates?" becomes a real standalone question — so the closure
+        # re-resolves on the query it is actually about to run. Capturing the
+        # raw turn's decision would skip retrieval on a genuine question and
+        # answer it ungrounded, which is the one mistake this feature is not
+        # allowed to make.
+        resolve_profile = self._resolve_profile
         enforce_budget = self._enforce_context_budget
 
         async def retrieve_node(state: dict) -> dict:
@@ -240,16 +241,24 @@ class ExpertPlugin:
                 or state.get("current_question")
                 or event.message
             )
-            if not should_retrieve:
+            # Classify what is being retrieved on, not what was typed.
+            node_profile = resolve_profile(query)
+            if not node_profile.retrieve:
                 # Small talk. There is nothing in a knowledge base that answers
                 # "thanks" — so no query is made at all, not a query whose
                 # results are discarded.
                 return {"combined_knowledge_docs": ""}
             result = await self._knowledge_store.query(
-                collection=collection, query_texts=[query], n_results=n_results,
+                collection=collection,
+                query_texts=[query],
+                n_results=node_profile.n_results,
             )
-            docs, filtered_result = _filter_and_format(result, score_threshold)
-            docs, filtered_result = enforce_budget(docs, filtered_result, budget_chars)
+            docs, filtered_result = _filter_and_format(
+                result, node_profile.score_threshold,
+            )
+            docs, filtered_result = enforce_budget(
+                docs, filtered_result, node_profile.max_context_chars,
+            )
             knowledge = "\n".join(docs)
             # The expert state schema expects ``combined_knowledge_docs``
             # — that's what the answer_question node reads via its

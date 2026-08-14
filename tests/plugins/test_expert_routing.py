@@ -309,3 +309,61 @@ class TestMalformedRoutersStillAnswer:
             r.getMessage() for r in caplog.records if r.levelno >= logging.INFO
         ]
         assert not any("SECRET-SPACE-QUESTION" in line for line in info_lines)
+
+
+class TestGraphReclassifiesTheRephrasedQuestion:
+    """corr-vc-2 — the graph may rephrase before it retrieves.
+
+    "Shall I list the templates in this space?" / "yes" becomes a real
+    standalone question by the time `retrieve_node` runs. Classifying the raw
+    turn would skip retrieval on a genuine question and answer it ungrounded —
+    the one mistake this feature is not allowed to make. The closure therefore
+    classifies the query it is about to run, not the words the member typed.
+    """
+
+    async def _drive(self, plugin: ExpertPlugin, raw: str, rephrased: str) -> None:
+        captured: dict = {}
+        mock_graph = MagicMock()
+        mock_graph.compile = MagicMock(
+            side_effect=lambda **kw: captured.update(kw) or mock_graph,
+        )
+        mock_graph.invoke = AsyncMock(return_value={"final_answer": "ok"})
+        with patch("core.domain.prompt_graph.PromptGraph") as MockPromptGraph:
+            MockPromptGraph.from_definition.return_value = mock_graph
+            await plugin.handle(make_input(message=raw, promptGraph=GRAPH))
+        await captured["special_nodes"]["retrieve"](
+            {"current_question": raw, "rephrased_question": rephrased},
+        )
+
+    @pytest.mark.parametrize("raw", ["yes", "sure", "ok", "no", "thanks"])
+    async def test_a_rephrased_follow_up_still_retrieves(self, raw: str) -> None:
+        store = MockKnowledgeStorePort()
+        plugin = _plugin(store, query_router=RuleQueryClassifier())
+        await self._drive(
+            plugin, raw, "What are the top templates in this space?",
+        )
+        assert store.query_calls, (
+            f"{raw!r} was expanded into a real question and still skipped "
+            f"retrieval — the answer would be ungrounded"
+        )
+
+    async def test_genuine_small_talk_with_no_rephrase_still_skips(self) -> None:
+        """The gate must not become uselessly permissive either."""
+        store = MockKnowledgeStorePort()
+        plugin = _plugin(store, query_router=RuleQueryClassifier())
+        await self._drive(plugin, "thanks!", "thanks!")
+        assert store.query_calls == []
+
+    async def test_the_rephrased_question_drives_the_width(self) -> None:
+        """A follow-up expanded into a comparison gets the complex profile."""
+        store = MockKnowledgeStorePort()
+        plugin = _plugin(store, query_router=RuleQueryClassifier())
+        await self._drive(
+            plugin, "yes", "Compare the goals of subspace A and subspace B",
+        )
+        simple_store = MockKnowledgeStorePort()
+        await self._drive(
+            _plugin(simple_store, query_router=RuleQueryClassifier()),
+            "yes", "Who is the space lead?",
+        )
+        assert store.query_calls[0][2] > simple_store.query_calls[0][2]

@@ -49,10 +49,16 @@ SMALL_TALK = [
     "hi", "Hi there", "hello", "Hey!", "good morning", "Good afternoon",
     "thanks", "Thanks!", "thank you", "Thank you so much", "thx", "cheers",
     "got it", "Got it, thanks", "understood", "makes sense", "noted",
-    "ok", "okay", "Alright", "sure", "cool", "nice", "great", "perfect",
+    "ok", "okay", "Alright", "cool", "nice", "great", "perfect",
     "bye", "goodbye", "see you", "take care",
-    "yes", "no", "yep", "nope",
     "sorry", "my bad", "no worries",
+]
+
+#: Bare affirmatives, negatives and requests. NOT small talk: after "Shall I
+#: list the templates?", "yes" means *do it*. They must retrieve.
+AMBIGUOUS_ACKNOWLEDGEMENTS = [
+    "yes", "yep", "yeah", "no", "nope", "maybe",
+    "sure", "please", "pls", "right",
 ]
 
 
@@ -208,7 +214,7 @@ class TestAdversarialSmallTalkPrefixes:
     ) -> None:
         assert _route(message) is not RouteClass.CONVERSATIONAL
 
-    @pytest.mark.parametrize("message", ["ok", "yes.", "no!", "cheers mate"])
+    @pytest.mark.parametrize("message", ["ok", "cheers mate", "thanks", "bye"])
     def test_bare_acknowledgements_do_skip_retrieval(self, message: str) -> None:
         """The other half of the property: it must not be uselessly strict."""
         assert _route(message) is RouteClass.CONVERSATIONAL
@@ -250,3 +256,23 @@ class TestInputIsBounded:
 
     def test_a_long_message_that_starts_like_small_talk_still_retrieves(self) -> None:
         assert _route("hi " + "x" * 10_000) is not RouteClass.CONVERSATIONAL
+
+
+
+class TestAmbiguousAffirmativesRetrieve:
+    """A bare "yes" is a request, not an acknowledgement.
+
+    After "Shall I list the templates in this space?", "yes" is the shortest
+    way a member can say *do it*. Unlike "thanks", none of these asserts that
+    nothing should be looked up — and excluding them costs nothing, because
+    they fall through to the retrieving route, which is today's behaviour.
+    """
+
+    @pytest.mark.parametrize("message", AMBIGUOUS_ACKNOWLEDGEMENTS)
+    def test_they_do_not_skip_retrieval(self, message: str) -> None:
+        assert _route(message) is not RouteClass.CONVERSATIONAL
+
+    @pytest.mark.parametrize("message", SMALL_TALK)
+    def test_unambiguous_small_talk_still_skips(self, message: str) -> None:
+        """The other half — the gate must not become uselessly strict."""
+        assert _route(message) is RouteClass.CONVERSATIONAL
