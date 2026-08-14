@@ -7,8 +7,11 @@ import time
 from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
+from opentelemetry.trace import SpanKind
+
 from core.domain.ingest_pipeline import Chunk, Document, IngestResult
 from core.domain.pipeline.chunk_strategy import is_content
+from core.tracing import optional_span
 
 logger = logging.getLogger(__name__)
 
@@ -242,15 +245,34 @@ class IngestEngine:
                     items_out=len(context.chunks),
                     error_count=1,
                 )
+                with optional_span(
+                    f"vc.ingest.step {step.name}", kind=SpanKind.INTERNAL
+                ) as span:
+                    if span is not None:
+                        span.set_attribute("vc.step.items_in", items_before)
+                        span.set_attribute("vc.step.items_out", len(context.chunks))
+                        span.set_attribute("vc.step.error_count", 1)
+                        span.set_attribute("vc.step.skipped", True)
+                        span.set_attribute("vc.step.skip_reason", "prior_errors")
                 continue
 
             start = time.monotonic()
 
-            try:
-                await step.execute(context)
-            except Exception as exc:
-                context.errors.append(f"{step.name}: {exc}")
-                logger.exception("Step '%s' failed", step.name)
+            with optional_span(
+                f"vc.ingest.step {step.name}", kind=SpanKind.INTERNAL
+            ) as span:
+                try:
+                    await step.execute(context)
+                except Exception as exc:
+                    context.errors.append(f"{step.name}: {exc}")
+                    logger.exception("Step '%s' failed", step.name)
+                finally:
+                    if span is not None:
+                        span.set_attribute("vc.step.items_in", items_before)
+                        span.set_attribute("vc.step.items_out", len(context.chunks))
+                        span.set_attribute(
+                            "vc.step.error_count", len(context.errors) - errors_before
+                        )
 
             elapsed = time.monotonic() - start
             context.metrics[f"{step.name}{metrics_suffix}"] = StepMetrics(

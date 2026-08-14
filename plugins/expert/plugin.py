@@ -146,19 +146,31 @@ class ExpertPlugin:
         enforce_budget = self._enforce_context_budget
 
         async def retrieve_node(state: dict) -> dict:
+            from opentelemetry.trace import SpanKind
+            from core.tracing import mark_empty_retrieval, optional_span
+
             query = (
                 state.get("rephrased_question")
                 or state.get("current_question")
                 or event.message
             )
-            result = await self._knowledge_store.query(
-                collection=collection,
-                query_texts=[query],
-                n_results=n_results,
-                where=FACTUAL_WHERE,
-            )
-            docs, filtered_result = _filter_and_format(result, score_threshold)
-            docs, filtered_result = enforce_budget(docs, filtered_result)
+            # #107's factual filter inside #108's retrieval span: the filter
+            # decides WHAT is fetched, the span records what came back.
+            with optional_span("vc.retrieval", kind=SpanKind.CLIENT) as span:
+                result = await self._knowledge_store.query(
+                    collection=collection,
+                    query_texts=[query],
+                    n_results=n_results,
+                    where=FACTUAL_WHERE,
+                )
+                docs, filtered_result = _filter_and_format(result, score_threshold)
+                initial_count = len(docs)
+                docs, filtered_result = enforce_budget(docs, filtered_result)
+                if span is not None:
+                    span.set_attribute("vc.retrieval.chunks_passed", len(docs))
+                    span.set_attribute("vc.retrieval.chunks_dropped_budget", initial_count - len(docs))
+                if not result.documents or not result.documents[0] or not docs:
+                    mark_empty_retrieval()
             knowledge = "\n".join(docs)
             # The expert state schema expects ``combined_knowledge_docs``
             # — that's what the answer_question node reads via its
@@ -211,14 +223,25 @@ class ExpertPlugin:
 
     async def _handle_simple(self, event: Input, collection: str) -> Response:
         """Simple RAG without graph execution."""
-        result = await self._knowledge_store.query(
-            collection=collection,
-            query_texts=[event.message],
-            n_results=self._n_results,
-            where=FACTUAL_WHERE,
-        )
-        docs, result = _filter_and_format(result, self._score_threshold)
-        docs, result = self._enforce_context_budget(docs, result)
+        from opentelemetry.trace import SpanKind
+
+        from core.tracing import mark_empty_retrieval, optional_span
+
+        with optional_span("vc.retrieval", kind=SpanKind.CLIENT) as span:
+            result = await self._knowledge_store.query(
+                collection=collection,
+                query_texts=[event.message],
+                n_results=self._n_results,
+                where=FACTUAL_WHERE,
+            )
+            docs, result = _filter_and_format(result, self._score_threshold)
+            initial_count = len(docs)
+            docs, result = self._enforce_context_budget(docs, result)
+            if span is not None:
+                span.set_attribute("vc.retrieval.chunks_passed", len(docs))
+                span.set_attribute("vc.retrieval.chunks_dropped_budget", initial_count - len(docs))
+            if not result.documents or not result.documents[0] or not docs:
+                mark_empty_retrieval()
         knowledge = "\n".join(docs)
 
         from plugins.expert.prompts import combined_expert_prompt

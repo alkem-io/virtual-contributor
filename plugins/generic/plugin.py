@@ -51,7 +51,12 @@ class GenericPlugin:
                 {"role": "system", "content": condenser_system_prompt},
                 {"role": "human", "content": f"History:\n{history_text}\n\nLatest question: {question}"},
             ]
-            question = await self._llm.invoke(condenser_messages)
+            from core.tracing import optional_span
+
+            with optional_span("vc.stage query_processing") as span:
+                if span is not None:
+                    span.set_attribute("vc.history_turns", len(event.history))
+                question = await self._llm.invoke(condenser_messages)
             logger.info("Condensed question from history")
 
         # Build final messages

@@ -64,12 +64,17 @@ class GuidancePlugin:
             history_text = "\n".join(
                 f"{h.role}: {h.content}" for h in event.history
             )
-            condensed = await self._llm.invoke([{
-                "role": "human",
-                "content": condense_prompt.format(
-                    chat_history=history_text, question=question
-                ),
-            }])
+            from core.tracing import optional_span
+
+            with optional_span("vc.stage query_processing") as span:
+                if span is not None:
+                    span.set_attribute("vc.history_turns", len(event.history))
+                condensed = await self._llm.invoke([{
+                    "role": "human",
+                    "content": condense_prompt.format(
+                        chat_history=history_text, question=question
+                    ),
+                }])
             question = condensed
 
         # Query multiple collections in parallel
@@ -77,26 +82,33 @@ class GuidancePlugin:
 
         async def _query_collection(collection: str):
             docs, sources = [], []
+            from opentelemetry.trace import SpanKind
+            from core.tracing import optional_span
+
             try:
-                result = await self._knowledge_store.query(
-                    collection=collection,
-                    query_texts=[question],
-                    n_results=n_results,
-                    where=FACTUAL_WHERE,
-                )
-                if result.documents:
-                    for i, doc in enumerate(result.documents[0]):
-                        distance = result.distances[0][i] if result.distances else 1.0
-                        score = 1.0 - distance
-                        docs.append(doc)
-                        meta = result.metadatas[0][i] if result.metadatas else {}
-                        source_url = meta.get("source", collection)
-                        sources.append(Source(
-                            source=source_url,
-                            title=meta.get("title"),
-                            uri=source_url,
-                            score=score,
-                        ))
+                # #107's factual filter inside #108's retrieval span.
+                # optional_span records any failure (content-gated) and
+                # re-raises; the outer handler isolates this collection.
+                with optional_span("vc.retrieval", kind=SpanKind.CLIENT):
+                    result = await self._knowledge_store.query(
+                        collection=collection,
+                        query_texts=[question],
+                        n_results=n_results,
+                        where=FACTUAL_WHERE,
+                    )
+                    if result.documents:
+                        for i, doc in enumerate(result.documents[0]):
+                            distance = result.distances[0][i] if result.distances else 1.0
+                            score = 1.0 - distance
+                            docs.append(doc)
+                            meta = result.metadatas[0][i] if result.metadatas else {}
+                            source_url = meta.get("source", collection)
+                            sources.append(Source(
+                                source=source_url,
+                                title=meta.get("title"),
+                                uri=source_url,
+                                score=score,
+                            ))
             except Exception:
                 logger.warning(
                     "Failed to query collection %s", collection, exc_info=True
@@ -131,6 +143,7 @@ class GuidancePlugin:
         deduped = deduped[:self._n_results]
 
         # Context budget enforcement — drop lowest-scoring chunks if over budget
+        dropped = 0
         total_chars = sum(len(doc) for doc, _ in deduped)
         if total_chars > self._max_context_chars:
             kept: list[tuple[str, Source]] = []
@@ -150,6 +163,16 @@ class GuidancePlugin:
 
         all_docs = [doc for doc, _ in deduped]
         all_sources = [src for _, src in deduped]
+
+        # These are cross-collection signals, so they belong on the root
+        # rather than incorrectly attributing merged filtering to one query.
+        from core.tracing import current_root_span, mark_empty_retrieval
+
+        root = current_root_span()
+        root.set_attribute("vc.retrieval.chunks_passed", len(deduped))
+        root.set_attribute("vc.retrieval.chunks_dropped_budget", dropped)
+        if not deduped:
+            mark_empty_retrieval()
 
         # Prefix each chunk with [source:N] for LLM source attribution
         if all_docs:
@@ -178,6 +201,7 @@ class GuidancePlugin:
             )
 
         logger.warning("Structured JSON parsing failed, returning raw LLM text")
+        current_root_span().add_event("vc.parse_fallback")
         return Response(
             result=answer,
             sources=all_sources,

@@ -1,6 +1,9 @@
 {
   "include": ["core", "plugins"],
   "exclude": ["tests", "**/__pycache__"],
+  "venvPath": ".",
+  "venv": ".venv",
+  "pythonVersion": "3.13",
   "typeCheckingMode": "basic",
   "reportAttributeAccessIssue": "warning",
   "reportArgumentType": "warning",
