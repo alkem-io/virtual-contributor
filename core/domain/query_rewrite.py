@@ -82,9 +82,33 @@ MIN_REWRITE_ALLOWANCE = 120
 #: what is kept. Matches the existing `ExpertConfig.history_length` default.
 DEFAULT_MAX_HISTORY_TURNS = 20
 
+#: Character budget for the history embedded in a rewrite prompt.
+#:
+#: The turn bound alone is not enough: the platform caps a single room message
+#: at 32 784 chars, so 20 turns is still ~656 000 chars — roughly 164 000
+#: tokens — re-sent to a metered third-party API on every turn of a thread.
+#: Mirrors the `max_context_chars` budget the repo already applies to retrieved
+#: chunks. Oldest turns are dropped first, since a follow-up refers to the most
+#: recent ones.
+DEFAULT_MAX_HISTORY_CHARS = 12_000
 
-def recent_history(history: object, max_turns: int = DEFAULT_MAX_HISTORY_TURNS) -> list:
-    """The trailing `max_turns` of a conversation, for prompt construction.
+
+def _turn_length(item: object) -> int:
+    content = getattr(item, "content", None)
+    if content is None and isinstance(item, dict):
+        content = item.get("content")
+    return len(content) if isinstance(content, str) else 0
+
+
+def recent_history(
+    history: object,
+    max_turns: int = DEFAULT_MAX_HISTORY_TURNS,
+    max_chars: int = DEFAULT_MAX_HISTORY_CHARS,
+) -> list:
+    """The trailing turns of a conversation, bounded by count *and* size.
+
+    Both bounds are needed. The turn count alone leaves the character volume to
+    the member — 20 turns at the platform's own message cap is ~656 000 chars.
 
     Returns a list so callers can format it as they already do; a non-sequence
     or empty history yields an empty list rather than raising, because a
@@ -96,9 +120,23 @@ def recent_history(history: object, max_turns: int = DEFAULT_MAX_HISTORY_TURNS) 
         items = list(history)
     except TypeError:
         return []
-    if max_turns <= 0:
+    if max_turns > 0:
+        items = items[-max_turns:]
+    if max_chars <= 0 or not items:
         return items
-    return items[-max_turns:]
+    # Walk backwards from the most recent turn, keeping what fits. At least one
+    # turn is always kept: dropping every turn would silently defeat the
+    # resolution this prompt exists to perform.
+    kept: list = []
+    budget = max_chars
+    for item in reversed(items):
+        length = _turn_length(item)
+        if kept and length > budget:
+            break
+        kept.append(item)
+        budget -= length
+    kept.reverse()
+    return kept
 
 
 @runtime_checkable

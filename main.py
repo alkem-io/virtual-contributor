@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import unicodedata
 import os
 import signal
 
@@ -69,8 +70,21 @@ class _ConversationalSkipPolicy:
         self._classifier = classifier
         self._conversational = conversational
 
+    @staticmethod
+    def _normalise(message: str) -> str:
+        """Strip trailing punctuation of any kind before the membership test.
+
+        A literal `!.?` set misses "ok," and "ok…" — and the whole point of the
+        hold-back list is that it must not be trivially side-stepped by how
+        someone happens to punctuate.
+        """
+        stripped = message.strip().lower()
+        while stripped and unicodedata.category(stripped[-1]).startswith("P"):
+            stripped = stripped[:-1].rstrip()
+        return stripped
+
     def should_skip_rewrite(self, message: str) -> bool:
-        if message.strip().rstrip("!.?").lower() in _AMBIGUOUS_ACKNOWLEDGEMENTS:
+        if self._normalise(message) in _AMBIGUOUS_ACKNOWLEDGEMENTS:
             return False
         try:
             return self._classifier.classify(message).route is self._conversational

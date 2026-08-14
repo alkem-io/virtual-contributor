@@ -160,9 +160,17 @@ class ExpertPlugin:
         enforce_budget = self._enforce_context_budget
 
         async def retrieve_node(state: dict) -> dict:
-            # `resolved` first: it survives a caller schema that drops the key.
-            # A graph node that writes its own rephrased_question still wins,
-            # because `resolved` is only set when it differs from the message.
+            # `resolved` sits between the graph's own rephrase and the raw
+            # question, because it survives a caller schema that drops the key.
+            # A graph node writing its own `rephrased_question` still wins.
+            #
+            # An *empty* `rephrased_question` falls through to `resolved`. That
+            # is deliberate: a field the schema declares but no node writes
+            # reads as "" too, and that — not a deliberate suppression — is the
+            # common case. The two are indistinguishable through `state.get`,
+            # and there was no rewriting on develop for a graph to suppress, so
+            # treating "" as "nothing was written" is the reading that matches
+            # every graph that exists today.
             query = (
                 state.get("rephrased_question")
                 or resolved

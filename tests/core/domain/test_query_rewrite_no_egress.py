@@ -120,3 +120,53 @@ class TestTheModuleDoesNotBindToTheUnmergedClassifier:
         assert importlib.import_module("core.domain.query_rewrite") is not None
         with pytest.raises(ImportError):
             importlib.import_module("core.domain.rule_classifier")
+
+
+class TestThePolicySeamIsPureToo:
+    """The guard above proves `query_rewrite.py` is pure — but the policy it
+    consults is a duck-typed object injected from `main.py`, which that walk
+    never reaches.
+
+    `RewritePolicy` is `@runtime_checkable`, so any object with
+    `should_skip_rewrite` is accepted. A future policy doing I/O would satisfy
+    the Protocol, pass every test above, and block the event loop inside
+    `should_rewrite` — reintroducing exactly the call this gate removes.
+    """
+
+    def test_the_shipped_policy_module_imports_no_network_client(self) -> None:
+        """`main.py` legitimately imports plenty; what matters is that the
+        policy's own logic is a membership test and a delegated classify."""
+        import inspect
+
+        import main
+
+        source = inspect.getsource(main._ConversationalSkipPolicy)
+        for client in _NETWORK_CALLS:
+            assert client not in source, f"{client} reached the policy"
+
+    def test_the_shipped_policy_decides_without_blocking(self) -> None:
+        """Timed at the seam, so an I/O-performing policy fails here even if it
+        imports nothing this test can name."""
+        import time
+
+        import main
+
+        class _Classifier:
+            def classify(self, message: str):
+                raise RuntimeError("unavailable")
+
+        policy = main._ConversationalSkipPolicy(_Classifier(), object())
+        start = time.perf_counter()
+        for _ in range(1_000):
+            policy.should_skip_rewrite("thanks!")
+        per_call_ms = (time.perf_counter() - start) * 1000 / 1_000
+        assert per_call_ms < 1.0, f"{per_call_ms:.3f}ms per decision"
+
+    def test_should_skip_rewrite_is_synchronous_on_the_shipped_policy(self) -> None:
+        import inspect
+
+        import main
+
+        assert not inspect.iscoroutinefunction(
+            main._ConversationalSkipPolicy.should_skip_rewrite
+        )

@@ -44,3 +44,25 @@ class TestInvalidRatioIsRejected:
         silently discard all of them and always fall back."""
         with pytest.raises(ValueError, match="QUERY_REWRITE_MAX_EXPANSION_RATIO"):
             BaseConfig(**_REQUIRED, query_rewrite_max_expansion_ratio=ratio)
+
+
+class TestNonFiniteRatiosAreRejected:
+    """`inf`, `nan` and absurd finite values all pass a bare `> 1.0` check and
+    silently disable the length bound this feature exists to enforce.
+
+    `nan` is the worst: every comparison against it is False, so the check is
+    not merely large but structurally unreachable, while startup logs a
+    plausible-looking value.
+    """
+
+    @pytest.mark.parametrize("ratio", [float("inf"), float("nan"), 1e308, 1e400])
+    def test_a_non_finite_or_absurd_ratio_raises(self, ratio: float) -> None:
+        with pytest.raises(ValueError, match="QUERY_REWRITE_MAX_EXPANSION_RATIO"):
+            BaseConfig(**_REQUIRED, query_rewrite_max_expansion_ratio=ratio)
+
+    def test_the_upper_bound_is_enforced(self) -> None:
+        assert BaseConfig(
+            **_REQUIRED, query_rewrite_max_expansion_ratio=100.0
+        ).query_rewrite_max_expansion_ratio == 100.0
+        with pytest.raises(ValueError):
+            BaseConfig(**_REQUIRED, query_rewrite_max_expansion_ratio=101.0)

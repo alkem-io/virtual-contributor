@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from enum import Enum
 
 import logging
@@ -141,10 +142,17 @@ class BaseConfig(BaseSettings):
         # longer than the original — which is what resolving a follow-up
         # against its history normally produces — so the gate would silently
         # discard all of them and always fall back.
-        if self.query_rewrite_max_expansion_ratio <= 1.0:
+        # `inf`, `nan` and absurd finite values all pass a bare `> 1.0` check
+        # and silently disable the bound this feature exists to enforce. `nan`
+        # is the worst: every comparison against it is False, so the length
+        # check is not merely large but structurally unreachable, while startup
+        # logs a plausible-looking value.
+        if not math.isfinite(self.query_rewrite_max_expansion_ratio) or not (
+            1.0 < self.query_rewrite_max_expansion_ratio <= 100.0
+        ):
             raise ValueError(
-                f"QUERY_REWRITE_MAX_EXPANSION_RATIO must be greater than 1.0, "
-                f"got {self.query_rewrite_max_expansion_ratio}"
+                f"QUERY_REWRITE_MAX_EXPANSION_RATIO must be a finite value in "
+                f"(1.0, 100.0], got {self.query_rewrite_max_expansion_ratio}"
             )
 
         if self.summarize_llm_timeout is not None and self.summarize_llm_timeout <= 0:

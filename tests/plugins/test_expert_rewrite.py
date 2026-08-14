@@ -387,3 +387,69 @@ class TestTheGraphPathIsBoundedToo:
             f"graph conversation was {seen['conversation']:,} chars — unbounded"
         )
         assert seen["messages"] < 50
+
+
+class TestPrecedenceIsExplicit:
+    async def test_an_empty_graph_rephrase_falls_through_to_the_resolution(
+        self,
+    ) -> None:
+        """A declared-but-unwritten schema field reads as "" as well, and that
+        is the common case — so "" means "nothing was written", not "suppress"."""
+        from unittest.mock import patch
+
+        from core.domain.prompt_graph import PromptGraph
+
+        store = MockKnowledgeStorePort()
+        real = PromptGraph.from_definition
+
+        def _with_empty_rephrase(definition: dict):
+            graph = real(definition)
+            real_compile = graph.compile
+
+            async def _rephrase(state) -> dict:
+                return {"rephrased_question": ""}
+
+            async def _answer(state) -> dict:
+                return {"final_answer": "an answer"}
+
+            def compile_with_stub(llm, special_nodes=None):
+                nodes = dict(special_nodes or {})
+                nodes.setdefault("answer", _answer)
+                nodes["rephrase"] = _rephrase
+                return real_compile(llm=llm, special_nodes=nodes)
+
+            graph.compile = compile_with_stub  # type: ignore[method-assign]
+            return graph
+
+        definition = {
+            "nodes": [
+                {"name": "rephrase", "input_variables": [], "prompt": ""},
+                {"name": "retrieve", "input_variables": [], "prompt": ""},
+                {"name": "answer", "input_variables": [], "prompt": ""},
+            ],
+            "edges": [
+                {"from": "START", "to": "rephrase"},
+                {"from": "rephrase", "to": "retrieve"},
+                {"from": "retrieve", "to": "answer"},
+                {"from": "answer", "to": "END"},
+            ],
+            "state": {"type": "object", "properties": {
+                "current_question": {"type": "string"},
+                "rephrased_question": {"type": "string"},
+                "combined_knowledge_docs": {"type": "string"},
+                "final_answer": {"type": "string"},
+            }},
+        }
+        with patch.object(
+            PromptGraph, "from_definition", staticmethod(_with_empty_rephrase)
+        ):
+            await ExpertPlugin(
+                llm=CountingLLM(), knowledge_store=store
+            ).handle(
+                make_input(
+                    message="and the other one?",
+                    history=HISTORY,
+                    promptGraph=definition,
+                )
+            )
+        assert store.query_calls[0][1] == [RESOLVED]

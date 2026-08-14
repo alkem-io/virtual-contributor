@@ -31,13 +31,20 @@ class _Decision:
 
 
 class _Classifier:
-    """Routes gratitude to CONVERSATIONAL, everything else to SIMPLE."""
+    """Routes gratitude to CONVERSATIONAL, everything else to SIMPLE.
+
+    Normalises the same way the real classifier does — case-folded and free of
+    trailing punctuation — so this stub cannot pass a message the shipped
+    classifier would route differently.
+    """
+
+    _GRATITUDE = {"thanks", "thank you", "cheers", "bye", "goodbye"}
 
     def classify(self, message: str) -> _Decision:
-        gratitude = {"thanks", "thanks!", "thank you", "cheers", "bye", "goodbye"}
+        normalised = main._ConversationalSkipPolicy._normalise(message)
         return _Decision(
             _Route.CONVERSATIONAL
-            if message.strip().lower() in gratitude
+            if normalised in self._GRATITUDE
             else _Route.SIMPLE
         )
 
@@ -76,7 +83,9 @@ class TestTheAdapterFailsOpen:
 
 class TestOnlyTerminalSmallTalkSkips:
     @pytest.mark.parametrize(
-        "message", ["thanks", "thanks!", "thank you", "cheers", "bye", "goodbye"]
+        "message",
+        ["thanks", "thanks!", "thank you", "cheers", "bye", "goodbye",
+         "thanks,", "cheers\u2026", "Thank you."],
     )
     def test_gratitude_and_closings_skip(self, message: str) -> None:
         assert _policy().should_skip_rewrite(message) is True
@@ -84,7 +93,7 @@ class TestOnlyTerminalSmallTalkSkips:
     @pytest.mark.parametrize(
         "message",
         ["ok", "okay", "alright", "will do", "later", "got it", "yep", "cool",
-         "OK!", "  Okay. "],
+         "OK!", "  Okay. ", "ok,", "ok\u2026", "ok.", "Alright!!", "cool..."],
     )
     def test_an_acknowledgement_never_skips(self, message: str) -> None:
         """After "Shall I list the subspaces?", "ok" means *do it*.

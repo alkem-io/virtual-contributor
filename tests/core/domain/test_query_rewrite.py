@@ -263,3 +263,50 @@ class TestValidationIsLengthNotMeaning:
         legit = "Who is the lead of Space Alpha?"
         assert len(legit) < MIN_REWRITE_ALLOWANCE
         assert validate_rewrite(legit, "who is he?") == legit
+
+
+class TestHistoryIsBoundedByCharactersToo:
+    """The turn count alone leaves the volume to the member.
+
+    The platform caps a single room message at 32 784 chars, so 20 turns is
+    still ~656 000 chars — ~164 000 tokens — re-sent to a metered API on every
+    turn of a thread.
+    """
+
+    def test_the_character_budget_is_enforced(self) -> None:
+        """20 turns at the platform's message cap is ~656 000 chars unbounded.
+
+        The kept volume is one oversized turn, not twenty: at least one turn is
+        always kept (see below), so the ceiling is the budget plus the single
+        largest recent turn — not a multiple of the turn count.
+        """
+        history = [{"role": "human", "content": "x" * 32_784} for _ in range(20)]
+        kept = recent_history(history)
+        total = sum(len(t["content"]) for t in kept)
+        assert total < 40_000, f"kept {total:,} chars"
+        assert total < 0.1 * (20 * 32_784)
+
+    def test_the_most_recent_turns_survive_the_budget(self) -> None:
+        """Oldest-first eviction — a follow-up refers to what was just said."""
+        history = [{"role": "human", "content": f"turn{i}" + "x" * 4_000}
+                   for i in range(10)]
+        kept = recent_history(history)
+        assert kept[-1]["content"].startswith("turn9")
+        assert len(kept) < 10
+
+    def test_one_oversized_turn_is_still_kept(self) -> None:
+        """Dropping every turn would silently defeat the resolution the prompt
+        exists to perform — worse than sending a large one."""
+        history = [{"role": "human", "content": "x" * 100_000}]
+        assert len(recent_history(history)) == 1
+
+    def test_a_short_history_is_untouched_by_the_budget(self) -> None:
+        history = [{"role": "human", "content": "hi"}, {"role": "assistant", "content": "hello"}]
+        assert recent_history(history) == history
+
+    def test_a_turn_without_string_content_does_not_raise(self) -> None:
+        assert len(recent_history([{"role": "human"}, {"content": None}])) == 2
+
+    def test_a_non_positive_budget_disables_the_character_bound(self) -> None:
+        history = [{"role": "human", "content": "x" * 50_000} for _ in range(3)]
+        assert len(recent_history(history, max_chars=0)) == 3
