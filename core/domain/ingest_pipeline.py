@@ -41,9 +41,16 @@ class DocumentMetadata:
     content beneath it, it is the subspace that contains that content — never
     the first-level ancestor.
 
-    All six fields default to "unknown" so existing construction sites (e.g.
-    website ingestion, which has no tree position at all) keep working
-    untouched.
+    **Defaults are not a sentinel value.** The five identifier fields default
+    to ``None``, which ``position_metadata`` omits from what is stored. But
+    ``depth`` defaults to ``0``, and ``0`` is a *meaningful* tier above — the
+    ingest root — so it cannot double as "unknown". What separates the two
+    cases is ``has_position``: content with no tree position (website
+    ingestion) stores no position fields **at all**, including ``depth``.
+    Position is all-or-nothing, which is what keeps the stored metadata and
+    the change-detection fingerprint in agreement.
+
+    Existing construction sites that pass none of these keep working untouched.
     """
 
     document_id: str
