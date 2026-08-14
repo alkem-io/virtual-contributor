@@ -298,6 +298,40 @@ A separate LLM can be configured for ingest pipeline summarization. All three fi
 | `GUIDANCE_MIN_SCORE` | `0.3` | Minimum relevance score (guidance plugin) |
 | `MAX_CONTEXT_CHARS` | `20000` | Context budget — lowest-scoring chunks dropped first |
 
+### Adaptive Routing
+
+Classifies each question and scales retrieval to it: small talk skips retrieval
+entirely, direct lookups retrieve narrowly, comparative questions retrieve more
+and get a wider context budget.
+
+Classification is **rule-based and in-process** — no model, no network call, no
+new dependency, sub-millisecond. An LLM classifier was rejected on arithmetic:
+it would cost a round trip on *every* question including the simple ones it
+exists to speed up, needing (at 350ms) 39% of all traffic on the cheap path
+just to break even. That share has never been measured here.
+
+**Off by default.** Disabled, both plugins take their existing code path with
+their existing constants.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ROUTING_ENABLED` | `false` | Enable adaptive routing |
+| `ROUTING_SIMPLE_N_RESULTS` | `3` | Width for direct lookups (must be ≤ the default width) |
+| `ROUTING_COMPLEX_N_RESULTS` | `10` | Width for comparative / multi-hop questions |
+| `ROUTING_COMPLEX_CONTEXT_CHARS` | `40000` | Context budget for those questions |
+
+The complex budget is widened alongside the width **on purpose**. At the
+deployed 9000-character chunk size, the default 20000-character budget already
+admits only two chunks — so widening retrieval without widening the budget
+would fetch more evidence and then discard it, producing a route that looks
+implemented and changes nothing.
+
+The rules are deliberately lopsided. Only one mistake is user-visible — routing
+a real question to skip retrieval answers it ungrounded — so that is the only
+route with a hard gate: the whole message must match an anchored small-talk
+list, carry no question mark, and be at most six words. Everything else falls
+through to retrieval, so every misclassification degrades to "retrieve anyway".
+
 ### Embeddings
 
 | Variable | Default | Description |

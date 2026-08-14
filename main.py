@@ -10,6 +10,7 @@ import signal
 
 from core.config import BaseConfig
 from core.container import Container
+from core.domain.rule_classifier import RuleQueryClassifier
 from core.health import HealthServer
 from core.logging import setup_logging
 from core.ports.llm import LLMPort
@@ -31,6 +32,45 @@ def _mask_sensitive(name: str, value) -> str:
     return s
 
 
+def _build_routing_table(config: BaseConfig) -> dict:
+    """Turn routing config into the per-route retrieval profiles.
+
+    The moderate route deliberately mirrors the service's existing defaults:
+    an unrecognised question falls back to it, and that fallback has to behave
+    exactly as the service does today.
+    """
+    from core.domain.routing import RetrievalProfile
+    from core.ports.query_router import RouteClass
+
+    default_threshold = config.retrieval_score_threshold
+    return {
+        RouteClass.CONVERSATIONAL: RetrievalProfile(
+            retrieve=False,
+            n_results=config.retrieval_n_results,
+            score_threshold=default_threshold,
+            max_context_chars=config.max_context_chars,
+        ),
+        RouteClass.SIMPLE: RetrievalProfile(
+            retrieve=True,
+            n_results=config.routing_simple_n_results,
+            score_threshold=default_threshold,
+            max_context_chars=config.max_context_chars,
+        ),
+        RouteClass.MODERATE: RetrievalProfile(
+            retrieve=True,
+            n_results=config.retrieval_n_results,
+            score_threshold=default_threshold,
+            max_context_chars=config.max_context_chars,
+        ),
+        RouteClass.COMPLEX: RetrievalProfile(
+            retrieve=True,
+            n_results=config.routing_complex_n_results,
+            score_threshold=default_threshold,
+            max_context_chars=config.routing_complex_context_chars,
+        ),
+    }
+
+
 def _log_config(config: BaseConfig) -> None:
     """Log all configurable summarization/retrieval fields at startup."""
     fields = [
@@ -49,6 +89,10 @@ def _log_config(config: BaseConfig) -> None:
         "guidance_n_results",
         "guidance_min_score",
         "max_context_chars",
+        "routing_enabled",
+        "routing_simple_n_results",
+        "routing_complex_n_results",
+        "routing_complex_context_chars",
         "summary_chunk_threshold",
         "pipeline_timeout",
     ]
@@ -246,6 +290,14 @@ async def _run(config: BaseConfig) -> None:
             deps["score_threshold"] = config.retrieval_score_threshold
     if "max_context_chars" in sig.parameters:
         deps["max_context_chars"] = config.max_context_chars
+    # Inject the classifier only when routing is enabled. Left absent, the
+    # plugins keep their `query_router=None` default and take their existing
+    # code path — which is what makes disabling this a true rollback rather
+    # than a routing table that merely happens to agree with today.
+    if config.routing_enabled and "query_router" in sig.parameters:
+        deps["query_router"] = RuleQueryClassifier()
+        if "routing_table" in sig.parameters:
+            deps["routing_table"] = _build_routing_table(config)
     # Inject summarization LLM for ingest plugins
     if "summarize_llm" in sig.parameters:
         deps["summarize_llm"] = summarize_llm

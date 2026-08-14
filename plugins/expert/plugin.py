@@ -6,8 +6,10 @@ import logging
 
 from core.events.input import Input
 from core.events.response import Response, Source
+from core.domain.routing import DEFAULT_ROUTING_TABLE, RetrievalProfile
 from core.ports.llm import LLMPort
 from core.ports.knowledge_store import KnowledgeStorePort, QueryResult
+from core.ports.query_router import QueryRouterPort
 
 logger = logging.getLogger(__name__)
 
@@ -63,12 +65,53 @@ class ExpertPlugin:
         n_results: int = 5,
         score_threshold: float = 0.3,
         max_context_chars: int = 20000,
+        query_router: QueryRouterPort | None = None,
+        routing_table: dict | None = None,
     ) -> None:
         self._llm = llm
         self._knowledge_store = knowledge_store
         self._n_results = n_results
         self._score_threshold = score_threshold
         self._max_context_chars = max_context_chars
+        # Absent unless routing is enabled, so an existing deployment takes its
+        # current code path with its current constants — the disabled path is
+        # literally today's branch, not a table that happens to agree with it.
+        self._query_router = query_router
+        self._routing_table = routing_table or DEFAULT_ROUTING_TABLE
+
+    def _resolve_profile(self, message: str) -> RetrievalProfile:
+        """Decide this query's retrieval settings.
+
+        Classification is an optimisation, never a dependency of answering: if
+        it fails for any reason the query is served with the configured
+        defaults, which is exactly what happens with routing switched off.
+        """
+        unrouted = RetrievalProfile(
+            retrieve=True,
+            n_results=self._n_results,
+            score_threshold=self._score_threshold,
+            max_context_chars=self._max_context_chars,
+        )
+        if self._query_router is None:
+            return unrouted
+        try:
+            decision = self._query_router.classify(message)
+        except Exception:
+            logger.warning(
+                "Query classification failed; using unrouted defaults",
+                exc_info=True,
+            )
+            return unrouted
+        profile = self._routing_table.get(decision.route)
+        if profile is None:
+            logger.warning("No profile for route %s; using defaults", decision.route)
+            return unrouted
+        logger.info(
+            "Routed query as %s (%s): retrieve=%s n_results=%d budget=%d",
+            decision.route.value, decision.reason,
+            profile.retrieve, profile.n_results, profile.max_context_chars,
+        )
+        return profile
 
     async def startup(self) -> None:
         logger.info("ExpertPlugin started")
@@ -80,20 +123,34 @@ class ExpertPlugin:
         bok_id = event.body_of_knowledge_id or ""
         collection = f"{bok_id}-knowledge" if bok_id else "default-knowledge"
 
+        # One decision per query, made before either path branches, so the
+        # two paths cannot drift apart in how they route.
+        profile = self._resolve_profile(event.message)
+
         # If prompt_graph is defined, use graph execution
         if event.prompt_graph:
-            return await self._handle_with_graph(event, collection)
+            return await self._handle_with_graph(event, collection, profile)
 
         # Fallback: simple RAG
-        return await self._handle_simple(event, collection)
+        return await self._handle_simple(event, collection, profile)
 
     def _enforce_context_budget(
         self, docs: list[str], filtered_result: QueryResult,
+        max_context_chars: int | None = None,
     ) -> tuple[list[str], QueryResult]:
-        """Drop lowest-scoring chunks if total chars exceed max_context_chars."""
+        """Drop lowest-scoring chunks if total chars exceed the budget.
+
+        The budget is per-query, not per-instance: a route that widens
+        retrieval must widen this too, or the extra chunks are fetched and
+        then silently discarded here.
+        """
+        budget = (
+            self._max_context_chars if max_context_chars is None
+            else max_context_chars
+        )
         raw_docs_check = filtered_result.documents[0] if filtered_result.documents else []
         total_raw_chars = sum(len(d) for d in raw_docs_check)
-        if total_raw_chars <= self._max_context_chars:
+        if total_raw_chars <= budget:
             return docs, filtered_result
 
         # docs are already in score order from _filter_and_format
@@ -107,7 +164,7 @@ class ExpertPlugin:
         kept_formatted = []
         for i, doc in enumerate(docs):
             raw_content = raw_docs[i] if i < len(raw_docs) else ""
-            if accumulated + len(raw_content) > self._max_context_chars:
+            if accumulated + len(raw_content) > budget:
                 break
             kept_formatted.append(doc)
             kept_docs.append(raw_content)
@@ -134,14 +191,21 @@ class ExpertPlugin:
         )
         return kept_formatted, new_result
 
-    async def _handle_with_graph(self, event: Input, collection: str) -> Response:
+    async def _handle_with_graph(
+        self, event: Input, collection: str, profile: RetrievalProfile,
+    ) -> Response:
         from core.domain.prompt_graph import PromptGraph
 
         graph = PromptGraph.from_definition(event.prompt_graph)
 
         # Create retrieve special node
-        n_results = self._n_results
-        score_threshold = self._score_threshold
+        # Read from the profile, not from self: the closure below captures
+        # these, and capturing instance constants is how one path silently
+        # keeps today's behaviour while the other routes.
+        n_results = profile.n_results
+        score_threshold = profile.score_threshold
+        budget_chars = profile.max_context_chars
+        should_retrieve = profile.retrieve
         enforce_budget = self._enforce_context_budget
 
         async def retrieve_node(state: dict) -> dict:
@@ -150,11 +214,16 @@ class ExpertPlugin:
                 or state.get("current_question")
                 or event.message
             )
+            if not should_retrieve:
+                # Small talk. There is nothing in a knowledge base that answers
+                # "thanks" — so no query is made at all, not a query whose
+                # results are discarded.
+                return {"combined_knowledge_docs": ""}
             result = await self._knowledge_store.query(
                 collection=collection, query_texts=[query], n_results=n_results,
             )
             docs, filtered_result = _filter_and_format(result, score_threshold)
-            docs, filtered_result = enforce_budget(docs, filtered_result)
+            docs, filtered_result = enforce_budget(docs, filtered_result, budget_chars)
             knowledge = "\n".join(docs)
             # The expert state schema expects ``combined_knowledge_docs``
             # — that's what the answer_question node reads via its
@@ -205,13 +274,23 @@ class ExpertPlugin:
             original_result=final_state.get("original_result"),
         )
 
-    async def _handle_simple(self, event: Input, collection: str) -> Response:
+    async def _handle_simple(
+        self, event: Input, collection: str, profile: RetrievalProfile,
+    ) -> Response:
         """Simple RAG without graph execution."""
-        result = await self._knowledge_store.query(
-            collection=collection, query_texts=[event.message], n_results=self._n_results,
-        )
-        docs, result = _filter_and_format(result, self._score_threshold)
-        docs, result = self._enforce_context_budget(docs, result)
+        if profile.retrieve:
+            result = await self._knowledge_store.query(
+                collection=collection,
+                query_texts=[event.message],
+                n_results=profile.n_results,
+            )
+            docs, result = _filter_and_format(result, profile.score_threshold)
+            docs, result = self._enforce_context_budget(
+                docs, result, profile.max_context_chars,
+            )
+        else:
+            docs = []
+            result = QueryResult(documents=[[]], metadatas=[[]], distances=[[]], ids=[[]])
         knowledge = "\n".join(docs)
 
         from plugins.expert.prompts import combined_expert_prompt

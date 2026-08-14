@@ -161,6 +161,32 @@ class BaseConfig(BaseSettings):
                 f"GUIDANCE_MIN_SCORE must be between 0.0 and 1.0, got {self.guidance_min_score}"
             )
 
+        # Routing validation. Fail at startup naming the variable: a bad value
+        # here would surface as quietly worse answers with nothing in the logs
+        # connecting them to a config change.
+        if self.routing_simple_n_results <= 0:
+            raise ValueError(
+                f"ROUTING_SIMPLE_N_RESULTS must be greater than 0, "
+                f"got {self.routing_simple_n_results}"
+            )
+        if self.routing_complex_n_results <= 0:
+            raise ValueError(
+                f"ROUTING_COMPLEX_N_RESULTS must be greater than 0, "
+                f"got {self.routing_complex_n_results}"
+            )
+        if self.routing_complex_context_chars <= 0:
+            raise ValueError(
+                f"ROUTING_COMPLEX_CONTEXT_CHARS must be greater than 0, "
+                f"got {self.routing_complex_context_chars}"
+            )
+        if self.routing_complex_n_results < self.routing_simple_n_results:
+            # Incoherent: the route meant to see more would see less.
+            raise ValueError(
+                f"ROUTING_COMPLEX_N_RESULTS ({self.routing_complex_n_results}) "
+                f"must be at least ROUTING_SIMPLE_N_RESULTS "
+                f"({self.routing_simple_n_results})"
+            )
+
         # Context budget validation
         if self.max_context_chars <= 0:
             raise ValueError(
@@ -278,6 +304,21 @@ class BaseConfig(BaseSettings):
     # Retrieval — deprecated global fields (kept for backward compat)
     retrieval_n_results: int = 5
     retrieval_score_threshold: float = 0.3
+
+    # Adaptive routing — off by default. It changes how much evidence every
+    # answer is built from, and can skip retrieval entirely, so it is opted
+    # into rather than inherited. Disabled, the plugins take their existing
+    # code path with their existing constants.
+    routing_enabled: bool = False
+    #: Retrieval width for a direct lookup. Must not exceed the default, so a
+    #: simple query never becomes slower than it is today.
+    routing_simple_n_results: int = 3
+    #: Width and budget for a comparative or multi-hop question. The budget
+    #: moves with the width on purpose: at a 9000-char chunk size the default
+    #: 20000-char budget admits only 2 chunks, so widening retrieval alone
+    #: would deliver exactly the same context.
+    routing_complex_n_results: int = 10
+    routing_complex_context_chars: int = 40_000
 
     # Ingest pipeline
     chunk_size: int = 2000

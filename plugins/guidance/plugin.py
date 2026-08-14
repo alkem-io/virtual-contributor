@@ -9,8 +9,10 @@ import re
 
 from core.events.input import Input
 from core.events.response import Response, Source
+from core.domain.routing import DEFAULT_ROUTING_TABLE, RetrievalProfile
 from core.ports.llm import LLMPort
 from core.ports.knowledge_store import KnowledgeStorePort
+from core.ports.query_router import QueryRouterPort
 
 logger = logging.getLogger(__name__)
 
@@ -40,12 +42,52 @@ class GuidancePlugin:
         n_results: int = 5,
         score_threshold: float = 0.3,
         max_context_chars: int = 20000,
+        query_router: QueryRouterPort | None = None,
+        routing_table: dict | None = None,
     ) -> None:
         self._llm = llm
         self._knowledge_store = knowledge_store
         self._n_results = n_results
         self._score_threshold = score_threshold
         self._max_context_chars = max_context_chars
+        # Absent unless routing is enabled, so an existing deployment keeps
+        # exactly its current behaviour on its current code path.
+        self._query_router = query_router
+        self._routing_table = routing_table or DEFAULT_ROUTING_TABLE
+
+    def _resolve_profile(self, message: str) -> RetrievalProfile:
+        """Decide this query's retrieval settings.
+
+        Classification is an optimisation, never a dependency of answering: a
+        failure here serves the query with the configured defaults, which is
+        what happens with routing switched off.
+        """
+        unrouted = RetrievalProfile(
+            retrieve=True,
+            n_results=self._n_results,
+            score_threshold=self._score_threshold,
+            max_context_chars=self._max_context_chars,
+        )
+        if self._query_router is None:
+            return unrouted
+        try:
+            decision = self._query_router.classify(message)
+        except Exception:
+            logger.warning(
+                "Query classification failed; using unrouted defaults",
+                exc_info=True,
+            )
+            return unrouted
+        profile = self._routing_table.get(decision.route)
+        if profile is None:
+            logger.warning("No profile for route %s; using defaults", decision.route)
+            return unrouted
+        logger.info(
+            "Routed query as %s (%s): retrieve=%s n_results=%d budget=%d",
+            decision.route.value, decision.reason,
+            profile.retrieve, profile.n_results, profile.max_context_chars,
+        )
+        return profile
 
     async def startup(self) -> None:
         logger.info("GuidancePlugin started")
@@ -71,8 +113,12 @@ class GuidancePlugin:
             }])
             question = condensed
 
+        # One decision per query, resolved on the condensed question — that is
+        # what retrieval will actually run against.
+        profile = self._resolve_profile(question)
+
         # Query multiple collections in parallel
-        n_results = self._n_results
+        n_results = profile.n_results
 
         async def _query_collection(collection: str):
             docs, sources = [], []
@@ -97,12 +143,15 @@ class GuidancePlugin:
                 logger.warning("Failed to query collection %s", collection)
             return docs, sources
 
-        query_results = await asyncio.gather(
-            *[_query_collection(c) for c in DEFAULT_COLLECTIONS]
-        )
         all_pairs: list[tuple[str, Source]] = []
-        for docs, sources in query_results:
-            all_pairs.extend(zip(docs, sources))
+        if profile.retrieve:
+            query_results = await asyncio.gather(
+                *[_query_collection(c) for c in DEFAULT_COLLECTIONS]
+            )
+            for docs, sources in query_results:
+                all_pairs.extend(zip(docs, sources))
+        # Otherwise: small talk. All three collection queries are skipped
+        # outright rather than run and discarded.
 
         # Sort by relevance (highest score first)
         all_pairs.sort(key=lambda p: p[1].score or 0, reverse=True)
@@ -110,7 +159,7 @@ class GuidancePlugin:
         # Filter by score threshold — discard low-relevance chunks
         all_pairs = [
             (doc, src) for doc, src in all_pairs
-            if (src.score or 0) >= self._score_threshold
+            if (src.score or 0) >= profile.score_threshold
         ]
 
         # Deduplicate by source URL, keeping the highest-scoring chunk per page
@@ -122,15 +171,18 @@ class GuidancePlugin:
                 seen_sources.add(key)
                 deduped.append((doc, src))
 
-        deduped = deduped[:self._n_results]
+        # The SAME width the store was asked for. Applying the profile at the
+        # query but not here would fetch the extra evidence and then discard
+        # it at truncation — the widening would be invisible downstream.
+        deduped = deduped[:profile.n_results]
 
         # Context budget enforcement — drop lowest-scoring chunks if over budget
         total_chars = sum(len(doc) for doc, _ in deduped)
-        if total_chars > self._max_context_chars:
+        if total_chars > profile.max_context_chars:
             kept: list[tuple[str, Source]] = []
             accumulated = 0
             for doc, src in deduped:
-                if accumulated + len(doc) > self._max_context_chars:
+                if accumulated + len(doc) > profile.max_context_chars:
                     break
                 kept.append((doc, src))
                 accumulated += len(doc)
