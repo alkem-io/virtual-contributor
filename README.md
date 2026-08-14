@@ -296,29 +296,36 @@ A separate LLM can be configured for ingest pipeline summarization. All three fi
 | `EXPERT_MIN_SCORE` | `0.3` | Minimum relevance score (expert plugin) |
 | `EXPERT_HIERARCHICAL_RETRIEVAL_ENABLED` | `false` | Opt-in expert overview/summary route then branch-scoped detail retrieval |
 | `EXPERT_HIERARCHY_MAX_BRANCHES` | `3` | Maximum relevant nearest branches selected (must be 2 or 3) |
+| `EXPERT_HIERARCHY_DISPLAY_NAMES_ENABLED` | `false` | Separately opt-in, sanitized hierarchy display names in generation context |
 | `GUIDANCE_N_RESULTS` | `5` | Number of chunks per collection (guidance plugin) |
 | `GUIDANCE_MIN_SCORE` | `0.3` | Minimum relevance score (guidance plugin) |
 | `MAX_CONTEXT_CHARS` | `20000` | Context budget — lowest-scoring chunks dropped first |
 
 ### Hierarchical expert retrieval
 
-This expert-only enhancement is **off by default**. When enabled, it densely
-routes a question over `overview` and `summary` entries, selects up to three
-relevant typed branches, and runs the existing hybrid/re-rank/threshold/top-K
-pipeline against detail in those branches. Context keeps its numbered document
-blocks and adds safe Space/Subspace provenance.
+This expert-only enhancement is **off by default**. Each eligible request runs
+one dense Stage-1 query over overview/summary entries and uses no permanent
+collection-capability cache. Specific subspace routes dominate any root route;
+a root-only or unusable route takes the established flat path. A safe route runs
+the existing hybrid/re-rank/threshold/top-K pipeline over scoped detail.
 
-`subspaceId` is the nearest stored subspace, not a full ancestor chain. The
-feature therefore does not infer subtree membership. A short non-empty scoped
-result remains scoped; a missing route, missing hierarchy keys, empty scoped
-result, or hierarchy-stage failure uses the unchanged flat path. Roll back by
-setting `EXPERT_HIERARCHICAL_RETRIEVAL_ENABLED=false`.
+A nonempty scoped result remains scoped even when short: there is no unscoped
+backfill. An empty scoped result or hierarchy-stage failure exits the hierarchy
+handler before exactly one flat attempt; an error from that flat attempt remains
+visible. Hierarchy labels, when disclosure is enabled, are sanitized and
+rendered before the context budget, so all model-visible label bytes are
+charged before eviction. Both hierarchy retrieval and display-name disclosure
+can be returned immediately to flat-compatible behaviour by setting their
+controls to `false`.
 
-Enable only after the image is deployed with the flag off, selected spaces are
-re-ingested with overview/summary and hierarchy metadata, and a human has run
-paired flat/on RAGAS evaluation on the same reviewed query set. The repository
-tests include only a deterministic structural precision proxy, not live RAGAS
-precision evidence. `SUMMARIZE_ENABLED` remains unchanged.
+Enable only after deployment with both controls off, re-ingestion of selected
+spaces, and the required human gates. `RG-05` is the representative paired
+flat/on RAGAS evaluation on one reviewed query set; its runs require matching
+effective, non-secret production/evaluation fingerprints and comparison fails
+closed when either fingerprint is absent or differs. `RG-05P` is the separate
+provider-processing gate required before display names may be enabled. The
+repository's deterministic proxy is structural evidence only, while `SC-009`
+is the full-suite regression gate. `SUMMARIZE_ENABLED` remains unchanged.
 
 ### Re-ranking
 
@@ -604,9 +611,13 @@ poetry run python -m evaluation.cli list
 ### How it Works
 
 1. **Golden test set**: JSONL file with `question`, `expected_answer`, and `relevant_documents` fields
-2. **Pipeline invoker**: Instantiates the plugin directly (bypassing RabbitMQ) with a `TracingKnowledgeStore` that captures retrieved contexts
+2. **Pipeline invoker**: Instantiates the plugin directly (bypassing RabbitMQ); for Expert, it shares production composition and captures the exact final rendered generation contexts after retrieval, ranking, filtering, and budget processing
 3. **Scorer**: Wraps RAGAS metrics, uses the pipeline's own LLM as judge via `LangchainLLMWrapper`
 4. **Runner**: Executes the test suite, computes per-metric aggregates, persists results to `evaluations/{id}.json`
+
+Paired Expert comparisons require both non-secret effective-composition
+fingerprints to be present and equal; otherwise comparison fails closed rather
+than treating a configuration change as a hierarchy-only experiment.
 
 ## Testing
 
@@ -625,6 +636,10 @@ poetry run pytest tests/plugins/test_expert.py
 # Single test
 poetry run pytest tests/plugins/test_expert.py::test_handle
 ```
+
+For this hierarchy feature, the full suite is the `SC-009` regression gate;
+focused tests and the deterministic precision proxy do not replace the
+representative paired RAGAS gate (`RG-05`).
 
 ### Test Infrastructure
 

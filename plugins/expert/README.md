@@ -39,27 +39,32 @@ legacy content. `SUMMARIES_WHERE` remains available for explicit overview retrie
 
 ### Optional two-stage hierarchy retrieval
 
-With `EXPERT_HIERARCHICAL_RETRIEVAL_ENABLED=false` (the default), expert makes
-the current single flat retrieval call. When explicitly enabled, Stage 1 makes
-a dense query over `overview`, `summary`, and legacy body-of-knowledge summary
-entries; Stage 2 applies the current hybrid/rerank/threshold/top-K/budget path
-to detail matching one to three selected `spaceId`/nearest `subspaceId` keys.
-`EXPERT_HIERARCHY_DISPLAY_NAMES_ENABLED=false` by default, so scoped retrieval
-does not expose Space/Subspace names to the answering provider. Only explicit
-true adds sanitized provenance, and it requires the RG-05P human approval;
-this code does not grant or imply that approval.
+With `EXPERT_HIERARCHICAL_RETRIEVAL_ENABLED=false` (the default), Expert makes
+the current single flat retrieval call. When enabled, every eligible request
+runs one dense Stage-1 routing query over overview/summary entries; there is no
+permanent collection capability cache. Specific subspace routes dominate root
+routes, and root-only routing is deliberately unscopable, so it uses flat
+retrieval rather than widening to a root scope.
 
-The stored `subspaceId` is only the nearest subspace; it is not an ancestor
-chain, so this feature never claims subtree expansion. No usable route, an
-empty scoped detail result, or a hierarchy-stage error falls back to the exact
-flat pipeline. A short non-empty scoped result is intentionally not backfilled
-from siblings. Disable the flag to roll back immediately.
+Stage 2 applies the current hybrid/rerank/threshold/top-K/budget path to detail
+in the selected specific branches. A nonempty scoped result is retained even if
+short: there is no unscoped sibling backfill. No usable route, an empty scoped
+result, or a hierarchy-stage failure leaves the hierarchy handler before exactly
+one flat attempt. A flat-path error is not hidden or retried by hierarchy logic.
 
-Stored IDs remain internal to filters and are never put in model-visible
-headers. Space and subspace display names are private, user-controlled
-metadata. Environment enablement additionally requires recorded provider
-processing/minimization approval (purpose, region, retention, training and
-subprocessor coverage) before the flag may be enabled.
+`EXPERT_HIERARCHY_DISPLAY_NAMES_ENABLED=false` by default and is independent
+of retrieval. When allowed, labels use only sanitized display names; they are
+rendered before context-budget eviction, and their model-visible bytes are
+charged before rows are dropped. With disclosure disabled or names unavailable,
+the hierarchy segment is omitted. Both controls can be set to `false` for an
+immediate flat-compatible rollback.
+
+Provider processing/minimization approval is a human `RG-05P` gate before
+display names may be enabled; this code does not grant or imply that approval.
+`RG-05` is the representative paired flat/on RAGAS gate. Its production and
+evaluation runs use the same effective composition and a non-secret fingerprint;
+comparison fails closed unless both fingerprints are present and equal.
+`SC-009` remains the full-suite regression gate, not an evaluation substitute.
 
 ## Grounded, citable answers
 
@@ -117,6 +122,7 @@ cue routing is outside this plugin's scope.
 | `EXPERT_MIN_SCORE` | `0.3` | Minimum relevance score threshold |
 | `EXPERT_HIERARCHICAL_RETRIEVAL_ENABLED` | `false` | Enable the opt-in overview/summary route and scoped detail stage |
 | `EXPERT_HIERARCHY_MAX_BRANCHES` | `3` | Route cap; only `2` or `3` are valid settings |
+| `EXPERT_HIERARCHY_DISPLAY_NAMES_ENABLED` | `false` | Separately enable sanitized display-name labels after RG-05P |
 | `MAX_CONTEXT_CHARS` | `20000` | Context budget — lowest-scoring chunks dropped first |
 | `ANSWERING_LLM_TEMPERATURE` | unset | Optional per-answer temperature, validated from `0.0` to `2.0` |
 | `ANSWERING_CHAIN_OF_THOUGHT_ENABLED` | `true` | Enables conditional private reasoning for complex simple-RAG questions |
