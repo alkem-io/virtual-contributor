@@ -19,12 +19,12 @@ from evaluation.report import (
     EvaluationRun,
     MetricScores,
     SourceInfo,
-    finite_unit_metric,
+    canonical_metric_scores,
 )
 
 logger = logging.getLogger(__name__)
 
-METRIC_NAMES = ["faithfulness", "answer_relevancy", "context_precision", "context_recall"]
+METRIC_NAMES = ("faithfulness", "answer_relevancy", "context_precision", "context_recall")
 
 
 class Scorer:
@@ -57,13 +57,7 @@ class Scorer:
         result = await asyncio.to_thread(evaluate, dataset=dataset, metrics=self._metrics)
         df = result.to_pandas()
 
-        scores: dict[str, float] = {}
-        for name in METRIC_NAMES:
-            if name in df.columns:
-                val = df[name].iloc[0]
-                scores[name] = finite_unit_metric(0.0 if val is None else val)
-
-        return scores
+        return canonical_metric_scores({str(name): df[name].iloc[0] for name in df.columns})
 
 
 class EvaluationRunner:
@@ -99,6 +93,25 @@ class EvaluationRunner:
             or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}", corpus_revision) is None
         ):
             raise ValueError("Expert evaluation requires a safe corpus revision")
+        # The public identity is a pre-egress gate.  Snapshot validated
+        # primitives now; never reread a mutable invoker after case work.
+        if normalized_plugin == "expert":
+            identity = getattr(self._invoker, "evaluation_identity", None)
+            fingerprint = getattr(self._invoker, "composition_fingerprint", None)
+            mode = getattr(identity, "hierarchy_mode", None)
+            invariant = getattr(identity, "invariant_composition_fingerprint", None)
+            full = getattr(identity, "full_composition_fingerprint", None)
+            from plugins.expert.composition import expert_full_composition_fingerprint
+            if (
+                mode not in {"flat", "hierarchical"}
+                or not isinstance(invariant, str)
+                or not isinstance(full, str)
+                or fingerprint != invariant
+                or full != expert_full_composition_fingerprint(invariant, mode)
+            ):
+                raise ValueError("Expert evaluation identity is incomplete or contradictory")
+        else:
+            fingerprint = mode = invariant = full = None
         run_start = time.monotonic()
         ts = datetime.now(timezone.utc)
         ts_str = ts.strftime("%Y%m%dT%H%M%S")
@@ -195,35 +208,14 @@ class EvaluationRunner:
         total_duration = time.monotonic() - run_start
         aggregate = self._compute_aggregate(cases)
 
-        fingerprint = getattr(self._invoker, "composition_fingerprint", None)
-        if not isinstance(fingerprint, str):
-            fingerprint = None
-        identity = None
-        if normalized_plugin == "expert":
-            identity = getattr(self._invoker, "evaluation_identity", None)
-            if identity is None:
-                raise ValueError("Expert evaluation requires a complete public invoker identity")
-            mode = getattr(identity, "hierarchy_mode", None)
-            invariant = getattr(identity, "invariant_composition_fingerprint", None)
-            full = getattr(identity, "full_composition_fingerprint", None)
-            from plugins.expert.composition import expert_full_composition_fingerprint
-            if (
-                mode not in {"flat", "hierarchical"}
-                or not isinstance(invariant, str)
-                or not isinstance(full, str)
-                or full != expert_full_composition_fingerprint(invariant, mode)
-                or fingerprint != invariant
-            ):
-                raise ValueError("Expert evaluation identity is incomplete or contradictory")
-        else:
-            mode = invariant = full = None
         run = EvaluationRun(
             id=run_id,
             timestamp=ts.isoformat(),
             label=label,
             plugin_type=plugin_type,
             composition_fingerprint=fingerprint,
-            composition_identity_version=6 if normalized_plugin == "expert" else None,
+            composition_identity_version=7 if normalized_plugin == "expert" else None,
+            case_identity_version="evaluation-case-identity/v1" if normalized_plugin == "expert" else None,
             hierarchy_mode=mode,
             test_set_digest=canonical_test_set_digest(test_cases) if normalized_plugin == "expert" else None,
             body_of_knowledge_digest=hashlib.sha256((body_of_knowledge_id or "").encode("utf-8")).hexdigest() if normalized_plugin == "expert" else None,

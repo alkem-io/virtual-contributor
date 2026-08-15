@@ -32,6 +32,8 @@ def evaluation_case_identity_payload(case: object) -> dict[str, object]:
     silently changing the producer's bytes while the persisted verifier keeps
     accepting its old hand-written projection.
     """
+    if isinstance(case, Mapping) and set(case) != set(CASE_IDENTITY_FIELDS):
+        raise ValueError("Evaluation case identity schema is not declared for this version")
     model_fields = getattr(type(case), "model_fields", None)
     if model_fields is not None and set(model_fields) != set(CASE_IDENTITY_FIELDS):
         raise ValueError("Evaluation case identity schema is not declared for this version")

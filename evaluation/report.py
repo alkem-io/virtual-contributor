@@ -9,7 +9,7 @@ import statistics
 
 from plugins.expert.composition import expert_full_composition_fingerprint
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class SourceInfo(BaseModel):
@@ -58,6 +58,14 @@ class EvaluationCase(BaseModel):
     duration_seconds: float
     error: str | None = None
 
+    @model_validator(mode="after")
+    def _successful_case_has_complete_scores(self) -> "EvaluationCase":
+        if self.error is None:
+            if self.scores is None:
+                raise ValueError("Successful evaluation case requires metric scores")
+            canonical_metric_scores(self.scores.model_dump())
+        return self
+
 
 class AggregateMetrics(BaseModel):
     """Summary statistics for a single metric across all cases."""
@@ -82,6 +90,7 @@ class EvaluationRun(BaseModel):
     plugin_type: str
     composition_fingerprint: str | None = None
     composition_identity_version: int | None = None
+    case_identity_version: str | None = None
     # v4 pairing identity. Optional only so historical JSON remains displayable;
     # comparison below intentionally requires every member.
     hierarchy_mode: str | None = None
@@ -121,7 +130,27 @@ class ComparisonReport(BaseModel):
 # Formatting
 # ---------------------------------------------------------------------------
 
-METRIC_NAMES = ["faithfulness", "answer_relevancy", "context_precision", "context_recall"]
+METRIC_NAMES = ("faithfulness", "answer_relevancy", "context_precision", "context_recall")
+METRIC_ALIASES = {
+    "faithfulness": "faithfulness",
+    "answer_relevancy": "answer_relevancy",
+    "llm_context_precision_without_reference": "context_precision",
+    "context_precision": "context_precision",
+    "context_recall": "context_recall",
+}
+
+
+def canonical_metric_scores(values: dict[str, object]) -> dict[str, float]:
+    """Map real RAGAS names once and require exactly four usable metrics."""
+    canonical: dict[str, float] = {}
+    for name, value in values.items():
+        mapped = METRIC_ALIASES.get(name)
+        if mapped is None or mapped in canonical:
+            raise ValueError("Evaluation metrics must use exactly the canonical inventory")
+        canonical[mapped] = finite_unit_metric(value)
+    if set(canonical) != set(METRIC_NAMES):
+        raise ValueError("Evaluation metrics must include every required metric")
+    return canonical
 
 
 def format_run_summary(run: EvaluationRun, output_path: str | None = None) -> str:
@@ -203,9 +232,11 @@ def compute_comparison(
         "invariant_composition_fingerprint", "full_composition_fingerprint",
     )
     if any(getattr(run, field) in (None, "") for run in runs for field in required):
-        raise ValueError("Evaluation runs lack complete v6 pairing identity")
-    if any(run.composition_identity_version != 6 for run in runs):
-        raise ValueError("Evaluation runs require v6 composition identity")
+        raise ValueError("Evaluation runs lack complete v7 pairing identity")
+    if any(run.composition_identity_version != 7 for run in runs):
+        raise ValueError("Evaluation runs require v7 composition identity")
+    if any(run.case_identity_version != "evaluation-case-identity/v1" for run in runs):
+        raise ValueError("Evaluation runs require evaluation-case-identity/v1")
     if baseline.plugin_type != "expert" or current.plugin_type != "expert":
         raise ValueError("Only Expert evaluation runs are comparable")
     if baseline.hierarchy_mode != "flat" or current.hierarchy_mode != "hierarchical":
@@ -263,7 +294,9 @@ def _case_digest(case: EvaluationCase) -> str:
 
 
 def _validate_persisted_run(run: EvaluationRun) -> None:
-    """Fail closed when persisted evidence is not a coherent v6 experiment."""
+    """Fail closed when persisted evidence is not a coherent v7 experiment."""
+    if run.case_identity_version != "evaluation-case-identity/v1":
+        raise ValueError("Evaluation run case identity version is invalid")
     if any(value < 0 for value in (run.test_case_count, run.success_count, run.failure_count)):
         raise ValueError("Evaluation counts must be nonnegative")
     if run.test_case_count != len(run.cases) or run.success_count + run.failure_count != run.test_case_count:

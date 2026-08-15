@@ -13,7 +13,10 @@ from core.ports.llm import LLMPort
 from core.provider_factory import create_llm_adapter  # noqa: F401 - test seam
 from core.registry import PluginRegistry
 from evaluation.tracing import TracingKnowledgeStore
-from plugins.expert.composition import expert_composition_fingerprint
+from plugins.expert.composition import (
+    ResolvedExpertComposition, expert_composition_fingerprint,
+    ExpertPlumbing, expert_runtime_config, resolve_expert_composition,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -36,14 +39,14 @@ class ExpertEvaluationIdentity:
             raise ValueError("Expert evaluation identity fingerprints must be SHA-256 digests")
 
 
-def effective_composition_fingerprint(config: BaseConfig) -> str:
+def effective_composition_fingerprint(composition: ResolvedExpertComposition) -> str:
     """Hash redacted behavior-affecting composition for paired evaluation.
 
     The hierarchy retrieval toggle is the controlled experiment variable and
     deliberately does not alter the paired-run fingerprint. Display-name
     rendering remains included because it changes model-visible context.
     """
-    return expert_composition_fingerprint(config, {})
+    return expert_composition_fingerprint(composition)
 
 
 class PipelineInvoker:
@@ -61,7 +64,10 @@ class PipelineInvoker:
     ) -> None:
         self._plugin_type = plugin_type.lower().replace("-", "_")
         # Evaluation selection is authoritative before adapter construction.
-        self._config = config.model_copy(update={"plugin_type": self._plugin_type})
+        selected = config.model_copy(update={"plugin_type": self._plugin_type})
+        self._config = selected
+        self._expert_composition: ResolvedExpertComposition | None = None
+        self._expert_plumbing: ExpertPlumbing | None = None
         self._body_of_knowledge_id = body_of_knowledge_id
         self._plugin = None
         self._tracing_store: TracingKnowledgeStore | None = None
@@ -84,8 +90,16 @@ class PipelineInvoker:
             _expert_composition_fingerprint,
         )
 
+        if self._plugin_type == "expert":
+            # This is the sole evaluation resolution and occurs before either
+            # adapter or plugin factory.  The object is retained by identity.
+            resolved_wiring = resolve_expert_composition(
+                self._config, llm_config=__import__("main")._resolve_plugin_llm_config(self._config),
+            )
+            self._expert_composition, self._expert_plumbing = resolved_wiring.authority, resolved_wiring.plumbing
+            self._config = expert_runtime_config(self._expert_composition, self._expert_plumbing)
         container = Container()
-        _create_adapters(self._config, container)
+        _create_adapters(self._expert_composition or self._config, container, self._expert_plumbing)
         try:
             store = container.resolve(KnowledgeStorePort)
         except ContainerError:
@@ -103,8 +117,11 @@ class PipelineInvoker:
         plugin_class = registry.discover(self._plugin_type)
         deps = container.resolve_for_plugin(plugin_class)
         if self._plugin_type.lower().replace("-", "_") == "expert":
+            assert self._expert_composition is not None
+            assert self._expert_plumbing is not None
             _compose_expert_dependencies(
-                self._config, deps, plugin_class,
+                self._expert_composition, deps, plugin_class,
+                plumbing=self._expert_plumbing,
                 context_observer=self._tracing_store.capture_generation_context,
             )
             self._generation_context_observer_wired = True
@@ -122,20 +139,20 @@ class PipelineInvoker:
             if "context_observer" in signature.parameters:
                 deps["context_observer"] = self._tracing_store.capture_generation_context
         self._plugin = plugin_class(**deps)
-        self._composition_fingerprint = _expert_composition_fingerprint(
-            self._config, deps, container,
+        self._composition_fingerprint = (
+            _expert_composition_fingerprint(self._expert_composition)
+            if self._expert_composition is not None else ""
         )
         from plugins.expert.composition import expert_full_composition_fingerprint
-        self._full_composition_fingerprint = expert_full_composition_fingerprint(
-            self._composition_fingerprint,
-            "hierarchical" if self._config.expert_hierarchical_retrieval_enabled else "flat",
-        )
+        if self._expert_composition is not None:
+            self._full_composition_fingerprint = expert_full_composition_fingerprint(
+                self._composition_fingerprint, self._expert_composition.mode,
+            )
         if self._plugin_type == "expert":
+            assert self._expert_composition is not None
             self._evaluation_identity = ExpertEvaluationIdentity(
                 hierarchy_mode=(
-                    "hierarchical"
-                    if self._config.expert_hierarchical_retrieval_enabled
-                    else "flat"
+                    self._expert_composition.mode
                 ),
                 invariant_composition_fingerprint=self._composition_fingerprint,
                 full_composition_fingerprint=self._full_composition_fingerprint,

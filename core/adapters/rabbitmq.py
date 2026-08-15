@@ -143,14 +143,25 @@ class RabbitMQAdapter:
                 body = json.loads(message.body.decode("utf-8"))
                 logger.info("Received message on queue %s", queue)
                 await callback(body, message)
-            except Exception:
-                logger.exception("Unhandled error in consume_with_message callback")
+            except Exception as exc:
+                # The application callback has already made its bounded delivery
+                # decision.  This is only a containment boundary: never render
+                # its exception, cause, context or traceback into a broker log.
+                logger.error(
+                    "consume_with_message callback failed: error_type=%s",
+                    type(exc).__name__,
+                    exc_info=False,
+                )
                 # Reject without requeue to avoid infinite loops;
                 # the callback should handle its own ACK/reject.
                 try:
                     await message.reject(requeue=False)
-                except Exception:
-                    pass
+                except Exception as reject_exc:
+                    logger.error(
+                        "consume_with_message reject failed: error_type=%s",
+                        type(reject_exc).__name__,
+                        exc_info=False,
+                    )
 
         await q.consume(on_message)
         logger.info("Consuming (with message) from queue: %s", queue)

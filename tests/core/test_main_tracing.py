@@ -754,3 +754,33 @@ async def test_early_ack_failure_span_never_records_content_attribute(traced_exp
     roots = [span for span in traced_exporter.get_finished_spans() if span.name == "vc.handle"]
     assert message.acked and len(roots) == 1 and roots[0].status.status_code.name == "ERROR"
     assert "vc.message" not in roots[0].attributes
+
+
+async def test_retry_reject_failure_is_contained_without_sensitive_chain() -> None:
+    async def handle(event): raise RuntimeError("provider-secret")
+    class RejectFails(_Message):
+        async def reject(self, *, requeue=False): raise RuntimeError("settlement-secret")
+    handler, _, _, _ = _wiring(handle, rabbitmq_max_retries=2)
+    await handler(_query_body(), RejectFails())
+
+
+async def test_terminal_reject_failure_is_contained_without_sensitive_chain() -> None:
+    async def handle(event): raise RuntimeError("provider-secret")
+    class RejectFails(_Message):
+        async def reject(self, *, requeue=False): raise RuntimeError("settlement-secret")
+    handler, _, _, _ = _wiring(handle)
+    await handler(_query_body(), RejectFails())
+
+
+async def test_parse_reject_failure_is_contained_without_sensitive_chain() -> None:
+    class RejectFails(_Message):
+        async def reject(self, *, requeue=False): raise RuntimeError("settlement-secret")
+    handler, _, _, _ = _wiring(lambda event: None)
+    await handler({"unknown": "member-secret"}, RejectFails())
+
+
+def test_rabbit_consumer_wrapper_logs_type_only_without_exception_context() -> None:
+    from pathlib import Path
+    source = Path("core/adapters/rabbitmq.py").read_text()
+    assert "logger.exception(\"Unhandled error in consume_with_message callback\")" not in source
+    assert "consume_with_message callback failed: error_type=%s" in source

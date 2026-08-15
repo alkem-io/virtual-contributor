@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import pytest
-from evaluation.dataset import TestCase, canonical_test_set_digest, successful_case_digest
+from evaluation.dataset import (
+    TestCase,
+    canonical_test_set_digest,
+    successful_case_digest,
+)
 
 from evaluation.report import (
     AggregateMetrics,
@@ -37,7 +41,11 @@ def _make_run(
             "context_precision": 0.71,
             "context_recall": 0.68,
         }
-    case_input = TestCase(question="What is Alkemio?", expected_answer="A platform", relevant_documents=["https://alkem.io"])
+    case_input = TestCase(
+        question="What is Alkemio?",
+        expected_answer="A platform",
+        relevant_documents=["https://alkem.io"],
+    )
     aggregate = {
         name: AggregateMetrics(mean=val, median=val, min=val, max=val)
         for name, val in agg_values.items()
@@ -55,14 +63,17 @@ def _make_run(
         failure_count=0,
         duration_seconds=842.5,
         composition_fingerprint="matched-composition",
-        composition_identity_version=6,
+        composition_identity_version=7,
+        case_identity_version="evaluation-case-identity/v1",
         hierarchy_mode=mode,
         test_set_digest=canonical_test_set_digest([case_input]),
         body_of_knowledge_digest="c" * 64,
         corpus_revision="reingest-2026-08-14",
         successful_case_digests=[successful_case_digest(case_input)],
         invariant_composition_fingerprint=invariant,
-        full_composition_fingerprint=expert_full_composition_fingerprint(invariant, mode),
+        full_composition_fingerprint=expert_full_composition_fingerprint(
+            invariant, mode
+        ),
         aggregate=aggregate,
         cases=[
             EvaluationCase(
@@ -87,13 +98,21 @@ class TestComputeComparison:
     def test_computes_deltas(self):
         baseline = _make_run(
             "baseline",
-            agg_values={"faithfulness": 0.80, "answer_relevancy": 0.70,
-                        "context_precision": 0.60, "context_recall": 0.50},
+            agg_values={
+                "faithfulness": 0.80,
+                "answer_relevancy": 0.70,
+                "context_precision": 0.60,
+                "context_recall": 0.50,
+            },
         )
         current = _make_run(
             "current",
-            agg_values={"faithfulness": 0.90, "answer_relevancy": 0.75,
-                        "context_precision": 0.55, "context_recall": 0.60},
+            agg_values={
+                "faithfulness": 0.90,
+                "answer_relevancy": 0.75,
+                "context_precision": 0.55,
+                "context_recall": 0.60,
+            },
         )
 
         report = compute_comparison(baseline, current)
@@ -117,13 +136,21 @@ class TestComputeComparison:
     def test_handles_zero_baseline(self):
         baseline = _make_run(
             "baseline",
-            agg_values={"faithfulness": 0.0, "answer_relevancy": 0.5,
-                        "context_precision": 0.5, "context_recall": 0.5},
+            agg_values={
+                "faithfulness": 0.0,
+                "answer_relevancy": 0.5,
+                "context_precision": 0.5,
+                "context_recall": 0.5,
+            },
         )
         current = _make_run(
             "current",
-            agg_values={"faithfulness": 0.5, "answer_relevancy": 0.5,
-                        "context_precision": 0.5, "context_recall": 0.5},
+            agg_values={
+                "faithfulness": 0.5,
+                "answer_relevancy": 0.5,
+                "context_precision": 0.5,
+                "context_recall": 0.5,
+            },
         )
         report = compute_comparison(baseline, current)
         # Zero baseline → percentage_change should be 0.0 (no division error)
@@ -132,7 +159,9 @@ class TestComputeComparison:
     def test_rejects_comparison_when_effective_composition_differs(self):
         baseline, current = _make_run("baseline"), _make_run("current")
         current.invariant_composition_fingerprint = "e" * 64
-        with pytest.raises(ValueError, match="invariant_composition_fingerprint differs"):
+        with pytest.raises(
+            ValueError, match="invariant_composition_fingerprint differs"
+        ):
             compute_comparison(baseline, current)
 
     @pytest.mark.parametrize("missing", ["baseline", "current"])
@@ -142,19 +171,27 @@ class TestComputeComparison:
             baseline.invariant_composition_fingerprint = None
         else:
             current.invariant_composition_fingerprint = ""
-        with pytest.raises(ValueError, match="complete v6 pairing identity"):
+        with pytest.raises(ValueError, match="complete v7 pairing identity"):
             compute_comparison(baseline, current)
 
     def test_summary_count(self):
         baseline = _make_run(
             "baseline",
-            agg_values={"faithfulness": 0.5, "answer_relevancy": 0.5,
-                        "context_precision": 0.5, "context_recall": 0.5},
+            agg_values={
+                "faithfulness": 0.5,
+                "answer_relevancy": 0.5,
+                "context_precision": 0.5,
+                "context_recall": 0.5,
+            },
         )
         current = _make_run(
             "current",
-            agg_values={"faithfulness": 0.6, "answer_relevancy": 0.6,
-                        "context_precision": 0.4, "context_recall": 0.5},
+            agg_values={
+                "faithfulness": 0.6,
+                "answer_relevancy": 0.6,
+                "context_precision": 0.4,
+                "context_recall": 0.5,
+            },
         )
         report = compute_comparison(baseline, current)
 
@@ -205,7 +242,7 @@ def test_rejects_positive_and_negative_infinite_metrics():
 
 
 def test_rejects_finite_metrics_outside_inclusive_unit_interval():
-    for value in (-.01, 1.01, True, "0.5"):
+    for value in (-0.01, 1.01, True, "0.5"):
         with pytest.raises(ValueError):
             MetricScores(context_recall=value)
 
@@ -217,30 +254,120 @@ def test_accepts_exact_zero_and_one_metric_boundaries():
 
 def test_report_rejects_unknown_case_identity_version():
     from evaluation.case_identity import CASE_IDENTITY_VERSION
+
     assert CASE_IDENTITY_VERSION == "evaluation-case-identity/v1"
     run = _make_run("baseline")
     run.composition_identity_version = 5
-    with pytest.raises(ValueError, match="v6"):
+    with pytest.raises(ValueError, match="v7"):
         compute_comparison(run, _make_run("current"))
 
 
 def test_case_schema_extension_cannot_diverge_producer_and_verifier():
     from pydantic import BaseModel
     from evaluation.case_identity import evaluation_case_identity_payload
+
     class FutureCase(BaseModel):
         question: str
         expected_answer: str
         relevant_documents: list[str]
         required_future_field: str
+
     with pytest.raises(ValueError, match="schema"):
-        evaluation_case_identity_payload(FutureCase(question="q", expected_answer="a", relevant_documents=["d"], required_future_field="x"))
+        evaluation_case_identity_payload(
+            FutureCase(
+                question="q",
+                expected_answer="a",
+                relevant_documents=["d"],
+                required_future_field="x",
+            )
+        )
 
 
 def test_v6_comparison_accepts_equivalent_default_representation():
     assert compute_comparison(_make_run("baseline"), _make_run("current")).deltas
 
 
-@pytest.mark.parametrize("mutation", ["plugin", "mode", "dataset", "bok", "corpus", "success", "invariant", "full", "failure", "legacy"])
+def test_successful_metric_scores_require_exact_non_null_inventory():
+    from evaluation.report import canonical_metric_scores
+
+    with pytest.raises(ValueError):
+        canonical_metric_scores(
+            {
+                "faithfulness": 0,
+                "answer_relevancy": 0,
+                "context_precision": 0,
+                "context_recall": None,
+            }
+        )
+    with pytest.raises(ValueError):
+        canonical_metric_scores(
+            {
+                "faithfulness": 0,
+                "answer_relevancy": 0,
+                "context_precision": 0,
+                "context_recall": 0,
+                "extra": 0,
+            }
+        )
+
+
+def test_comparison_rejects_provider_alias_or_incomplete_metric_inventory():
+    baseline, current = _make_run("baseline"), _make_run("current")
+    baseline.aggregate.pop("context_recall")
+    with pytest.raises(ValueError):
+        compute_comparison(baseline, current)
+
+
+def test_comparison_rejects_missing_case_identity_version():
+    baseline, current = _make_run("baseline"), _make_run("current")
+    baseline.case_identity_version = None
+    with pytest.raises(ValueError):
+        compute_comparison(baseline, current)
+
+
+def test_comparison_rejects_unknown_case_identity_version():
+    baseline, current = _make_run("baseline"), _make_run("current")
+    baseline.case_identity_version = "future/v2"
+    with pytest.raises(ValueError):
+        compute_comparison(baseline, current)
+
+
+def test_comparison_rejects_contradictory_case_identity_version():
+    baseline, current = _make_run("baseline"), _make_run("current")
+    current.case_identity_version = "evaluation-case-identity/v2"
+    with pytest.raises(ValueError):
+        compute_comparison(baseline, current)
+
+
+def test_comparison_rejects_future_case_identity_fields():
+    from evaluation.case_identity import evaluation_case_identity_payload
+
+    with pytest.raises(ValueError):
+        evaluation_case_identity_payload(
+            {
+                "question": "q",
+                "expected_answer": "a",
+                "relevant_documents": [],
+                "future_identity": "x",
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "plugin",
+        "mode",
+        "dataset",
+        "bok",
+        "corpus",
+        "success",
+        "invariant",
+        "full",
+        "failure",
+        "legacy",
+    ],
+)
 def test_comparison_rejects_incomplete_or_mismatched_v4_identity(mutation):
     baseline, current = _make_run("baseline"), _make_run("current")
     if mutation == "plugin":
@@ -335,12 +462,16 @@ def test_comparison_rejects_full_fingerprint_not_bound_to_mode():
 def test_comparison_rejects_legacy_reports_without_v4_identity():
     _reject_v4("legacy")
 
-@pytest.mark.parametrize("field", ["query_cap", "rewrite_cap", "attempts", "attempt_timeout", "deadline"])
+
+@pytest.mark.parametrize(
+    "field", ["query_cap", "rewrite_cap", "attempts", "attempt_timeout", "deadline"]
+)
 def test_comparison_rejects_each_embedding_safety_control_mismatch(field):
     baseline, current = _make_run("baseline"), _make_run("current")
     current.invariant_composition_fingerprint = "e" * 64
     with pytest.raises(ValueError):
         compute_comparison(baseline, current)
+
 
 def test_comparison_rejects_pre_v5_composition_identity():
     baseline, current = _make_run("baseline"), _make_run("current")
@@ -348,11 +479,13 @@ def test_comparison_rejects_pre_v5_composition_identity():
     with pytest.raises(ValueError):
         compute_comparison(baseline, current)
 
+
 def test_comparison_rejects_incoherent_case_and_count_inventory():
     baseline, current = _make_run("baseline"), _make_run("current")
     current.success_count = 2
     with pytest.raises(ValueError):
         compute_comparison(baseline, current)
+
 
 def test_comparison_rejects_incomplete_or_failed_case_inventory():
     baseline, current = _make_run("baseline"), _make_run("current")
@@ -364,11 +497,13 @@ def test_comparison_rejects_incomplete_or_failed_case_inventory():
     with pytest.raises(ValueError):
         compute_comparison(baseline, current)
 
+
 def test_comparison_rejects_noncanonical_sha256_identity():
     baseline, current = _make_run("baseline"), _make_run("current")
     current.test_set_digest = "UPPER"
     with pytest.raises(ValueError):
         compute_comparison(baseline, current)
+
 
 def test_comparison_recomputes_ordered_case_digests_and_metric_means():
     baseline, current = _make_run("baseline"), _make_run("current")
@@ -394,7 +529,10 @@ def test_expert_readme_documents_equal_invariant_and_distinct_full_fingerprints(
     text = open("plugins/expert/README.md", encoding="utf-8").read()
     normalized = " ".join(text.lower().split())
     assert "invariant fingerprints are equal" in normalized
-    assert "both full fingerprints are present, recomputable from the invariant plus mode" in normalized
+    assert (
+        "both full fingerprints are present, recomputable from the invariant plus mode"
+        in normalized
+    )
     assert "different for flat versus hierarchical" in normalized
     assert "both full fingerprints equal" not in normalized
 
@@ -406,8 +544,10 @@ class TestFormatComparison:
             current_id="current",
             deltas={
                 "faithfulness": MetricDelta(
-                    baseline=0.80, current=0.90,
-                    absolute_delta=0.10, percentage_change=12.5,
+                    baseline=0.80,
+                    current=0.90,
+                    absolute_delta=0.10,
+                    percentage_change=12.5,
                 ),
             },
         )

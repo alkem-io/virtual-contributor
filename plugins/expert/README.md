@@ -72,15 +72,23 @@ model-visible names while scoped retrieval remains available.
 Provider processing/minimization approval is a human `RG-05P` gate before
 display names may be enabled; this code does not grant or imply that approval.
 `RG-05` is the representative paired flat/on RAGAS gate. Its production and
-evaluation runs use the same immutable resolved v6 composition and an invariant plus
+evaluation runs use the same deeply immutable resolved v7 composition and an invariant plus
 mode-bound full non-secret fingerprint. Comparison fails closed unless invariant
 fingerprints are equal and both full fingerprints are present, recomputable from
 the invariant plus mode, and different for flat versus hierarchical runs.
 Evaluation case/dataset identity is `evaluation-case-identity/v1` and every
-case/aggregate metric must be a finite value in inclusive `[0,1]`. `SC-009`
+case/aggregate metric must be a finite value in inclusive `[0,1]`; successful
+cases have exactly faithfulness, answer relevancy, context precision, and
+context recall, and persist `evaluation-case-identity/v1`. The public Expert
+identity is validated before provider/scorer/file work. `SC-009`
 remains the full-suite regression gate, not an evaluation substitute. RG-05P,
 RG-05, and RG-06 remain human gates; hierarchy and display names remain off by
 default.
+
+`published-unacked` forbids application-managed raw republish and same-callback
+rerun; ambiguous ACK may still broker-redeliver and does not promise exactly
+once. Reject settlement faults log type only. All hierarchy controls remain
+default-off and RG-05P/RG-05/RG-06 stay human gates.
 
 The remediation is evidence for the pending review sequence only: round 05 is
 gated independently and rounds 06–07 are contingent human reviews. It does not

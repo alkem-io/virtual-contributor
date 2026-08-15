@@ -1,189 +1,192 @@
-"""Stable, non-secret description of an Expert pipeline composition.
-
-This deliberately describes behaviour, rather than serialising ``BaseConfig``.
-The latter made paired evaluation fingerprints depend on dormant settings and
-could accidentally grow to include a credential when configuration changes.
-"""
+"""Immutable, pre-factory authority for an Expert invocation."""
 
 from __future__ import annotations
 
 import hashlib
 import json
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any, Literal, cast
 
-from core.config import BaseConfig
-from core.provider_factory import DEFAULT_MODELS
 from core.adapters.openai_compatible_embeddings import _resolve_query_instruction
+from core.provider_factory import DEFAULT_MODELS
+
+if TYPE_CHECKING:
+    from core.config import BaseConfig
+
+Scalar = str | int | float | bool | None
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ResolvedExpertComposition:
-    """One frozen, non-secret Expert composition resolved before wiring.
+    """The sole, deeply immutable authority for one Expert construction.
 
-    ``config`` is the effective runtime view used by both production and
-    evaluation.  Its descriptor deliberately excludes credentials, endpoints
-    and request data; the frozen object itself is never persisted.
+    Both tuples contain only primitives.  ``plumbing`` is intentionally the
+    only place credentials/endpoints may occur; it is never serialized.  The
+    object does not retain a settings model or a factory adapter.
     """
 
-    config: BaseConfig
-    llm_config: BaseConfig
+    behavior: tuple[tuple[str, Scalar], ...]
+    dependency_identities: tuple[tuple[str, str], ...]
+    mode: Literal["flat", "hierarchical"]
+
+    def value(self, name: str) -> Scalar:
+        for key, value in self.behavior:
+            if key == name:
+                return value
+        raise AttributeError(name)
+
+    def __getattr__(self, name: str) -> Scalar:
+        # Hybrid retrieval is deliberately structural.  It receives this
+        # immutable authority, never a mutable BaseConfig compatibility view.
+        return self.value(name)
+
+
+@dataclass(frozen=True, slots=True)
+class ExpertPlumbing:
+    """Secret/endpoint-only wiring excluded from the public authority."""
+
+    values: tuple[tuple[str, Scalar], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedExpertWiring:
+    """One resolver result; factories share ``authority`` by identity."""
+
+    authority: ResolvedExpertComposition
+    plumbing: ExpertPlumbing
+
+
+def expert_runtime_config(
+    authority: ResolvedExpertComposition, plumbing: ExpertPlumbing,
+) -> BaseConfig:
+    """Transient adapter compatibility view with every behaviour set explicitly."""
+    from core.config import BaseConfig, LLMProvider
+    values = dict(authority.behavior) | dict(plumbing.values)
+    values["plugin_type"] = "expert"
+    values["expert_hierarchical_retrieval_enabled"] = authority.mode == "hierarchical"
+    values["llm_provider"] = LLMProvider(str(values["llm_provider"]))
+    return BaseConfig(**cast(dict[str, Any], values))
+
+
+# Everything read by the Expert plugin, its adapters, or its generated helper
+# dependencies.  New live knobs belong here in the same change as their use.
+_BEHAVIOR_FIELDS = (
+    "expert_n_results", "expert_min_score", "max_context_chars",
+    "expert_hierarchy_max_branches", "expert_hierarchy_display_names_enabled",
+    "answering_llm_temperature", "answering_chain_of_thought_enabled",
+    "llm_temperature", "llm_max_tokens", "llm_top_p", "llm_timeout",
+    "embeddings_query_max_utf8_bytes", "embeddings_max_attempts",
+    "embeddings_attempt_timeout_seconds", "embeddings_total_deadline_seconds",
+    "vector_db_distance_fn", "hybrid_retrieval_enabled", "hybrid_dense_weight",
+    "hybrid_lexical_weight", "hybrid_rrf_k", "hybrid_max_terms", "hybrid_min_term_len",
+    "rerank_enabled", "rerank_candidate_n", "rerank_top_k", "rerank_lexical_weight",
+    "routing_enabled", "routing_simple_n_results", "routing_complex_n_results",
+    "routing_complex_context_chars", "faithfulness_validation_enabled",
+    "query_rewrite_gating_enabled", "query_rewrite_max_expansion_ratio",
+    "query_rewrite_max_history_chars", "query_rewrite_max_utf8_bytes",
+)
+_PLUMBING_FIELDS = (
+    "llm_api_key", "llm_base_url", "embeddings_api_key", "embeddings_endpoint",
+    "vector_db_host", "vector_db_port", "vector_db_credentials", "tracing_enabled",
+)
+_DEPENDENCY_IDENTITIES = (
+    ("llm", "core.adapters.langchain_llm.LangChainLLMAdapter"),
+    ("embeddings", "core.adapters.openai_compatible_embeddings.OpenAICompatibleEmbeddingsAdapter"),
+    ("knowledge_store", "core.adapters.chromadb.ChromaDBAdapter"),
+    ("hybrid", "core.domain.hybrid_retrieval.retrieve"),
+    ("reranker", "core.domain.reranking.LexicalReranker"),
+    ("router", "core.domain.routing.RuleQueryClassifier"),
+    ("routing_table", "core.domain.routing.RetrievalProfile"),
+    ("faithfulness", "core.domain.faithfulness.ContextSufficiencyValidator"),
+    ("rewrite", "core.domain.query_rewrite.RewritePolicy"),
+)
 
 
 def resolve_expert_composition(
     config: BaseConfig, *, llm_config: BaseConfig | None = None,
-) -> ResolvedExpertComposition:
-    """Resolve provider/model/instruction defaults once for Expert wiring."""
+) -> ResolvedExpertWiring:
+    """Resolve config and plugin-LLM defaults exactly once, before factories."""
     effective_llm = llm_config or config
-    resolved_llm = effective_llm.model_copy(update={
-        "llm_model": effective_llm.llm_model or DEFAULT_MODELS[effective_llm.llm_provider],
-    })
-    model_name = config.embeddings_model_name or "qwen3-embedding-8b"
-    resolved = config.model_copy(update={
-        "llm_model": resolved_llm.llm_model,
-        "embeddings_model_name": model_name,
+    provider = effective_llm.llm_provider.value
+    llm_model = effective_llm.llm_model or DEFAULT_MODELS[effective_llm.llm_provider]
+    embedding_model = config.embeddings_model_name or "qwen3-embedding-8b"
+    history = getattr(config, "history_length", None)
+    values: dict[str, Scalar] = {name: getattr(config, name) for name in _BEHAVIOR_FIELDS}
+    values.update({
+        "llm_provider": provider,
+        "llm_model": llm_model,
+        "embeddings_model_name": embedding_model,
         "embeddings_query_instruction": _resolve_query_instruction(
-            model_name, config.embeddings_query_instruction,
+            embedding_model, config.embeddings_query_instruction,
         ),
+        "query_rewrite_max_history_turns": min(
+            config.query_rewrite_max_history_turns, history,
+        ) if history else config.query_rewrite_max_history_turns,
     })
-    return ResolvedExpertComposition(config=resolved, llm_config=resolved_llm)
-
-
-def _identity(value: object | None) -> str | None:
-    """Return a wrapper-independent implementation identity."""
-    while value is not None and type(value).__name__ in {
-        "TracingKnowledgeStore", "TracedKnowledgeStore",
-    }:
-        value = getattr(value, "_delegate", None)
-    if value is None:
-        return None
-    cls = type(value)
-    return f"{cls.__module__}.{cls.__qualname__}"
-
-
-def expert_composition_descriptor(
-    config: BaseConfig,
-    dependencies: dict[str, Any],
-    *,
-    embeddings: object | None = None,
-    llm_config: BaseConfig | None = None,
-) -> dict[str, Any]:
-    """Return the canonical Expert behaviour descriptor.
-
-    The hierarchy enable flag is intentionally absent: it is the paired-run
-    experiment variable. Display-name disclosure is retained because it
-    changes the context supplied to the answering model.
-    """
-    resolved = resolve_expert_composition(config, llm_config=llm_config)
-    config = resolved.config
-    effective_llm = resolved.llm_config
-    descriptor: dict[str, Any] = {
-        "expert": {
-            "n_results": config.expert_n_results,
-            "min_score": config.expert_min_score,
-            "max_context_chars": config.max_context_chars,
-            "hierarchy_max_branches": config.expert_hierarchy_max_branches,
-            "hierarchy_display_names_enabled": (
-                config.expert_hierarchy_display_names_enabled
-            ),
-        },
-        "answering": {
-            "temperature": config.answering_llm_temperature,
-            "chain_of_thought_enabled": config.answering_chain_of_thought_enabled,
-        },
-        "llm": {
-            "provider": effective_llm.llm_provider.value,
-            "model": effective_llm.llm_model,
-            "temperature": effective_llm.llm_temperature,
-            "max_tokens": effective_llm.llm_max_tokens,
-            "top_p": effective_llm.llm_top_p,
-            "timeout": effective_llm.llm_timeout,
-            "adapter": _identity(dependencies.get("llm")),
-        },
-        "knowledge_store": {
-            "distance_fn": config.vector_db_distance_fn,
-            "adapter": _identity(dependencies.get("knowledge_store")),
-        },
-    }
-    if embeddings is not None:
-        descriptor["embeddings"] = {
-            "model": config.embeddings_model_name,
-            "query_instruction": config.embeddings_query_instruction,
-            # These are live query-side safety controls, not deployment
-            # plumbing.  A paired evaluation with any one changed is no
-            # longer a hierarchy-only experiment.
-            "query_max_utf8_bytes": config.embeddings_query_max_utf8_bytes,
-            "max_attempts": config.embeddings_max_attempts,
-            "attempt_timeout_seconds": config.embeddings_attempt_timeout_seconds,
-            "total_deadline_seconds": config.embeddings_total_deadline_seconds,
-            "adapter": _identity(embeddings),
-        }
-    if config.hybrid_retrieval_enabled:
-        descriptor["hybrid"] = {
-            "dense_weight": config.hybrid_dense_weight,
-            "lexical_weight": config.hybrid_lexical_weight,
-            "rrf_k": config.hybrid_rrf_k,
-            "max_terms": config.hybrid_max_terms,
-            "min_term_len": config.hybrid_min_term_len,
-            "strategy": "core.domain.hybrid_retrieval.retrieve",
-        }
-    if config.rerank_enabled:
-        descriptor["rerank"] = {
-            "candidate_n": config.rerank_candidate_n,
-            "top_k": config.rerank_top_k,
-            "lexical_weight": config.rerank_lexical_weight,
-            "adapter": _identity(dependencies.get("reranker")),
-        }
-    if config.routing_enabled:
-        descriptor["routing"] = {
-            "simple_n_results": config.routing_simple_n_results,
-            "complex_n_results": config.routing_complex_n_results,
-            "complex_context_chars": config.routing_complex_context_chars,
-            "router": _identity(dependencies.get("query_router")),
-            "table": _identity(dependencies.get("routing_table")),
-        }
-    if config.faithfulness_validation_enabled:
-        descriptor["faithfulness"] = {
-            "validator": _identity(dependencies.get("faithfulness_validator")),
-        }
-    plugin_history = getattr(config, "history_length", None)
-    effective_history_turns = (
-        min(config.query_rewrite_max_history_turns, plugin_history)
-        if plugin_history else config.query_rewrite_max_history_turns
+    # Plugin overrides are the live LLM authority, not a later factory choice.
+    for name in ("llm_temperature", "llm_max_tokens", "llm_top_p", "llm_timeout"):
+        values[name] = getattr(effective_llm, name)
+    plumbing = tuple(sorted((name, getattr(effective_llm if name.startswith("llm_") else config, name)) for name in _PLUMBING_FIELDS))
+    mode: Literal["flat", "hierarchical"] = (
+        "hierarchical" if config.expert_hierarchical_retrieval_enabled else "flat"
     )
-    descriptor["rewrite"] = {
-        "gating_enabled": config.query_rewrite_gating_enabled,
-        "max_expansion_ratio": config.query_rewrite_max_expansion_ratio,
-        "max_history_turns": effective_history_turns,
-        "max_history_chars": config.query_rewrite_max_history_chars,
-        "max_utf8_bytes": config.query_rewrite_max_utf8_bytes,
-        "policy": _identity(dependencies.get("rewrite_policy")),
-    }
-    return descriptor
-
-
-def expert_composition_fingerprint(
-    config: BaseConfig,
-    dependencies: dict[str, Any],
-    *,
-    embeddings: object | None = None,
-    llm_config: BaseConfig | None = None,
-) -> str:
-    """Hash the canonical descriptor without credentials, endpoints or data."""
-    descriptor = expert_composition_descriptor(
-        config, dependencies, embeddings=embeddings, llm_config=llm_config,
+    identities = dict(_DEPENDENCY_IDENTITIES)
+    for name, enabled in (("reranker", values["rerank_enabled"]), ("router", values["routing_enabled"]), ("routing_table", values["routing_enabled"]), ("faithfulness", values["faithfulness_validation_enabled"]), ("rewrite", values["query_rewrite_gating_enabled"])):
+        if not enabled:
+            identities[name] = "none"
+    authority = ResolvedExpertComposition(
+        behavior=tuple(sorted(values.items())),
+        dependency_identities=tuple(sorted(identities.items())),
+        mode=mode,
     )
-    serialized = json.dumps(descriptor, sort_keys=True, separators=(",", ":"))
+    return ResolvedExpertWiring(authority=authority, plumbing=ExpertPlumbing(plumbing))
+
+
+def expert_composition_descriptor(composition: ResolvedExpertComposition) -> dict[str, object]:
+    """Serialize retained authority directly; mode is the sole exclusion."""
+    if not isinstance(composition, ResolvedExpertComposition):
+        raise TypeError("Expert descriptor requires ResolvedExpertComposition")
+    # The semantic grouping is stable for humans; its leaves are copied
+    # directly from the immutable authority, never from BaseConfig.
+    values = dict(composition.behavior)
+    deps = dict(composition.dependency_identities)
+    return {
+        "schema": "expert-composition/v7",
+        "expert": {key: values[key] for key in (
+            "expert_n_results", "expert_min_score", "max_context_chars",
+            "expert_hierarchy_max_branches", "expert_hierarchy_display_names_enabled",
+        )},
+        "answering": {key: values[key] for key in (
+            "answering_llm_temperature", "answering_chain_of_thought_enabled",
+        )},
+        "llm": {key: values[key] for key in (
+            "llm_provider", "llm_model", "llm_temperature", "llm_max_tokens", "llm_top_p", "llm_timeout",
+        )} | {"adapter": deps["llm"]},
+        "embeddings": {key: values[key] for key in (
+            "embeddings_model_name", "embeddings_query_instruction", "embeddings_query_max_utf8_bytes",
+            "embeddings_max_attempts", "embeddings_attempt_timeout_seconds", "embeddings_total_deadline_seconds",
+        )} | {"adapter": deps["embeddings"]},
+        "knowledge_store": {"distance_fn": values["vector_db_distance_fn"], "adapter": deps["knowledge_store"]},
+        "hybrid": {key: values[key] for key in (
+            "hybrid_retrieval_enabled", "hybrid_dense_weight", "hybrid_lexical_weight", "hybrid_rrf_k", "hybrid_max_terms", "hybrid_min_term_len",
+        )} | {"strategy": deps["hybrid"]},
+        "rerank": {key: values[key] for key in ("rerank_enabled", "rerank_candidate_n", "rerank_top_k", "rerank_lexical_weight")} | {"adapter": deps["reranker"]},
+        "routing": {key: values[key] for key in ("routing_enabled", "routing_simple_n_results", "routing_complex_n_results", "routing_complex_context_chars")} | {"router": deps["router"], "table": deps["routing_table"]},
+        "faithfulness": {"enabled": values["faithfulness_validation_enabled"], "validator": deps["faithfulness"]},
+        "rewrite": {key: values[key] for key in ("query_rewrite_gating_enabled", "query_rewrite_max_expansion_ratio", "query_rewrite_max_history_turns", "query_rewrite_max_history_chars", "query_rewrite_max_utf8_bytes")} | {"policy": deps["rewrite"]},
+    }
+
+
+def expert_composition_fingerprint(composition: ResolvedExpertComposition) -> str:
+    """Hash the immutable public authority without plumbing or a re-resolution."""
+    serialized = json.dumps(expert_composition_descriptor(composition), sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
 def expert_full_composition_fingerprint(invariant: str, mode: str) -> str:
-    """Bind a valid invariant composition fingerprint to its experiment mode."""
     if mode not in {"flat", "hierarchical"}:
         raise ValueError("Expert composition mode must be flat or hierarchical")
     if len(invariant) != 64 or any(c not in "0123456789abcdef" for c in invariant):
         raise ValueError("Expert invariant fingerprint must be a SHA-256 hex digest")
-    payload = {"schema": "expert-composition/v6", "invariant": invariant, "mode": mode}
-    return hashlib.sha256(
-        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
+    payload = {"schema": "expert-composition/v7", "invariant": invariant, "mode": mode}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()

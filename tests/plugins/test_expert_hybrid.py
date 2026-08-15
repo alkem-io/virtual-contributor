@@ -11,9 +11,73 @@ from tests.conftest import MockKnowledgeStorePort, MockLLMPort, make_input
 
 
 async def test_traced_hybrid_waiter_cancellation_preserves_single_flight_and_cleanup() -> None:
-    """The plugin-level seam retains the adapter-owned request lifecycle."""
     import asyncio
-    assert asyncio.shield is not None
+    import contextvars
+    from unittest.mock import patch
+    import httpx
+    from core.adapters.chromadb import ChromaDBAdapter
+    from core.adapters.openai_compatible_embeddings import OpenAICompatibleEmbeddingsAdapter
+    from core.tracing_knowledge_store import TracedKnowledgeStore
+
+    adapter = ChromaDBAdapter.__new__(ChromaDBAdapter)
+    adapter._query_embedding_cache = contextvars.ContextVar("traced-cancel", default=None)
+    first_started, release_first, second_started = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    attempts = 0
+    embeddings = OpenAICompatibleEmbeddingsAdapter.__new__(OpenAICompatibleEmbeddingsAdapter)
+    embeddings._query_instruction = ""
+    embeddings._query_max_utf8_bytes = 32768
+    embeddings._api_key, embeddings._endpoint, embeddings._model_name = "key", "http://provider", "model"
+    embeddings._max_attempts, embeddings._attempt_timeout_seconds, embeddings._total_deadline_seconds = 2, 5, 30
+    adapter._embeddings = embeddings
+
+    class Client:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): return None
+        async def post(self, *args, **kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                first_started.set()
+                await release_first.wait()
+                raise httpx.ConnectError("first attempt")
+            second_started.set()
+            await asyncio.Event().wait()
+
+    class Store(MockKnowledgeStorePort):
+        def query_embedding_scope(self):
+            return adapter.query_embedding_scope()
+        async def query(self, *args, **kwargs):
+            await adapter._embed_query(["same"])
+            return QueryResult([[]], [[]], [[]], [[]])
+        async def query_lexical(self, *args, **kwargs):
+            await adapter._embed_query(["same"])
+            return QueryResult([[]], [[]], [[]], [[]])
+
+    store = TracedKnowledgeStore(Store())
+    with patch("core.adapters.openai_compatible_embeddings.httpx.AsyncClient", return_value=Client()), patch(
+        "core.adapters.openai_compatible_embeddings.BASE_DELAY", 0,
+    ):
+        async with store.query_embedding_scope():
+            installer = asyncio.create_task(store.query("c", ["same"]))
+            await first_started.wait()
+            follower = asyncio.create_task(store.query_lexical("c", ["same"]))
+            installer.cancel()
+            follower.cancel()
+            import pytest
+            with pytest.raises(asyncio.CancelledError):
+                await installer
+            with pytest.raises(asyncio.CancelledError):
+                await follower
+            cache = adapter._query_embedding_cache.get()
+            assert cache is not None
+            provider = cache[("same",)]
+            assert isinstance(provider, asyncio.Task) and not provider.done()
+            release_first.set()
+            await second_started.wait()
+            assert not provider.done()  # both cancelled waiters left it owned by the scope
+        assert provider.done() and provider.cancelled()
+    assert attempts == 2
+    assert adapter._query_embedding_cache.get() is None
 
 
 @dataclass

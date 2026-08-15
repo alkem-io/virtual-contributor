@@ -28,7 +28,10 @@ from core.ports.knowledge_store import KnowledgeStorePort
 from core.ports.reranker import RerankerPort
 from core.registry import PluginRegistry
 from core.router import Router
-from plugins.expert.composition import expert_composition_fingerprint
+from plugins.expert.composition import (
+    ExpertPlumbing, ResolvedExpertComposition, expert_composition_fingerprint,
+    expert_runtime_config,
+)
 
 logger = logging.getLogger(__name__)
 GENERIC_PIPELINE_ERROR = "Error: unable to process request"
@@ -400,17 +403,21 @@ def _inject_answering_config(
 
 
 def _compose_expert_dependencies(
-    config: BaseConfig,
+    composition: ResolvedExpertComposition,
     deps: dict[str, Any],
     plugin_class: type,
     *,
+    plumbing: ExpertPlumbing,
     context_observer: object | None = None,
 ) -> inspect.Signature:
     """Apply every Expert setting at the one production/evaluation boundary."""
+    # The transient view feeds legacy helper signatures only; every Expert
+    # constructor kwarg below is explicitly read from immutable authority.
+    config = expert_runtime_config(composition, plumbing)
     sig = _inject_plugin_config(deps, plugin_class, config, None, None)
     _inject_answering_config(config, deps, sig)
     if "hybrid_config" in sig.parameters:
-        deps["hybrid_config"] = config
+        deps["hybrid_config"] = composition
     if "reranker" in deps:
         if "rerank_candidate_n" in sig.parameters:
             deps["rerank_candidate_n"] = config.rerank_candidate_n
@@ -447,16 +454,9 @@ def _compose_expert_dependencies(
     return sig
 
 
-def _expert_composition_fingerprint(
-    config: BaseConfig, deps: dict[str, Any], container: Container,
-) -> str:
-    """Build the shared paired-evaluation fingerprint from live adapters."""
-    return expert_composition_fingerprint(
-        config,
-        deps,
-        embeddings=container._bindings.get(EmbeddingsPort),
-        llm_config=_resolve_plugin_llm_config(config),
-    )
+def _expert_composition_fingerprint(composition: ResolvedExpertComposition) -> str:
+    """Serialize the already-resolved Expert authority; never reread config."""
+    return expert_composition_fingerprint(composition)
 
 
 def _resolve_plugin_llm_config(config: BaseConfig) -> BaseConfig:
@@ -499,12 +499,23 @@ def _resolve_plugin_llm_config(config: BaseConfig) -> BaseConfig:
     return BaseConfig(**merged)
 
 
-def _create_adapters(config: BaseConfig, container: Container) -> None:
+def _create_adapters(
+    config: BaseConfig | ResolvedExpertComposition, container: Container,
+    plumbing: ExpertPlumbing | None = None,
+) -> None:
     """Wire adapter instances into the container based on config."""
+    composition = config if isinstance(config, ResolvedExpertComposition) else None
+    runtime_config: BaseConfig
+    if composition is not None:
+        runtime_config = expert_runtime_config(composition, plumbing or ExpertPlumbing(()))
+    else:
+        assert isinstance(config, BaseConfig)
+        runtime_config = config
+    config = runtime_config
     # LLM adapter — unified provider factory with per-plugin override support
     from core.provider_factory import create_llm_adapter
 
-    effective_config = _resolve_plugin_llm_config(config)
+    effective_config = config if composition is not None else _resolve_plugin_llm_config(config)
     llm_adapter = create_llm_adapter(effective_config)
     container.register(LLMPort, llm_adapter)
     logger.info(
@@ -834,7 +845,13 @@ def build_message_handler(
                         await _publish_result(envelope)
                     except Exception:
                         logger.error("Failed to publish fallback error response")
-            await message.reject(requeue=False)  # type: ignore[union-attr]
+            try:
+                await message.reject(requeue=False)  # type: ignore[union-attr]
+            except Exception as reject_exc:
+                logger.error(
+                    "Retry reject settlement failed: error_type=%s",
+                    type(reject_exc).__name__, exc_info=False,
+                )
         else:
             logger.error(
                 "Message failed after %d attempts, discarding",
@@ -863,7 +880,13 @@ def build_message_handler(
                     # duplicate plugin execution and response delivery.
                     logger.error("Terminal error-result ACK failed: error_type=%s", type(ack_exc).__name__)
             else:
-                await message.reject(requeue=False)  # type: ignore[union-attr]
+                try:
+                    await message.reject(requeue=False)  # type: ignore[union-attr]
+                except Exception as reject_exc:
+                    logger.error(
+                        "Terminal reject settlement failed: error_type=%s",
+                        type(reject_exc).__name__, exc_info=False,
+                    )
 
     return on_message
 
@@ -872,6 +895,18 @@ async def _run(config: BaseConfig) -> None:
     """Main async entrypoint."""
     from core.adapters.rabbitmq import RabbitMQAdapter
 
+    # Expert resolves effective defaults once before any adapter or plugin
+    # factory.  The same view is later used for live wiring and identity.
+    expert_composition: ResolvedExpertComposition | None = None
+    expert_plumbing: ExpertPlumbing | None = None
+    if config.plugin_type.lower().replace("-", "_") == "expert":
+        from plugins.expert.composition import resolve_expert_composition
+        resolved_wiring = resolve_expert_composition(
+            config, llm_config=_resolve_plugin_llm_config(config),
+        )
+        expert_composition, expert_plumbing = resolved_wiring.authority, resolved_wiring.plumbing
+        config = expert_runtime_config(expert_composition, expert_plumbing)
+
     # Discover plugin
     registry = PluginRegistry()
     plugin_class = registry.discover(config.plugin_type)
@@ -879,7 +914,7 @@ async def _run(config: BaseConfig) -> None:
 
     # Wire adapters
     container = Container()
-    _create_adapters(config, container)
+    _create_adapters(expert_composition or config, container, expert_plumbing)
 
     # Create summarization LLM adapter if fully configured
     summarize_llm = None
@@ -949,7 +984,9 @@ async def _run(config: BaseConfig) -> None:
     plugin_name = config.plugin_type.lower().replace("-", "_") if config.plugin_type else ""
     expert_composed = plugin_name == "expert"
     if expert_composed:
-        sig = _compose_expert_dependencies(config, deps, plugin_class)
+        assert expert_composition is not None
+        assert expert_plumbing is not None
+        sig = _compose_expert_dependencies(expert_composition, deps, plugin_class, plumbing=expert_plumbing)
     else:
         sig = _inject_plugin_config(
             deps, plugin_class, config, summarize_llm, bok_llm,
@@ -1066,9 +1103,10 @@ async def _run(config: BaseConfig) -> None:
             logger.warning("GraphQL client not configured — missing API_ENDPOINT_PRIVATE_GRAPHQL, AUTH_ADMIN_EMAIL, or AUTH_ADMIN_PASSWORD")
     plugin = plugin_class(**deps)
     if expert_composed:
+        assert expert_composition is not None
         logger.info(
             "Expert composition fingerprint=%s",
-            _expert_composition_fingerprint(config, deps, container),
+            _expert_composition_fingerprint(expert_composition),
         )
 
     # Plugin lifecycle: startup

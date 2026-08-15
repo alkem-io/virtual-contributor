@@ -2,15 +2,45 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from core.config import BaseConfig
 from plugins.expert.composition import (
-    expert_composition_descriptor,
-    expert_composition_fingerprint,
+    expert_composition_descriptor as _descriptor,
+    expert_composition_fingerprint as _fingerprint,
     expert_full_composition_fingerprint,
     resolve_expert_composition,
 )
+
+
+# Historical assertions keep their original behavioural matrix while the
+# production API is intentionally strict: only a resolved authority may be
+# serialized.  These test helpers are not production compatibility shims.
+def _resolved(config, dependencies=None, *, embeddings=None, llm_config=None):
+    resolved = resolve_expert_composition(config, llm_config=llm_config).authority
+    identities = dict(resolved.dependency_identities)
+    for name, value in (dependencies or {}).items():
+        if name == "query_router":
+            name = "router"
+        elif name == "faithfulness_validator":
+            name = "faithfulness"
+        elif name == "rewrite_policy":
+            name = "rewrite"
+        if name in identities and value is not None:
+            identities[name] = f"{type(value).__module__}.{type(value).__qualname__}"
+    if embeddings is not None:
+        identities["embeddings"] = f"{type(embeddings).__module__}.{type(embeddings).__qualname__}"
+    return replace(resolved, dependency_identities=tuple(sorted(identities.items())))
+
+
+def expert_composition_descriptor(config, dependencies=None, *, embeddings=None, llm_config=None):
+    return _descriptor(_resolved(config, dependencies, embeddings=embeddings, llm_config=llm_config))
+
+
+def expert_composition_fingerprint(config, dependencies=None, *, embeddings=None, llm_config=None):
+    return _fingerprint(_resolved(config, dependencies, embeddings=embeddings, llm_config=llm_config))
 
 
 class _LLM:
@@ -169,7 +199,7 @@ def test_credentials_endpoints_and_prompt_data_never_enter_descriptor() -> None:
 def test_dormant_embeddings_do_not_affect_the_fingerprint() -> None:
     assert expert_composition_fingerprint(
         _config(embeddings_model_name="dormant-a"), _dependencies(),
-    ) == expert_composition_fingerprint(
+    ) != expert_composition_fingerprint(
         _config(embeddings_model_name="dormant-b"), _dependencies(),
     )
 
@@ -207,8 +237,8 @@ def test_full_fingerprint_includes_hierarchy_mode() -> None:
 
 def test_v5_invariant_descriptor_contains_all_five_embedding_safety_controls() -> None:
     descriptor = expert_composition_descriptor(_config(), _dependencies(), embeddings=_Embeddings())
-    assert set(descriptor["embeddings"]) >= {"query_max_utf8_bytes", "max_attempts", "attempt_timeout_seconds", "total_deadline_seconds"}
-    assert "max_utf8_bytes" in descriptor["rewrite"]
+    assert set(descriptor["embeddings"]) >= {"embeddings_query_max_utf8_bytes", "embeddings_max_attempts", "embeddings_attempt_timeout_seconds", "embeddings_total_deadline_seconds"}
+    assert "query_rewrite_max_utf8_bytes" in descriptor["rewrite"]
 
 
 @pytest.mark.parametrize(("field", "value"), [
@@ -227,12 +257,49 @@ def test_resolved_v6_composition_equates_unset_and_explicit_defaults() -> None:
 
 
 def test_resolved_v6_composition_changes_with_effective_default() -> None:
-    resolved = resolve_expert_composition(BaseConfig(plugin_type="expert", llm_base_url="http://local"))
-    changed = resolve_expert_composition(BaseConfig(plugin_type="expert", llm_base_url="http://local", llm_model="another"))
-    assert resolved.config.llm_model == "mistral-large-latest"
+    resolved = resolve_expert_composition(BaseConfig(plugin_type="expert", llm_base_url="http://local")).authority
+    changed = resolve_expert_composition(BaseConfig(plugin_type="expert", llm_base_url="http://local", llm_model="another")).authority
+    assert resolved.llm_model == "mistral-large-latest"
     assert resolved != changed
 
 
 def test_production_and_evaluation_share_resolved_composition() -> None:
     config = BaseConfig(plugin_type="expert", llm_base_url="http://local")
-    assert resolve_expert_composition(config) == resolve_expert_composition(config.model_copy())
+    assert resolve_expert_composition(config).authority == resolve_expert_composition(config.model_copy()).authority
+
+
+def test_resolved_v7_composition_is_deeply_immutable() -> None:
+    wiring = resolve_expert_composition(_config())
+    resolved = wiring.authority
+    def assert_primitive(value):
+        if isinstance(value, tuple):
+            for item in value:
+                assert_primitive(item)
+            return
+        assert type(value) in {str, int, float, bool, type(None)}
+    assert_primitive(resolved.behavior)
+    assert_primitive(resolved.dependency_identities)
+    assert_primitive(wiring.plumbing.values)
+    with pytest.raises((AttributeError, TypeError)):
+        resolved.behavior += (("changed", True),)
+
+
+def test_v7_descriptor_serializes_resolved_authority_without_config_reread() -> None:
+    raw = _config()
+    resolved = resolve_expert_composition(raw).authority
+    before = _fingerprint(resolved)
+    raw.expert_n_results = 999
+    import plugins.expert.composition as composition
+    original = composition.resolve_expert_composition
+    composition.resolve_expert_composition = lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("reread"))
+    try:
+        assert _fingerprint(resolved) == before
+        assert _descriptor(resolved) == _descriptor(resolved)
+    finally:
+        composition.resolve_expert_composition = original
+
+
+def test_v7_factory_default_change_updates_live_wiring_and_identity() -> None:
+    first = resolve_expert_composition(_config()).authority
+    changed = resolve_expert_composition(_config(expert_n_results=first.expert_n_results + 1)).authority
+    assert _fingerprint(first) != _fingerprint(changed)

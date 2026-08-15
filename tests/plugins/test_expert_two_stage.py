@@ -616,3 +616,93 @@ async def test_non_capable_store_preserves_legacy_query_calls() -> None:
     store = _store()
     await _plugin(store).handle(_event())  # type: ignore[arg-type]
     assert all(len(call) == 4 for call in store.query_calls)
+
+
+async def _production_separator_boundary(*, hierarchy: bool, graph: bool) -> None:
+    """C-57 real provider-visible boundary oracle for all four paths."""
+    from core.domain.prompts_shared import (
+        inter_block_budget_size,
+        join_document_blocks,
+        rendered_document_budget_size,
+    )
+
+    async def execute(budget: int):
+        observed: list[list[str]] = []
+        captured_result: list[object] = []
+        llm = MockLLMPort(response="answer")
+        if graph:
+            _CapturingGraphModel.calls = []
+            llm = LangChainLLMAdapter(_CapturingGraphModel())  # type: ignore[assignment]
+        plugin = ExpertPlugin(
+            llm, _store(), n_results=5,
+            hierarchical_retrieval_enabled=hierarchy,
+            hierarchy_display_names_enabled=hierarchy,
+            max_context_chars=budget, context_observer=observed.append,
+        )
+        original = plugin._enforce_context_budget
+        def capture(*args, **kwargs):
+            output = original(*args, **kwargs)
+            captured_result.append(output[1])
+            return output
+        plugin._enforce_context_budget = capture  # type: ignore[method-assign]
+        if graph:
+            response = await plugin.handle(make_input(
+                message="Alpha liability", bodyOfKnowledgeID="c", promptGraph=REAL_ANSWER_GRAPH,
+            ))
+            context = str(_CapturingGraphModel.calls[-1][0].content)
+        else:
+            response = await plugin.handle(_event())  # type: ignore[arg-type]
+            context = llm.calls[-1][0]["content"]
+        return observed[-1], context, response.sources, captured_result[-1]
+
+    blocks, _, sources, result = await execute(20_000)
+    # Fixed fixture oracle: Stage 1's overview selects a-sub; stage 2 keeps
+    # exactly these two rows in ranking order.  The hierarchy display is part
+    # of what the provider sees, not a post-hoc source decoration.
+    survivor_indices = [1, 2] if hierarchy else [0, 1, 2, 3]
+    expected_entries = [_entries()[index] for index in survivor_indices]
+    assert result.documents == [[entry["document"] for entry in expected_entries]]
+    assert result.ids == [[entry["id"] for entry in expected_entries]]
+    assert result.metadatas == [[entry["metadata"] for entry in expected_entries]]
+    assert result.distances == [[0.1 * (index + 1) for index in range(len(expected_entries))]]
+    expected_sources = ([] if graph and not hierarchy else [entry["metadata"].get("source", "") for entry in expected_entries])
+    assert [source.source for source in sources] == expected_sources
+    exact = sum(
+        rendered_document_budget_size(block, block.partition("\n")[2])
+        for block in blocks
+    ) + inter_block_budget_size(len(blocks))
+    equal_blocks, context, equal_sources, equal_result = await execute(exact)
+    over_blocks, over_context, over_sources, over_result = await execute(exact - 1)
+    joined = join_document_blocks(blocks)
+    assert equal_blocks == blocks
+    assert equal_result == result
+    assert [source.source for source in equal_sources] == expected_sources
+    over_entries = expected_entries[:-1]
+    assert over_result.documents == [[entry["document"] for entry in over_entries]]
+    assert over_result.ids == [[entry["id"] for entry in over_entries]]
+    assert over_result.metadatas == [[entry["metadata"] for entry in over_entries]]
+    assert over_result.distances == [[0.1 * (index + 1) for index in range(len(over_entries))]]
+    assert [source.source for source in over_sources] == ([] if graph and not hierarchy else [entry["metadata"].get("source", "") for entry in over_entries])
+    assert join_document_blocks(equal_blocks) == joined
+    if graph:
+        assert context == f"FINAL ANSWER CONTEXT:\n{joined}"
+        assert over_context == f"FINAL ANSWER CONTEXT:\n{join_document_blocks(over_blocks)}"
+    else:
+        assert joined in context
+        assert join_document_blocks(over_blocks) in over_context
+
+
+async def test_flat_simple_production_separator_budget_boundary_preserves_alignment() -> None:
+    await _production_separator_boundary(hierarchy=False, graph=False)
+
+
+async def test_hierarchy_simple_production_separator_budget_boundary_preserves_alignment() -> None:
+    await _production_separator_boundary(hierarchy=True, graph=False)
+
+
+async def test_flat_graph_production_separator_budget_boundary_preserves_alignment() -> None:
+    await _production_separator_boundary(hierarchy=False, graph=True)
+
+
+async def test_hierarchy_graph_production_separator_budget_boundary_preserves_alignment() -> None:
+    await _production_separator_boundary(hierarchy=True, graph=True)

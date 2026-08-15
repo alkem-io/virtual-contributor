@@ -2,12 +2,13 @@
 
 Unified microkernel engine with pluggable handlers for AI-powered virtual contributors. Consolidates 7 formerly standalone services into a single Python 3.12 codebase using a **microkernel + hexagonal (ports and adapters)** architecture.
 
-Expert evaluation resolves one frozen v6 composition before adapter wiring and
+Expert evaluation resolves one frozen deeply immutable v7 composition before adapter wiring and
 stores invariant plus mode-bound full composition fingerprints. It uses the
 public `evaluation-case-identity/v1` serializer and accepts only finite
 inclusive `[0,1]` case and aggregate metrics. Paired Expert
 comparison is fail-closed: it accepts only a failure-free flat-to-hierarchical
-v6 pair with matching canonical test-set, BoK, corpus-revision, and successful
+v7 pair with matching canonical test-set, BoK, corpus-revision, explicit
+`evaluation-case-identity/v1`, and successful
 case identities. Corpus revision is an audit token, not deployment or
 re-ingestion proof; privacy approval, evaluation, enablement, and rollout stay
 human gates.
@@ -18,7 +19,12 @@ deadlines. Compatible Chroma requests reuse only successful exact inputs within
 one request scope; provider tasks own successful cache publication and terminal
 eviction. Terminal results follow `unpublished` → `published-unacked` →
 `settled`, never raw-retrying after publication. Early-ACK tasks retrieve every
-terminal state with type-only diagnostics. Embedding failures never use flat
+terminal state with type-only diagnostics. `published-unacked` forbids
+application-managed raw republish or same-callback rerun, but an ambiguous ACK
+may be broker-redelivered and is not an exactly-once promise. Reject settlement
+faults are contained with type-only diagnostics. Expert identity is validated
+before provider/scorer/file work; each successful run has exactly four required
+finite unit metrics. Embedding failures never use flat
 fallback or RabbitMQ redelivery and receive a generic safe response.
 
 This remediation evidence supports only the pending review sequence: review
