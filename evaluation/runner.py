@@ -6,7 +6,6 @@ import asyncio
 import hashlib
 import json
 import logging
-import math
 import re
 import statistics
 import time
@@ -20,6 +19,7 @@ from evaluation.report import (
     EvaluationRun,
     MetricScores,
     SourceInfo,
+    finite_unit_metric,
 )
 
 logger = logging.getLogger(__name__)
@@ -61,8 +61,7 @@ class Scorer:
         for name in METRIC_NAMES:
             if name in df.columns:
                 val = df[name].iloc[0]
-                numeric = float(val) if val is not None else 0.0
-                scores[name] = numeric if math.isfinite(numeric) else 0.0
+                scores[name] = finite_unit_metric(0.0 if val is None else val)
 
         return scores
 
@@ -197,27 +196,41 @@ class EvaluationRunner:
         aggregate = self._compute_aggregate(cases)
 
         fingerprint = getattr(self._invoker, "composition_fingerprint", None)
-        # Test doubles and third-party invokers need not expose the optional
-        # protocol property; only persist an actual deterministic fingerprint.
         if not isinstance(fingerprint, str):
             fingerprint = None
-        invariant = getattr(self._invoker, "composition_fingerprint", None)
-        full = getattr(self._invoker, "full_composition_fingerprint", None)
-        mode = "hierarchical" if getattr(getattr(self._invoker, "_config", None), "expert_hierarchical_retrieval_enabled", False) else "flat"
+        identity = None
+        if normalized_plugin == "expert":
+            identity = getattr(self._invoker, "evaluation_identity", None)
+            if identity is None:
+                raise ValueError("Expert evaluation requires a complete public invoker identity")
+            mode = getattr(identity, "hierarchy_mode", None)
+            invariant = getattr(identity, "invariant_composition_fingerprint", None)
+            full = getattr(identity, "full_composition_fingerprint", None)
+            from plugins.expert.composition import expert_full_composition_fingerprint
+            if (
+                mode not in {"flat", "hierarchical"}
+                or not isinstance(invariant, str)
+                or not isinstance(full, str)
+                or full != expert_full_composition_fingerprint(invariant, mode)
+                or fingerprint != invariant
+            ):
+                raise ValueError("Expert evaluation identity is incomplete or contradictory")
+        else:
+            mode = invariant = full = None
         run = EvaluationRun(
             id=run_id,
             timestamp=ts.isoformat(),
             label=label,
             plugin_type=plugin_type,
             composition_fingerprint=fingerprint,
-            composition_identity_version=5 if normalized_plugin == "expert" else None,
-            hierarchy_mode=mode if normalized_plugin == "expert" else None,
+            composition_identity_version=6 if normalized_plugin == "expert" else None,
+            hierarchy_mode=mode,
             test_set_digest=canonical_test_set_digest(test_cases) if normalized_plugin == "expert" else None,
             body_of_knowledge_digest=hashlib.sha256((body_of_knowledge_id or "").encode("utf-8")).hexdigest() if normalized_plugin == "expert" else None,
             corpus_revision=corpus_revision if normalized_plugin == "expert" else None,
             successful_case_digests=[successful_case_digest(test_cases[c.index]) for c in cases if c.error is None] if normalized_plugin == "expert" else None,
-            invariant_composition_fingerprint=invariant if normalized_plugin == "expert" and isinstance(invariant, str) else None,
-            full_composition_fingerprint=full if normalized_plugin == "expert" and isinstance(full, str) else None,
+            invariant_composition_fingerprint=invariant,
+            full_composition_fingerprint=full,
             test_set_path=test_set_path,
             test_case_count=total,
             success_count=success_count,

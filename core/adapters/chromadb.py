@@ -60,11 +60,17 @@ class ChromaDBAdapter:
         try:
             yield
         finally:
-            pending = [value for value in cache.values() if isinstance(value, asyncio.Task) and not value.done()]
-            for task in pending:
-                task.cancel()
-            if pending:
-                await asyncio.gather(*pending, return_exceptions=True)
+            live = [value for value in cache.values() if isinstance(value, asyncio.Task)]
+            for task in live:
+                if not task.done():
+                    task.cancel()
+            if live:
+                # This also retrieves terminal exceptions, including a task
+                # which completed between collection and cancellation.
+                await asyncio.gather(*live, return_exceptions=True)
+            # A provider task owns cache publication while the scope exists;
+            # after every owned task has settled this request owns no state.
+            cache.clear()
             self._query_embedding_cache.reset(token)
 
     async def _embed_query(self, query_texts: list[str]) -> list[list[float]]:
@@ -87,14 +93,24 @@ class ChromaDBAdapter:
         # provider submission.
         task = asyncio.create_task(self._embeddings.embed_query(query_texts))
         cache[key] = task
-        try:
-            vectors = await asyncio.shield(task)
-        except BaseException:
+
+        def _complete_provider_task(completed: asyncio.Task[list[list[float]]]) -> None:
+            """Publish success or evict failure; waiters never own either."""
             if cache.get(key) is task:
-                cache.pop(key, None)
-            raise
-        cache[key] = vectors
-        return vectors
+                if completed.cancelled():
+                    cache.pop(key, None)
+                    return
+                try:
+                    vectors = completed.result()
+                except Exception:
+                    # Calling result() consumes a terminal exception even when
+                    # every waiter was cancelled before it finished.
+                    cache.pop(key, None)
+                else:
+                    cache[key] = vectors
+
+        task.add_done_callback(_complete_provider_task)
+        return await asyncio.shield(task)
 
     async def query(
         self,

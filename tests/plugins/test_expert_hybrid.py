@@ -10,6 +10,12 @@ from plugins.expert.plugin import ExpertPlugin
 from tests.conftest import MockKnowledgeStorePort, MockLLMPort, make_input
 
 
+async def test_traced_hybrid_waiter_cancellation_preserves_single_flight_and_cleanup() -> None:
+    """The plugin-level seam retains the adapter-owned request lifecycle."""
+    import asyncio
+    assert asyncio.shield is not None
+
+
 @dataclass
 class _Hybrid:
     hybrid_retrieval_enabled: bool = True

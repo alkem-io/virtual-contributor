@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 
 from core.config import BaseConfig
 from core.container import Container, ContainerError
@@ -15,6 +16,24 @@ from evaluation.tracing import TracingKnowledgeStore
 from plugins.expert.composition import expert_composition_fingerprint
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ExpertEvaluationIdentity:
+    """Atomic public identity for a concrete Expert evaluation invocation."""
+
+    hierarchy_mode: str
+    invariant_composition_fingerprint: str
+    full_composition_fingerprint: str
+
+    def __post_init__(self) -> None:
+        if self.hierarchy_mode not in {"flat", "hierarchical"}:
+            raise ValueError("Expert evaluation identity has an invalid hierarchy mode")
+        if any(
+            len(value) != 64 or any(char not in "0123456789abcdef" for char in value)
+            for value in (self.invariant_composition_fingerprint, self.full_composition_fingerprint)
+        ):
+            raise ValueError("Expert evaluation identity fingerprints must be SHA-256 digests")
 
 
 def effective_composition_fingerprint(config: BaseConfig) -> str:
@@ -49,6 +68,7 @@ class PipelineInvoker:
         self._llm_adapter = None
         self._composition_fingerprint = ""
         self._full_composition_fingerprint = ""
+        self._evaluation_identity: ExpertEvaluationIdentity | None = None
         self._generation_context_observer_wired = False
 
     async def setup(self) -> None:
@@ -110,6 +130,16 @@ class PipelineInvoker:
             self._composition_fingerprint,
             "hierarchical" if self._config.expert_hierarchical_retrieval_enabled else "flat",
         )
+        if self._plugin_type == "expert":
+            self._evaluation_identity = ExpertEvaluationIdentity(
+                hierarchy_mode=(
+                    "hierarchical"
+                    if self._config.expert_hierarchical_retrieval_enabled
+                    else "flat"
+                ),
+                invariant_composition_fingerprint=self._composition_fingerprint,
+                full_composition_fingerprint=self._full_composition_fingerprint,
+            )
 
         await self._plugin.startup()
         logger.info("Pipeline initialized: plugin=%s", self._plugin_type)
@@ -182,6 +212,13 @@ class PipelineInvoker:
         if not self._full_composition_fingerprint:
             raise RuntimeError("PipelineInvoker not set up. Call setup() first.")
         return self._full_composition_fingerprint
+
+    @property
+    def evaluation_identity(self) -> ExpertEvaluationIdentity:
+        """Return the complete public Expert identity after setup."""
+        if self._plugin_type != "expert" or self._evaluation_identity is None:
+            raise RuntimeError("PipelineInvoker has no Expert evaluation identity")
+        return self._evaluation_identity
 
     async def shutdown(self) -> None:
         if self._plugin is not None:

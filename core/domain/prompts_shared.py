@@ -150,6 +150,14 @@ def render_document_block(
     return f"[{' · '.join(label_parts)}]\n{content}"
 
 
+INTER_BLOCK_SEPARATOR = "\n\n"
+
+
+def inter_block_budget_size(block_count: int) -> int:
+    """Return the exact UTF-8 cost of joins between ``block_count`` blocks."""
+    return max(block_count - 1, 0) * len(INTER_BLOCK_SEPARATOR.encode("utf-8"))
+
+
 def rendered_document_budget_size(rendered_block: str, content: str) -> int:
     """Return raw content chars plus the rendered label's UTF-8 byte size.
 
@@ -199,4 +207,4 @@ def empty_context_instruction(has_context: bool) -> str:
 def join_document_blocks(blocks: Sequence[str]) -> str:
     """Join rendered blocks, or use the explicit no-material sentinel."""
 
-    return "\n\n".join(blocks) if blocks else EMPTY_CONTEXT_SENTINEL
+    return INTER_BLOCK_SEPARATOR.join(blocks) if blocks else EMPTY_CONTEXT_SENTINEL

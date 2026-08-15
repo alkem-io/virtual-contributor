@@ -260,6 +260,14 @@ def _log_config(config: BaseConfig, plugin_class: type | None = None) -> None:
         "faithfulness_validation_enabled",
         "query_rewrite_gating_enabled",
         "query_rewrite_max_expansion_ratio",
+        # Explicitly non-secret query-safety controls.  These values are part
+        # of the Expert v6 behaviour identity and are intentionally logged;
+        # no endpoint, credential, environment or request data is added.
+        "embeddings_query_max_utf8_bytes",
+        "query_rewrite_max_utf8_bytes",
+        "embeddings_max_attempts",
+        "embeddings_attempt_timeout_seconds",
+        "embeddings_total_deadline_seconds",
         "summary_chunk_threshold",
         "chunk_size",
         "chunk_overlap",
@@ -647,7 +655,10 @@ def build_message_handler(
                 from core.events.response import Response
                 error_response = Response(result=GENERIC_PIPELINE_ERROR)
                 envelope = router.build_response_envelope(error_response, event)
-                await _publish_result(envelope)
+                try:
+                    await _publish_result(envelope)
+                except Exception as publish_exc:
+                    logger.error("Early-ACK fallback publication failed: error_type=%s", type(publish_exc).__name__)
             except asyncio.TimeoutError as exc:
                 logger.error(
                     "Pipeline timed out after %ds for event type %s",
@@ -659,7 +670,10 @@ def build_message_handler(
                 from core.events.response import Response
                 error_response = Response(result=GENERIC_PIPELINE_ERROR)
                 envelope = router.build_response_envelope(error_response, event)
-                await _publish_result(envelope)
+                try:
+                    await _publish_result(envelope)
+                except Exception as publish_exc:
+                    logger.error("Early-ACK fallback publication failed: error_type=%s", type(publish_exc).__name__)
             except Exception as exc:
                 logger.error("Pipeline failed for event type %s: error_type=%s", type(event).__name__, type(exc).__name__)
                 if root is not None:
@@ -667,107 +681,111 @@ def build_message_handler(
                 from core.events.response import Response
                 error_response = Response(result=GENERIC_PIPELINE_ERROR)
                 envelope = router.build_response_envelope(error_response, event)
-                await _publish_result(envelope)
+                try:
+                    await _publish_result(envelope)
+                except Exception as publish_exc:
+                    logger.error("Early-ACK fallback publication failed: error_type=%s", type(publish_exc).__name__)
 
     def _task_done(task: asyncio.Task) -> None:
-        """Remove completed task from the active set."""
+        """Retrieve every early-ACK terminal state without rendering it."""
         active_tasks.discard(task)
+        if task.cancelled():
+            logger.warning("Early-ACK background task cancelled")
+            return
+        try:
+            task.result()
+        except Exception as exc:
+            # Never pass the exception object to logging: its message, cause
+            # and traceback may contain ingest content or provider details.
+            logger.error("Early-ACK background task failed: error_type=%s", type(exc).__name__)
 
     # Message handler — receives both body and raw message for ACK control
     async def on_message(
         body: dict,
         message: object,
     ) -> None:
-        event = None
         try:
             event = router.parse_event(body)
-
-            if _is_ingest_event(event):
-                # Early ACK: acknowledge before processing starts
-                await message.ack()  # type: ignore[union-attr]
-                logger.info(
-                    "Early-ACKed ingest message, scheduling async pipeline for %s",
-                    type(event).__name__,
-                )
-                task = asyncio.create_task(_run_pipeline(event))
-                active_tasks.add(task)
-                task.add_done_callback(_task_done)
-            else:
-                # Engine query: late ACK — process synchronously, then ACK
-                from core.tracing import (
-                    FailureMode,
-                    LLMInvocationTimeoutError,
-                    classify_failure,
-                    handle_span,
-                    record_failure,
-                    tracing_is_configured,
-                )
-
-                context = handle_span(config, event, plugin.name) if tracing_is_configured() else nullcontext(None)
-                published = False
-                with context as root:
-                    try:
-                        response = await asyncio.wait_for(
-                            plugin.handle(event),
-                            timeout=config.pipeline_timeout,
-                        )
-                        envelope = router.build_response_envelope(response, event)
-                        await _publish_result(envelope)
-                        published = True
-                        await message.ack()  # type: ignore[union-attr]
-                        if root is not None:
-                            from opentelemetry import trace
-
-                            from core.tracing import set_content_attribute
-                            set_content_attribute(root, "vc.message", getattr(event, "message", None), config)
-                            root.set_status(trace.Status(trace.StatusCode.OK))
-                    except LLMInvocationTimeoutError as exc:
-                        logger.error(
-                            "LLM provider timed out for %s", type(event).__name__
-                        )
-                        if root is not None:
-                            record_failure(root, exc, FailureMode.llm_error, config=config)
-                        await _retry_or_reject(
-                            message, body,
-                            event=event,
-                            error_text=GENERIC_PIPELINE_ERROR,
-                        )
-                    except asyncio.TimeoutError as exc:
-                        logger.error(
-                            "Handler timed out after %ds for %s",
-                            config.pipeline_timeout,
-                            type(event).__name__,
-                        )
-                        if root is not None:
-                            record_failure(root, exc, FailureMode.timeout, config=config)
-                        await _retry_or_reject(
-                            message, body,
-                            event=event,
-                            error_text=(
-                                f"Error: handler timed out after "
-                                f"{config.pipeline_timeout}s"
-                            ),
-                        )
-                    except Exception as exc:
-                        logger.error("Engine query failed: error_type=%s", type(exc).__name__)
-                        if root is not None:
-                            record_failure(root, exc, classify_failure(exc), config=config)
-                        # If the answer already reached the result queue and only
-                        # the ACK failed (e.g. a dropped channel), requeuing here
-                        # would re-run the plugin and deliver a second reply for
-                        # one user request. Leave redelivery to the broker.
-                        if not published:
-                            await _retry_or_reject(
-                                message, body,
-                                event=event,
-                                error_text=GENERIC_PIPELINE_ERROR,
-                                force_terminal=_is_embedding_error(exc),
-                                acknowledge_terminal=_is_permanent_embedding_error(exc),
-                            )
         except Exception as exc:
-            # parse_event failed — reject the message
+            # Parsing is the only operation that can enter raw-message retry.
             logger.error("Failed to parse message: error_type=%s", type(exc).__name__)
             await _retry_or_reject(message, body)
+            return
+
+        if _is_ingest_event(event):
+            # Early ACK: acknowledge before processing starts
+            await message.ack()  # type: ignore[union-attr]
+            logger.info(
+                "Early-ACKed ingest message, scheduling async pipeline for %s",
+                type(event).__name__,
+            )
+            task = asyncio.create_task(_run_pipeline(event))
+            active_tasks.add(task)
+            task.add_done_callback(_task_done)
+            return
+
+        # Engine query: explicit terminal delivery state.  A terminal result
+        # may be published exactly once; ACK failure must not re-enter raw
+        # retry and therefore cannot re-execute a member request.
+        from core.tracing import (
+            FailureMode,
+            LLMInvocationTimeoutError,
+            classify_failure,
+            handle_span,
+            record_failure,
+            tracing_is_configured,
+        )
+        context = handle_span(config, event, plugin.name) if tracing_is_configured() else nullcontext(None)
+        delivery_state = "unpublished"
+        with context as root:
+            try:
+                response = await asyncio.wait_for(
+                    plugin.handle(event), timeout=config.pipeline_timeout,
+                )
+                envelope = router.build_response_envelope(response, event)
+                await _publish_result(envelope)
+            except LLMInvocationTimeoutError as exc:
+                logger.error("LLM provider timed out for %s", type(event).__name__)
+                if root is not None:
+                    record_failure(root, exc, FailureMode.llm_error, config=config)
+                await _retry_or_reject(message, body, event=event, error_text=GENERIC_PIPELINE_ERROR)
+                return
+            except asyncio.TimeoutError as exc:
+                logger.error("Handler timed out after %ds for %s", config.pipeline_timeout, type(event).__name__)
+                if root is not None:
+                    record_failure(root, exc, FailureMode.timeout, config=config)
+                await _retry_or_reject(message, body, event=event, error_text=f"Error: handler timed out after {config.pipeline_timeout}s")
+                return
+            except Exception as exc:
+                logger.error("Engine query failed: error_type=%s", type(exc).__name__)
+                if root is not None:
+                    record_failure(root, exc, classify_failure(exc), config=config)
+                await _retry_or_reject(
+                    message, body, event=event, error_text=GENERIC_PIPELINE_ERROR,
+                    force_terminal=_is_embedding_error(exc),
+                    acknowledge_terminal=_is_permanent_embedding_error(exc),
+                )
+                return
+
+            delivery_state = "published-unacked"
+            try:
+                await message.ack()  # type: ignore[union-attr]
+            except Exception as exc:
+                logger.error("Terminal result ACK failed: error_type=%s", type(exc).__name__)
+                if root is not None:
+                    record_failure(root, exc, classify_failure(exc), config=config)
+                return
+            delivery_state = "settled"
+            if root is not None:
+                from opentelemetry import trace
+                from core.tracing import set_content_attribute
+                set_content_attribute(root, "vc.message", getattr(event, "message", None), config)
+                root.set_status(trace.Status(trace.StatusCode.OK))
+
+        # Keep the terminal states explicit and inspectable in the handler
+        # source without adding user or broker data to logs/spans.
+        assert delivery_state == "settled"
+        return
 
     async def _retry_or_reject(
         message: object,
@@ -822,6 +840,7 @@ def build_message_handler(
                 "Message failed after %d attempts, discarding",
                 max_retries,
             )
+            terminal_published = False
             if event is not None and error_text:
                 try:
                     from core.events.response import Response
@@ -830,10 +849,19 @@ def build_message_handler(
                         error_response, event,
                     )
                     await _publish_result(envelope)
+                    terminal_published = True
                 except Exception as pub_exc:
                     logger.error("Failed to publish terminal error response: error_type=%s", type(pub_exc).__name__)
-            if acknowledge_terminal:
-                await message.ack()  # type: ignore[union-attr]
+            # A terminal result is an actual delivery state: ACK only after
+            # confirmation.  On failed result publication retain broker-owned
+            # disposition rather than losing the only response.
+            if acknowledge_terminal and terminal_published:
+                try:
+                    await message.ack()  # type: ignore[union-attr]
+                except Exception as ack_exc:
+                    # The result is terminally published; raw retry here would
+                    # duplicate plugin execution and response delivery.
+                    logger.error("Terminal error-result ACK failed: error_type=%s", type(ack_exc).__name__)
             else:
                 await message.reject(requeue=False)  # type: ignore[union-attr]
 

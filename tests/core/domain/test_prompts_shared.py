@@ -13,7 +13,15 @@ from core.domain.prompts_shared import (
     join_document_blocks,
     render_document_block,
     rendered_document_budget_size,
+    inter_block_budget_size,
 )
+
+
+def test_context_budget_charges_exact_inter_block_separator_at_equality() -> None:
+    assert inter_block_budget_size(0) == 0
+    assert inter_block_budget_size(1) == 0
+    assert inter_block_budget_size(2) == 2
+    assert inter_block_budget_size(3) == 4
 
 
 def test_document_blocks_are_dense_one_based_and_visually_separated() -> None:

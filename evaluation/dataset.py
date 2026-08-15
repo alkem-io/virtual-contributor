@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
-import hashlib
 import logging
 from pathlib import Path
 
 from pydantic import BaseModel, Field
+
+from evaluation.case_identity import evaluation_case_digest, ordered_evaluation_case_digest
 
 logger = logging.getLogger(__name__)
 
@@ -24,15 +25,12 @@ class TestCase(BaseModel):
 
 def canonical_test_set_digest(cases: list[TestCase]) -> str:
     """Hash ordered canonical case JSON, independent of its source path."""
-    payload = [case.model_dump() for case in cases]
-    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    return ordered_evaluation_case_digest(cases)
 
 
 def successful_case_digest(case: TestCase) -> str:
     """Stable identity for the successful input case, excluding model output."""
-    encoded = json.dumps(case.model_dump(), ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    return evaluation_case_digest(case)
 
 
 def load_test_set(path: Path = DEFAULT_TEST_SET_PATH) -> list[TestCase]:

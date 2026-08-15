@@ -9,9 +9,44 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import dataclass
 from typing import Any
 
 from core.config import BaseConfig
+from core.provider_factory import DEFAULT_MODELS
+from core.adapters.openai_compatible_embeddings import _resolve_query_instruction
+
+
+@dataclass(frozen=True)
+class ResolvedExpertComposition:
+    """One frozen, non-secret Expert composition resolved before wiring.
+
+    ``config`` is the effective runtime view used by both production and
+    evaluation.  Its descriptor deliberately excludes credentials, endpoints
+    and request data; the frozen object itself is never persisted.
+    """
+
+    config: BaseConfig
+    llm_config: BaseConfig
+
+
+def resolve_expert_composition(
+    config: BaseConfig, *, llm_config: BaseConfig | None = None,
+) -> ResolvedExpertComposition:
+    """Resolve provider/model/instruction defaults once for Expert wiring."""
+    effective_llm = llm_config or config
+    resolved_llm = effective_llm.model_copy(update={
+        "llm_model": effective_llm.llm_model or DEFAULT_MODELS[effective_llm.llm_provider],
+    })
+    model_name = config.embeddings_model_name or "qwen3-embedding-8b"
+    resolved = config.model_copy(update={
+        "llm_model": resolved_llm.llm_model,
+        "embeddings_model_name": model_name,
+        "embeddings_query_instruction": _resolve_query_instruction(
+            model_name, config.embeddings_query_instruction,
+        ),
+    })
+    return ResolvedExpertComposition(config=resolved, llm_config=resolved_llm)
 
 
 def _identity(value: object | None) -> str | None:
@@ -39,7 +74,9 @@ def expert_composition_descriptor(
     experiment variable. Display-name disclosure is retained because it
     changes the context supplied to the answering model.
     """
-    effective_llm = llm_config or config
+    resolved = resolve_expert_composition(config, llm_config=llm_config)
+    config = resolved.config
+    effective_llm = resolved.llm_config
     descriptor: dict[str, Any] = {
         "expert": {
             "n_results": config.expert_n_results,
@@ -146,7 +183,7 @@ def expert_full_composition_fingerprint(invariant: str, mode: str) -> str:
         raise ValueError("Expert composition mode must be flat or hierarchical")
     if len(invariant) != 64 or any(c not in "0123456789abcdef" for c in invariant):
         raise ValueError("Expert invariant fingerprint must be a SHA-256 hex digest")
-    payload = {"schema": "expert-composition/v5", "invariant": invariant, "mode": mode}
+    payload = {"schema": "expert-composition/v6", "invariant": invariant, "mode": mode}
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()

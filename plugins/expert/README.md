@@ -6,8 +6,9 @@ Hierarchy is opt-in. Only a nonempty scoped Stage-2 result supplies PromptGraph
 sources; feature-off and all flat fallbacks retain empty graph sources. Legacy
 metadata retains its frozen rendering behavior, while hierarchy display names
 alone are UTF-8/control-character hardened. Compatible Chroma stores open one
-request-local embedding scope around Stage 1 and Stage 2/fallback, cache only
-successful exact inputs, and clear on exit. Typed embedding errors bypass flat
+request-local embedding scope around Stage 1 and Stage 2/fallback. Provider
+tasks own successful cache publication and terminal eviction, so waiter
+cancellation cannot evict live work or create a duplicate. Typed embedding errors bypass flat
 fallback and RabbitMQ redelivery; external error delivery is generic and safe.
 
 ## Overview
@@ -62,8 +63,8 @@ one flat attempt. A flat-path error is not hidden or retried by hierarchy logic.
 
 `EXPERT_HIERARCHY_DISPLAY_NAMES_ENABLED=false` by default and is independent
 of retrieval. When allowed, labels use only sanitized display names; they are
-rendered before context-budget eviction, and their model-visible bytes are
-charged before rows are dropped. With disclosure disabled or names unavailable,
+rendered before context-budget eviction, and their model-visible bytes plus the
+exact shared inter-block separator are charged before rows are dropped. With disclosure disabled or names unavailable,
 the hierarchy segment is omitted. Setting hierarchy retrieval to `false`
 restores flat retrieval; setting display names to `false` independently omits
 model-visible names while scoped retrieval remains available.
@@ -71,11 +72,19 @@ model-visible names while scoped retrieval remains available.
 Provider processing/minimization approval is a human `RG-05P` gate before
 display names may be enabled; this code does not grant or imply that approval.
 `RG-05` is the representative paired flat/on RAGAS gate. Its production and
-evaluation runs use the same effective composition and an invariant plus
+evaluation runs use the same immutable resolved v6 composition and an invariant plus
 mode-bound full non-secret fingerprint. Comparison fails closed unless invariant
 fingerprints are equal and both full fingerprints are present, recomputable from
 the invariant plus mode, and different for flat versus hierarchical runs.
-`SC-009` remains the full-suite regression gate, not an evaluation substitute.
+Evaluation case/dataset identity is `evaluation-case-identity/v1` and every
+case/aggregate metric must be a finite value in inclusive `[0,1]`. `SC-009`
+remains the full-suite regression gate, not an evaluation substitute. RG-05P,
+RG-05, and RG-06 remain human gates; hierarchy and display names remain off by
+default.
+
+The remediation is evidence for the pending review sequence only: round 05 is
+gated independently and rounds 06–07 are contingent human reviews. It does not
+authorize approval, enablement, deployment, or corpus mutation.
 
 ## Grounded, citable answers
 
@@ -135,6 +144,11 @@ cue routing is outside this plugin's scope.
 | `EXPERT_HIERARCHY_MAX_BRANCHES` | `3` | Route cap; only `2` or `3` are valid settings |
 | `EXPERT_HIERARCHY_DISPLAY_NAMES_ENABLED` | `false` | Separately enable sanitized display-name labels after RG-05P |
 | `MAX_CONTEXT_CHARS` | `20000` | Context budget — lowest-scoring chunks dropped first |
+| `EMBEDDINGS_QUERY_MAX_UTF8_BYTES` | `32768` | Startup-logged query byte cap |
+| `QUERY_REWRITE_MAX_UTF8_BYTES` | `4096` | Startup-logged rewrite byte cap |
+| `EMBEDDINGS_MAX_ATTEMPTS` | `3` | Startup-logged outer query attempts |
+| `EMBEDDINGS_ATTEMPT_TIMEOUT_SECONDS` | `20` | Startup-logged query attempt timeout |
+| `EMBEDDINGS_TOTAL_DEADLINE_SECONDS` | `45` | Startup-logged query total deadline |
 | `ANSWERING_LLM_TEMPERATURE` | unset | Optional per-answer temperature, validated from `0.0` to `2.0` |
 | `ANSWERING_CHAIN_OF_THOUGHT_ENABLED` | `true` | Enables conditional private reasoning for complex simple-RAG questions |
 

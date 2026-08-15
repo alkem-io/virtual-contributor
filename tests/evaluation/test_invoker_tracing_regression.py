@@ -3,6 +3,8 @@
 import ast
 from pathlib import Path
 
+import pytest
+
 from core.config import BaseConfig
 from core.container import Container
 from core.ports.knowledge_store import QueryResult
@@ -153,6 +155,20 @@ def test_effective_composition_fingerprint_is_stable_and_redacted() -> None:
     )
     secret_changed = BaseConfig(**shared, embeddings_endpoint="https://secret.invalid", embeddings_api_key="not-in-hash")
     assert effective_composition_fingerprint(flat) == effective_composition_fingerprint(secret_changed)
+
+
+def test_pipeline_invoker_exposes_immutable_public_evaluation_identity() -> None:
+    from dataclasses import FrozenInstanceError
+    from evaluation.pipeline_invoker import ExpertEvaluationIdentity
+    identity = ExpertEvaluationIdentity("flat", "a" * 64, "b" * 64)
+    with pytest.raises(FrozenInstanceError):
+        identity.hierarchy_mode = "hierarchical"
+
+
+def test_public_evaluation_identity_binds_mode_and_full_fingerprint() -> None:
+    from evaluation.pipeline_invoker import ExpertEvaluationIdentity
+    with pytest.raises(ValueError):
+        ExpertEvaluationIdentity("other", "a" * 64, "b" * 64)
 
 
 async def test_expert_cli_path_applies_actual_expert_retrieval_and_llm_values(monkeypatch) -> None:

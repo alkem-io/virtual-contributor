@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -103,8 +104,11 @@ class TestEvaluationRunner:
         from evaluation.runner import EvaluationRunner
 
         mock_pipeline_invoker.composition_fingerprint = "a" * 64
-        mock_pipeline_invoker.full_composition_fingerprint = "b" * 64
-        mock_pipeline_invoker._config.expert_hierarchical_retrieval_enabled = False
+        from plugins.expert.composition import expert_full_composition_fingerprint
+        mock_pipeline_invoker.evaluation_identity = SimpleNamespace(
+            hierarchy_mode="flat", invariant_composition_fingerprint="a" * 64,
+            full_composition_fingerprint=expert_full_composition_fingerprint("a" * 64, "flat"),
+        )
         run = await EvaluationRunner(mock_pipeline_invoker, mock_scorer, tmp_path).run(
             _make_test_cases(1), plugin_type="expert", body_of_knowledge_id="bok", corpus_revision="reingest-1",
         )
@@ -114,8 +118,11 @@ class TestEvaluationRunner:
         from evaluation.runner import EvaluationRunner
 
         mock_pipeline_invoker.composition_fingerprint = "a" * 64
-        mock_pipeline_invoker.full_composition_fingerprint = "b" * 64
-        mock_pipeline_invoker._config.expert_hierarchical_retrieval_enabled = False
+        from plugins.expert.composition import expert_full_composition_fingerprint
+        mock_pipeline_invoker.evaluation_identity = SimpleNamespace(
+            hierarchy_mode="flat", invariant_composition_fingerprint="a" * 64,
+            full_composition_fingerprint=expert_full_composition_fingerprint("a" * 64, "flat"),
+        )
         run = await EvaluationRunner(mock_pipeline_invoker, mock_scorer, tmp_path).run(
             _make_test_cases(2), plugin_type="expert", corpus_revision="reingest-1",
         )
@@ -204,3 +211,24 @@ class TestEvaluationRunner:
 
         assert run.failure_count == 1
         assert "Judge model unreachable" in run.cases[0].error
+
+    async def test_runner_rejects_invalid_metric_domain_before_persisting(self, mock_pipeline_invoker, mock_scorer, tmp_path):
+        from evaluation.runner import EvaluationRunner
+        mock_scorer.score.return_value = {"faithfulness": float("inf")}
+        run = await EvaluationRunner(mock_pipeline_invoker, mock_scorer, tmp_path).run(_make_test_cases(1), plugin_type="guidance")
+        assert run.failure_count == 1
+
+    async def test_runner_uses_public_identity_without_private_config(self, mock_pipeline_invoker, mock_scorer, tmp_path):
+        from types import SimpleNamespace
+        from evaluation.runner import EvaluationRunner
+        from plugins.expert.composition import expert_full_composition_fingerprint
+        invariant = "a" * 64
+        mock_pipeline_invoker.composition_fingerprint = invariant
+        mock_pipeline_invoker.evaluation_identity = SimpleNamespace(hierarchy_mode="flat", invariant_composition_fingerprint=invariant, full_composition_fingerprint=expert_full_composition_fingerprint(invariant, "flat"))
+        run = await EvaluationRunner(mock_pipeline_invoker, mock_scorer, tmp_path).run(_make_test_cases(1), plugin_type="expert", corpus_revision="r1")
+        assert run.hierarchy_mode == "flat"
+
+    async def test_runner_rejects_missing_or_contradictory_expert_identity(self, mock_pipeline_invoker, mock_scorer, tmp_path):
+        from evaluation.runner import EvaluationRunner
+        with pytest.raises(ValueError, match="identity"):
+            await EvaluationRunner(mock_pipeline_invoker, mock_scorer, tmp_path).run(_make_test_cases(1), plugin_type="expert", corpus_revision="r1")

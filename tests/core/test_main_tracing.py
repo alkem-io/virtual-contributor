@@ -34,6 +34,20 @@ def test_hierarchy_startup_log_reports_safe_enablement_and_cap(caplog) -> None:
     assert "EXPERT_HIERARCHY_DISPLAY_NAMES_ENABLED=False" in caplog.text
 
 
+def test_startup_log_reports_exact_embedding_query_safety_controls(caplog) -> None:
+    caplog.set_level(logging.INFO)
+    _log_config(BaseConfig(llm_base_url="http://local", embeddings_query_max_utf8_bytes=111, query_rewrite_max_utf8_bytes=99, embeddings_max_attempts=2, embeddings_attempt_timeout_seconds=3, embeddings_total_deadline_seconds=4))
+    for key, value in (("EMBEDDINGS_QUERY_MAX_UTF8_BYTES", 111), ("QUERY_REWRITE_MAX_UTF8_BYTES", 99), ("EMBEDDINGS_MAX_ATTEMPTS", 2), ("EMBEDDINGS_ATTEMPT_TIMEOUT_SECONDS", 3), ("EMBEDDINGS_TOTAL_DEADLINE_SECONDS", 4)):
+        assert f"{key}={value}" in caplog.text
+
+
+def test_startup_log_with_safety_controls_omits_secrets_and_dynamic_values(caplog) -> None:
+    caplog.set_level(logging.INFO)
+    _log_config(BaseConfig(llm_base_url="https://user:secret@example.test", embeddings_api_key="embedding-secret", llm_api_key="llm-secret"))
+    assert "embedding-secret" not in caplog.text
+    assert "llm-secret" not in caplog.text
+
+
 def test_url_userinfo_is_masked() -> None:
     assert _mask_sensitive("llm_base_url", "https://user:secret@llm.internal/v1") == "https://***@llm.internal/v1"
     assert _mask_sensitive("tracing_otlp_endpoint", "https://token@collector.internal/v1/traces") == "https://***@collector.internal/v1/traces"
@@ -288,6 +302,87 @@ async def test_failed_ack_does_not_republish_an_already_published_answer() -> No
         "a published answer was requeued after a failed ACK — the plugin will "
         "re-run and the user will receive a duplicate response"
     )
+
+
+async def test_terminal_embedding_publish_failure_never_acks_or_raw_republishes() -> None:
+    from core.ports.embeddings import EmbeddingInputError
+    async def handle(event):
+        raise EmbeddingInputError("private")
+    handler, _, _, transport = _wiring(handle)
+    transport.publish.side_effect = ConnectionError("publish failed")
+    message = _Message()
+    await handler(_query_body(), message)
+    assert not message.acked and message.rejected
+    assert transport.republish_with_headers.await_count == 0
+
+
+async def test_terminal_embedding_published_ack_failure_never_raw_republishes() -> None:
+    from core.ports.embeddings import EmbeddingInputError
+    class AckFails(_Message):
+        async def ack(self) -> None:
+            raise ConnectionError("ack")
+    async def handle(event):
+        raise EmbeddingInputError("private")
+    handler, _, _, transport = _wiring(handle)
+    await handler(_query_body(), AckFails())
+    assert transport.publish.await_count == 1
+    assert transport.republish_with_headers.await_count == 0
+
+
+async def test_terminal_embedding_delivery_states_are_explicit() -> None:
+    async def handle(event):
+        from core.events.response import Response
+        return Response(result="ok")
+    handler, _, _, transport = _wiring(handle)
+    message = _Message()
+    await handler(_query_body(), message)
+    assert message.acked and transport.publish.await_count == 1
+
+
+async def test_parse_failure_retry_is_scoped_before_handler_execution() -> None:
+    async def handle(event):
+        raise AssertionError("must not execute")
+    handler, _, _, transport = _wiring(handle)
+    message = _Message()
+    await handler({"bad": "event"}, message)
+    assert transport.republish_with_headers.await_count == 0
+    assert message.rejected
+
+
+async def _early_ack_dual_fault(plugin_type: str, body: dict) -> tuple[set, object]:
+    import asyncio
+    async def handle(event):
+        raise RuntimeError("sensitive-value")
+    handler, active, _, transport = _wiring(handle, plugin_type=plugin_type)
+    transport.publish.side_effect = ConnectionError("fallback-failure")
+    await handler(body, _Message())
+    while active:
+        await asyncio.gather(*tuple(active))
+        await asyncio.sleep(0)
+    return active, transport
+
+
+async def test_early_ack_website_dual_fault_retrieves_task_without_sensitive_egress(caplog) -> None:
+    caplog.set_level(logging.ERROR)
+    active, _ = await _early_ack_dual_fault("ingest-website", {"eventType": "IngestWebsite", "baseUrl": "https://example.test", "type": "website", "purpose": "knowledge", "personaId": "p"})
+    assert not active and "sensitive-value" not in caplog.text
+
+
+async def test_early_ack_space_dual_fault_retrieves_task_without_sensitive_egress(caplog) -> None:
+    caplog.set_level(logging.ERROR)
+    active, _ = await _early_ack_dual_fault("ingest-space", {"eventType": "IngestBodyOfKnowledge", "spaceId": "space", "type": "space", "purpose": "knowledge", "personaId": "p"})
+    assert not active and "sensitive-value" not in caplog.text
+
+
+async def test_early_ack_background_completion_logs_type_only(caplog) -> None:
+    caplog.set_level(logging.ERROR)
+    await _early_ack_dual_fault("ingest-website", {"eventType": "IngestWebsite", "baseUrl": "https://example.test", "type": "website", "purpose": "knowledge", "personaId": "p"})
+    assert "RuntimeError" in caplog.text and "sensitive-value" not in caplog.text
+
+
+async def test_early_ack_fallback_publication_failure_is_contained() -> None:
+    active, transport = await _early_ack_dual_fault("ingest-website", {"eventType": "IngestWebsite", "baseUrl": "https://example.test", "type": "website", "purpose": "knowledge", "personaId": "p"})
+    assert not active and transport.publish.await_count == 1
 
 
 async def _assert_sensitive_handler_boundary(traced_exporter) -> None:

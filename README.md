@@ -2,10 +2,12 @@
 
 Unified microkernel engine with pluggable handlers for AI-powered virtual contributors. Consolidates 7 formerly standalone services into a single Python 3.12 codebase using a **microkernel + hexagonal (ports and adapters)** architecture.
 
-Expert evaluation normalizes its selected plugin before adapter composition and
-stores invariant plus mode-bound full composition fingerprints. Paired Expert
+Expert evaluation resolves one frozen v6 composition before adapter wiring and
+stores invariant plus mode-bound full composition fingerprints. It uses the
+public `evaluation-case-identity/v1` serializer and accepts only finite
+inclusive `[0,1]` case and aggregate metrics. Paired Expert
 comparison is fail-closed: it accepts only a failure-free flat-to-hierarchical
-v5 pair with matching canonical test-set, BoK, corpus-revision, and successful
+v6 pair with matching canonical test-set, BoK, corpus-revision, and successful
 case identities. Corpus revision is an audit token, not deployment or
 re-ingestion proof; privacy approval, evaluation, enablement, and rollout stay
 human gates.
@@ -13,8 +15,16 @@ human gates.
 Query embeddings are bounded to 32768 UTF-8 bytes (rewrites to 4096), with up
 to three adapter-owned attempts under 20-second attempt and 45-second total
 deadlines. Compatible Chroma requests reuse only successful exact inputs within
-one request scope; embedding failures never use flat fallback or RabbitMQ
-redelivery and receive a generic safe response.
+one request scope; provider tasks own successful cache publication and terminal
+eviction. Terminal results follow `unpublished` → `published-unacked` →
+`settled`, never raw-retrying after publication. Early-ACK tasks retrieve every
+terminal state with type-only diagnostics. Embedding failures never use flat
+fallback or RabbitMQ redelivery and receive a generic safe response.
+
+This remediation evidence supports only the pending review sequence: review
+round 05 may begin after its independent gate, while rounds 06–07 remain
+contingent human reviews. It does not authorize enablement, deployment, or data
+mutation.
 
 ## Table of Contents
 
@@ -446,6 +456,11 @@ verdict, not for fetching it.
 | `EMBEDDINGS_API_KEY` | _(required for ingest)_ | API key for embedding service |
 | `EMBEDDINGS_ENDPOINT` | `https://api.scaleway.ai/v1` | Embedding API endpoint |
 | `EMBEDDINGS_MODEL_NAME` | `qwen3-embedding-8b` | Embedding model |
+| `EMBEDDINGS_QUERY_MAX_UTF8_BYTES` | `32768` | Logged query-input byte cap |
+| `QUERY_REWRITE_MAX_UTF8_BYTES` | `4096` | Logged rewrite-input byte cap |
+| `EMBEDDINGS_MAX_ATTEMPTS` | `3` | Logged outer query-attempt cap |
+| `EMBEDDINGS_ATTEMPT_TIMEOUT_SECONDS` | `20` | Logged per-attempt query timeout |
+| `EMBEDDINGS_TOTAL_DEADLINE_SECONDS` | `45` | Logged total query deadline |
 
 ### Ingest Pipeline
 

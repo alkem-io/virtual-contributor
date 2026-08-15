@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import re
-import hashlib
-import json
+import math
+import numbers
 import statistics
 
 from plugins.expert.composition import expert_full_composition_fingerprint
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class SourceInfo(BaseModel):
@@ -20,6 +20,16 @@ class SourceInfo(BaseModel):
     score: float | None = None
 
 
+def finite_unit_metric(value: object) -> float:
+    """Validate the public metric domain before it can become evidence."""
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        raise ValueError("Evaluation metric must be a finite real number")
+    numeric = float(value)
+    if not math.isfinite(numeric) or not 0 <= numeric <= 1:
+        raise ValueError("Evaluation metric must be within inclusive [0, 1]")
+    return numeric
+
+
 class MetricScores(BaseModel):
     """Per-metric scores for a single evaluation case."""
 
@@ -27,6 +37,11 @@ class MetricScores(BaseModel):
     answer_relevancy: float | None = None
     context_precision: float | None = None
     context_recall: float | None = None
+
+    @field_validator("faithfulness", "answer_relevancy", "context_precision", "context_recall", mode="before")
+    @classmethod
+    def _validate_metric(cls, value: object) -> object:
+        return None if value is None else finite_unit_metric(value)
 
 
 class EvaluationCase(BaseModel):
@@ -51,6 +66,11 @@ class AggregateMetrics(BaseModel):
     median: float
     min: float
     max: float
+
+    @field_validator("mean", "median", "min", "max", mode="before")
+    @classmethod
+    def _validate_metric(cls, value: object) -> float:
+        return finite_unit_metric(value)
 
 
 class EvaluationRun(BaseModel):
@@ -183,9 +203,9 @@ def compute_comparison(
         "invariant_composition_fingerprint", "full_composition_fingerprint",
     )
     if any(getattr(run, field) in (None, "") for run in runs for field in required):
-        raise ValueError("Evaluation runs lack complete v5 pairing identity")
-    if any(run.composition_identity_version != 5 for run in runs):
-        raise ValueError("Evaluation runs require v5 composition identity")
+        raise ValueError("Evaluation runs lack complete v6 pairing identity")
+    if any(run.composition_identity_version != 6 for run in runs):
+        raise ValueError("Evaluation runs require v6 composition identity")
     if baseline.plugin_type != "expert" or current.plugin_type != "expert":
         raise ValueError("Only Expert evaluation runs are comparable")
     if baseline.hierarchy_mode != "flat" or current.hierarchy_mode != "hierarchical":
@@ -232,19 +252,18 @@ _SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
 def _case_digest(case: EvaluationCase) -> str:
-    """Return the canonical input identity for one persisted successful case."""
-    payload = {
-        "expected_answer": case.expected_answer,
+    """Return the public v1 identity for one persisted successful case."""
+    from evaluation.case_identity import evaluation_case_digest
+
+    return evaluation_case_digest({
         "question": case.question,
+        "expected_answer": case.expected_answer,
         "relevant_documents": case.relevant_documents,
-    }
-    return hashlib.sha256(
-        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
+    })
 
 
 def _validate_persisted_run(run: EvaluationRun) -> None:
-    """Fail closed when persisted evidence is not a coherent v5 experiment."""
+    """Fail closed when persisted evidence is not a coherent v6 experiment."""
     if any(value < 0 for value in (run.test_case_count, run.success_count, run.failure_count)):
         raise ValueError("Evaluation counts must be nonnegative")
     if run.test_case_count != len(run.cases) or run.success_count + run.failure_count != run.test_case_count:
@@ -263,13 +282,15 @@ def _validate_persisted_run(run: EvaluationRun) -> None:
     digests = [_case_digest(case) for case in run.cases]
     if run.successful_case_digests != digests:
         raise ValueError("Evaluation successful case digests do not match cases")
-    dataset_payload = [
-        {"expected_answer": case.expected_answer, "question": case.question, "relevant_documents": case.relevant_documents}
+    from evaluation.case_identity import ordered_evaluation_case_digest
+    expected_dataset = ordered_evaluation_case_digest([
+        {
+            "question": case.question,
+            "expected_answer": case.expected_answer,
+            "relevant_documents": case.relevant_documents,
+        }
         for case in run.cases
-    ]
-    expected_dataset = hashlib.sha256(
-        json.dumps(dataset_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
+    ])
     if run.test_set_digest != expected_dataset:
         raise ValueError("Evaluation test-set digest does not match cases")
     if set(run.aggregate) != set(METRIC_NAMES):

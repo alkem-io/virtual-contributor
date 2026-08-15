@@ -12,6 +12,7 @@ from core.domain.prompts_shared import (
     citation_scope_instruction,
     empty_context_instruction,
     join_document_blocks,
+    inter_block_budget_size,
     render_document_block,
     rendered_document_budget_size,
 )
@@ -441,7 +442,7 @@ class ExpertPlugin:
         total_budget_size = sum(
             rendered_document_budget_size(rendered, content)
             for rendered, content in zip(docs, raw_docs_check)
-        )
+        ) + inter_block_budget_size(len(docs))
         if total_budget_size <= budget:
             return docs, filtered_result
 
@@ -457,7 +458,8 @@ class ExpertPlugin:
         for i, doc in enumerate(docs):
             raw_content = raw_docs[i] if i < len(raw_docs) else ""
             document_budget_size = rendered_document_budget_size(doc, raw_content)
-            if accumulated + document_budget_size > budget:
+            separator_size = inter_block_budget_size(len(kept_formatted) + 1) - inter_block_budget_size(len(kept_formatted))
+            if accumulated + separator_size + document_budget_size > budget:
                 break
             kept_formatted.append(doc)
             kept_docs.append(raw_content)
@@ -467,7 +469,7 @@ class ExpertPlugin:
                 kept_metadatas.append(raw_metadatas[i])
             if i < len(raw_ids):
                 kept_ids.append(raw_ids[i])
-            accumulated += document_budget_size
+            accumulated += separator_size + document_budget_size
 
         dropped = len(docs) - len(kept_formatted)
         dropped_budget = total_budget_size - accumulated

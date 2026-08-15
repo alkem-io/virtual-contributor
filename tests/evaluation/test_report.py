@@ -55,7 +55,7 @@ def _make_run(
         failure_count=0,
         duration_seconds=842.5,
         composition_fingerprint="matched-composition",
-        composition_identity_version=5,
+        composition_identity_version=6,
         hierarchy_mode=mode,
         test_set_digest=canonical_test_set_digest([case_input]),
         body_of_knowledge_digest="c" * 64,
@@ -142,7 +142,7 @@ class TestComputeComparison:
             baseline.invariant_composition_fingerprint = None
         else:
             current.invariant_composition_fingerprint = ""
-        with pytest.raises(ValueError, match="complete v5 pairing identity"):
+        with pytest.raises(ValueError, match="complete v6 pairing identity"):
             compute_comparison(baseline, current)
 
     def test_summary_count(self):
@@ -188,6 +188,55 @@ class TestFormatRunSummary:
 
 
 def test_comparison_accepts_complete_expert_flat_to_on_pair():
+    assert compute_comparison(_make_run("baseline"), _make_run("current")).deltas
+
+
+def test_rejects_nan_case_and_aggregate_metrics():
+    with pytest.raises(ValueError):
+        MetricScores(faithfulness=float("nan"))
+    with pytest.raises(ValueError):
+        AggregateMetrics(mean=float("nan"), median=0, min=0, max=0)
+
+
+def test_rejects_positive_and_negative_infinite_metrics():
+    for value in (float("inf"), float("-inf")):
+        with pytest.raises(ValueError):
+            MetricScores(context_precision=value)
+
+
+def test_rejects_finite_metrics_outside_inclusive_unit_interval():
+    for value in (-.01, 1.01, True, "0.5"):
+        with pytest.raises(ValueError):
+            MetricScores(context_recall=value)
+
+
+def test_accepts_exact_zero_and_one_metric_boundaries():
+    assert MetricScores(faithfulness=0, answer_relevancy=1).faithfulness == 0
+    assert AggregateMetrics(mean=0, median=1, min=0, max=1).max == 1
+
+
+def test_report_rejects_unknown_case_identity_version():
+    from evaluation.case_identity import CASE_IDENTITY_VERSION
+    assert CASE_IDENTITY_VERSION == "evaluation-case-identity/v1"
+    run = _make_run("baseline")
+    run.composition_identity_version = 5
+    with pytest.raises(ValueError, match="v6"):
+        compute_comparison(run, _make_run("current"))
+
+
+def test_case_schema_extension_cannot_diverge_producer_and_verifier():
+    from pydantic import BaseModel
+    from evaluation.case_identity import evaluation_case_identity_payload
+    class FutureCase(BaseModel):
+        question: str
+        expected_answer: str
+        relevant_documents: list[str]
+        required_future_field: str
+    with pytest.raises(ValueError, match="schema"):
+        evaluation_case_identity_payload(FutureCase(question="q", expected_answer="a", relevant_documents=["d"], required_future_field="x"))
+
+
+def test_v6_comparison_accepts_equivalent_default_representation():
     assert compute_comparison(_make_run("baseline"), _make_run("current")).deltas
 
 

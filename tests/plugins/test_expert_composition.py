@@ -9,6 +9,7 @@ from plugins.expert.composition import (
     expert_composition_descriptor,
     expert_composition_fingerprint,
     expert_full_composition_fingerprint,
+    resolve_expert_composition,
 )
 
 
@@ -217,3 +218,21 @@ def test_v5_invariant_descriptor_contains_all_five_embedding_safety_controls() -
 ])
 def test_each_embedding_safety_control_mutation_changes_the_invariant_fingerprint(field, value) -> None:
     assert expert_composition_fingerprint(_config(), _dependencies(), embeddings=_Embeddings()) != expert_composition_fingerprint(_config(**{field: value}), _dependencies(), embeddings=_Embeddings())
+
+
+def test_resolved_v6_composition_equates_unset_and_explicit_defaults() -> None:
+    unset = BaseConfig(plugin_type="expert", llm_base_url="http://local")
+    explicit = BaseConfig(plugin_type="expert", llm_base_url="http://local", llm_model="mistral-large-latest", embeddings_model_name="qwen3-embedding-8b")
+    assert expert_composition_fingerprint(unset, _dependencies(), embeddings=_Embeddings()) == expert_composition_fingerprint(explicit, _dependencies(), embeddings=_Embeddings())
+
+
+def test_resolved_v6_composition_changes_with_effective_default() -> None:
+    resolved = resolve_expert_composition(BaseConfig(plugin_type="expert", llm_base_url="http://local"))
+    changed = resolve_expert_composition(BaseConfig(plugin_type="expert", llm_base_url="http://local", llm_model="another"))
+    assert resolved.config.llm_model == "mistral-large-latest"
+    assert resolved != changed
+
+
+def test_production_and_evaluation_share_resolved_composition() -> None:
+    config = BaseConfig(plugin_type="expert", llm_base_url="http://local")
+    assert resolve_expert_composition(config) == resolve_expert_composition(config.model_copy())

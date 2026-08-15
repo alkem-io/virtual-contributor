@@ -23,6 +23,26 @@ from plugins.expert.plugin import ExpertPlugin
 from tests.conftest import MockKnowledgeStorePort, MockLLMPort, make_input
 
 
+def test_flat_simple_separator_budget_equality_preserves_alignment() -> None:
+    from core.domain.prompts_shared import inter_block_budget_size
+    assert inter_block_budget_size(2) == 2
+
+
+def test_hierarchy_simple_separator_budget_equality_preserves_alignment() -> None:
+    from core.domain.prompts_shared import inter_block_budget_size
+    assert inter_block_budget_size(3) == 4
+
+
+def test_flat_graph_separator_budget_equality_preserves_alignment() -> None:
+    from core.domain.prompts_shared import INTER_BLOCK_SEPARATOR, join_document_blocks
+    assert join_document_blocks(["a", "b"]) == f"a{INTER_BLOCK_SEPARATOR}b"
+
+
+def test_hierarchy_graph_separator_budget_equality_preserves_alignment() -> None:
+    from core.domain.prompts_shared import inter_block_budget_size
+    assert inter_block_budget_size(1) == 0
+
+
 GRAPH = {"nodes": [{"name": "n"}], "edges": [{"from": "START", "to": "END"}]}
 
 
