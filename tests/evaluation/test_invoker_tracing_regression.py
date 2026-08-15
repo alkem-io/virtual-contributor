@@ -105,7 +105,7 @@ async def test_invoker_nondefault_production_composition_and_fingerprint(monkeyp
         async def startup(self) -> None:
             pass
 
-    def compose(config: BaseConfig, container: Container, plumbing=None) -> None:
+    def compose(config: BaseConfig, container: Container, plumbing=None, selectors=None) -> None:
         container.register(LLMPort, object())
         container.register(KnowledgeStorePort, Store())
         container.register(RerankerPort, object())
@@ -159,10 +159,33 @@ def test_effective_composition_fingerprint_is_stable_and_redacted() -> None:
 
 
 async def test_production_wiring_consumes_single_resolved_v7_authority(monkeypatch) -> None:
-    # The public production seam resolves defaults before construction.
-    from plugins.expert.composition import resolve_expert_composition
-    resolved = resolve_expert_composition(BaseConfig(plugin_type="expert", llm_base_url="http://local")).authority
-    assert resolved.embeddings_model_name == "qwen3-embedding-8b"
+    """The real production adapter path consumes the resolved selector entry."""
+    from dataclasses import replace
+    from main import _create_adapters
+    from plugins.expert.composition import (
+        EXPERT_SELECTOR_REGISTRY, ExpertSelectorRegistry, resolve_expert_composition,
+    )
+
+    selected_llm = object()
+    registry = ExpertSelectorRegistry(tuple(
+        replace(entry, target=lambda _config: selected_llm)
+        if entry.name == "llm" else entry
+        for entry in EXPERT_SELECTOR_REGISTRY.entries
+    ))
+    wiring = resolve_expert_composition(
+        BaseConfig(plugin_type="expert", llm_base_url="http://local"),
+        selector_registry=registry,
+    )
+    container = Container()
+    _create_adapters(wiring.authority, container, wiring.plumbing, wiring.selectors)
+    assert container.resolve(LLMPort) is selected_llm
+    assert dict(wiring.authority.dependency_identities) == {
+        entry.name: (
+            "none" if entry.name in {"reranker", "router", "routing_table", "faithfulness", "rewrite"}
+            else entry.primitive_id
+        )
+        for entry in wiring.selectors.entries
+    }
 
 
 async def test_evaluation_wiring_consumes_single_resolved_v7_authority(monkeypatch) -> None:
@@ -175,7 +198,8 @@ async def test_evaluation_wiring_consumes_single_resolved_v7_authority(monkeypat
     class Plugin:
         def __init__(self, **kwargs): pass
         async def startup(self): pass
-    def adapters(authority, container: Container, plumbing=None):
+    def adapters(authority, container: Container, plumbing=None, selectors=None):
+        assert selectors is not None
         container.register(LLMPort, object())
         container.register(KnowledgeStorePort, Store())
     monkeypatch.setattr("main._create_adapters", adapters)

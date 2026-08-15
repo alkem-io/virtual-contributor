@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Callable, Literal, cast
 
 from core.adapters.openai_compatible_embeddings import _resolve_query_instruction
 from core.provider_factory import DEFAULT_MODELS
@@ -14,6 +14,41 @@ if TYPE_CHECKING:
     from core.config import BaseConfig
 
 Scalar = str | int | float | bool | None
+
+
+@dataclass(frozen=True, slots=True)
+class ExpertSelector:
+    """One stable public selector and the concrete object it selects."""
+
+    name: str
+    primitive_id: str
+    target: Callable[..., object]
+
+
+@dataclass(frozen=True, slots=True)
+class ExpertSelectorRegistry:
+    """Closed immutable registry for every Expert dependency selection."""
+
+    entries: tuple[ExpertSelector, ...]
+
+    def entry(self, name: str) -> ExpertSelector:
+        for entry in self.entries:
+            if entry.name == name:
+                return entry
+        raise KeyError(f"Unknown Expert selector: {name}")
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedExpertSelectors:
+    """The exact concrete entries selected with one resolved authority."""
+
+    entries: tuple[ExpertSelector, ...]
+
+    def entry(self, name: str) -> ExpertSelector:
+        for entry in self.entries:
+            if entry.name == name:
+                return entry
+        raise KeyError(f"Unknown resolved Expert selector: {name}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +89,71 @@ class ResolvedExpertWiring:
 
     authority: ResolvedExpertComposition
     plumbing: ExpertPlumbing
+    selectors: ResolvedExpertSelectors
+
+
+def _build_routing_table(
+    composition: ResolvedExpertComposition,
+    *,
+    n_results: int,
+    score_threshold: float,
+    max_context_chars: int,
+) -> dict[object, object]:
+    """Build Expert routing profiles from the already-resolved authority."""
+    from core.domain.routing import RetrievalProfile
+    from core.ports.query_router import RouteClass
+
+    def integer(name: str) -> int:
+        value = composition.value(name)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"Resolved Expert routing value {name} must be an integer")
+        return value
+
+    return {
+        RouteClass.CONVERSATIONAL: RetrievalProfile(False, n_results, score_threshold, max_context_chars),
+        RouteClass.SIMPLE: RetrievalProfile(
+            True, min(integer("routing_simple_n_results"), n_results),
+            score_threshold, max_context_chars,
+        ),
+        RouteClass.MODERATE: RetrievalProfile(True, n_results, score_threshold, max_context_chars),
+        RouteClass.COMPLEX: RetrievalProfile(
+            True, max(integer("routing_complex_n_results"), n_results),
+            score_threshold, max(integer("routing_complex_context_chars"), max_context_chars),
+        ),
+    }
+
+
+def _build_rewrite_policy() -> object | None:
+    """Build the optional rewrite gate without changing the disabled path."""
+    from main import _build_rewrite_policy as legacy_builder
+
+    return legacy_builder()
+
+
+def _selector_registry() -> ExpertSelectorRegistry:
+    """Construct the sole immutable registry of concrete Expert dependencies."""
+    from core.adapters.chromadb import ChromaDBAdapter
+    from core.adapters.openai_compatible_embeddings import OpenAICompatibleEmbeddingsAdapter
+    from core.domain.faithfulness import ContextSufficiencyValidator
+    from core.domain.hybrid_retrieval import retrieve
+    from core.domain.rerank import LexicalReranker
+    from core.domain.rule_classifier import RuleQueryClassifier
+    from core.provider_factory import create_llm_adapter
+
+    return ExpertSelectorRegistry(entries=(
+        ExpertSelector("llm", "expert.llm.adapter/v1", create_llm_adapter),
+        ExpertSelector("embeddings", "expert.embeddings.adapter/v1", OpenAICompatibleEmbeddingsAdapter),
+        ExpertSelector("knowledge_store", "expert.knowledge-store.adapter/v1", ChromaDBAdapter),
+        ExpertSelector("hybrid", "expert.hybrid.retrieve/v1", retrieve),
+        ExpertSelector("reranker", "expert.reranker.lexical/v1", LexicalReranker),
+        ExpertSelector("router", "expert.router.rule-classifier/v1", RuleQueryClassifier),
+        ExpertSelector("routing_table", "expert.routing-table.profile-builder/v1", _build_routing_table),
+        ExpertSelector("faithfulness", "expert.faithfulness.context-sufficiency/v1", ContextSufficiencyValidator),
+        ExpertSelector("rewrite", "expert.rewrite.policy-builder/v1", _build_rewrite_policy),
+    ))
+
+
+EXPERT_SELECTOR_REGISTRY = _selector_registry()
 
 
 def expert_runtime_config(
@@ -89,23 +189,12 @@ _PLUMBING_FIELDS = (
     "llm_api_key", "llm_base_url", "embeddings_api_key", "embeddings_endpoint",
     "vector_db_host", "vector_db_port", "vector_db_credentials", "tracing_enabled",
 )
-_DEPENDENCY_IDENTITIES = (
-    ("llm", "core.adapters.langchain_llm.LangChainLLMAdapter"),
-    ("embeddings", "core.adapters.openai_compatible_embeddings.OpenAICompatibleEmbeddingsAdapter"),
-    ("knowledge_store", "core.adapters.chromadb.ChromaDBAdapter"),
-    ("hybrid", "core.domain.hybrid_retrieval.retrieve"),
-    ("reranker", "core.domain.reranking.LexicalReranker"),
-    ("router", "core.domain.routing.RuleQueryClassifier"),
-    ("routing_table", "core.domain.routing.RetrievalProfile"),
-    ("faithfulness", "core.domain.faithfulness.ContextSufficiencyValidator"),
-    ("rewrite", "core.domain.query_rewrite.RewritePolicy"),
-)
-
-
 def resolve_expert_composition(
     config: BaseConfig, *, llm_config: BaseConfig | None = None,
+    selector_registry: ExpertSelectorRegistry | None = None,
 ) -> ResolvedExpertWiring:
     """Resolve config and plugin-LLM defaults exactly once, before factories."""
+    selector_registry = selector_registry or EXPERT_SELECTOR_REGISTRY
     effective_llm = llm_config or config
     provider = effective_llm.llm_provider.value
     llm_model = effective_llm.llm_model or DEFAULT_MODELS[effective_llm.llm_provider]
@@ -130,7 +219,8 @@ def resolve_expert_composition(
     mode: Literal["flat", "hierarchical"] = (
         "hierarchical" if config.expert_hierarchical_retrieval_enabled else "flat"
     )
-    identities = dict(_DEPENDENCY_IDENTITIES)
+    selected = ResolvedExpertSelectors(selector_registry.entries)
+    identities = {entry.name: entry.primitive_id for entry in selected.entries}
     for name, enabled in (("reranker", values["rerank_enabled"]), ("router", values["routing_enabled"]), ("routing_table", values["routing_enabled"]), ("faithfulness", values["faithfulness_validation_enabled"]), ("rewrite", values["query_rewrite_gating_enabled"])):
         if not enabled:
             identities[name] = "none"
@@ -139,7 +229,11 @@ def resolve_expert_composition(
         dependency_identities=tuple(sorted(identities.items())),
         mode=mode,
     )
-    return ResolvedExpertWiring(authority=authority, plumbing=ExpertPlumbing(plumbing))
+    return ResolvedExpertWiring(
+        authority=authority,
+        plumbing=ExpertPlumbing(plumbing),
+        selectors=selected,
+    )
 
 
 def expert_composition_descriptor(composition: ResolvedExpertComposition) -> dict[str, object]:

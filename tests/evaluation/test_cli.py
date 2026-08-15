@@ -6,19 +6,29 @@ from click.testing import CliRunner
 from evaluation.cli import cli
 
 
-def test_cli_never_renders_missing_required_metric_as_zero():
-    from evaluation.report import canonical_metric_scores
-    import pytest
+def test_cli_never_renders_missing_required_metric_as_zero(tmp_path, monkeypatch):
+    """The real list command labels unavailable evidence instead of zeroing it."""
+    import json
 
-    with pytest.raises(ValueError):
-        canonical_metric_scores(
-            {
-                "faithfulness": None,
-                "answer_relevancy": 0.2,
-                "context_precision": 0.2,
-                "context_recall": 0.2,
-            }
-        )
+    directory = tmp_path / "evaluations"
+    directory.mkdir()
+    (directory / "malformed.json").write_text("{")
+    (directory / "partial.json").write_text(json.dumps({
+        "id": "partial", "plugin_type": "expert", "test_case_count": 1,
+        "success_count": 1, "failure_count": 0,
+        "aggregate": {"faithfulness": {"mean": 0.2}},
+    }))
+    (directory / "failed.json").write_text(json.dumps({
+        "id": "failed", "plugin_type": "expert", "test_case_count": 1,
+        "success_count": 0, "failure_count": 1, "aggregate": {},
+    }))
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(cli, ["list"])
+    assert result.exit_code == 0
+    assert "invalid" in result.output
+    assert "incomplete" in result.output
+    assert "N/A" in result.output
+    assert "0.000" not in result.output
 
 
 def _run_command(monkeypatch, plugin: str, *extra: str) -> dict[str, object]:

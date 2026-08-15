@@ -269,6 +269,8 @@ def test_production_and_evaluation_share_resolved_composition() -> None:
 
 
 def test_resolved_v7_composition_is_deeply_immutable() -> None:
+    from plugins.expert.composition import EXPERT_SELECTOR_REGISTRY
+
     wiring = resolve_expert_composition(_config())
     resolved = wiring.authority
     def assert_primitive(value):
@@ -282,6 +284,12 @@ def test_resolved_v7_composition_is_deeply_immutable() -> None:
     assert_primitive(wiring.plumbing.values)
     with pytest.raises((AttributeError, TypeError)):
         resolved.behavior += (("changed", True),)
+    assert {entry.name for entry in EXPERT_SELECTOR_REGISTRY.entries} >= {
+        "reranker", "router", "routing_table", "faithfulness", "rewrite",
+    }
+    assert all(entry.primitive_id.startswith("expert.") for entry in wiring.selectors.entries)
+    with pytest.raises((AttributeError, TypeError)):
+        wiring.selectors.entries += ()
 
 
 def test_v7_descriptor_serializes_resolved_authority_without_config_reread() -> None:
@@ -300,6 +308,41 @@ def test_v7_descriptor_serializes_resolved_authority_without_config_reread() -> 
 
 
 def test_v7_factory_default_change_updates_live_wiring_and_identity() -> None:
-    first = resolve_expert_composition(_config()).authority
-    changed = resolve_expert_composition(_config(expert_n_results=first.expert_n_results + 1)).authority
-    assert _fingerprint(first) != _fingerprint(changed)
+    from core.container import Container
+    from core.ports.reranker import RerankerPort
+    from main import _create_adapters
+    from plugins.expert.composition import EXPERT_SELECTOR_REGISTRY, ExpertSelectorRegistry
+
+    class FirstReranker:
+        def __init__(self, *, lexical_weight):
+            self.lexical_weight = lexical_weight
+
+    class ChangedReranker(FirstReranker):
+        pass
+
+    def registry_for(target, primitive_id):
+        return ExpertSelectorRegistry(tuple(
+            replace(entry, target=target, primitive_id=primitive_id)
+            if entry.name == "reranker" else
+            replace(entry, target=lambda _config: object())
+            if entry.name == "llm" else entry
+            for entry in EXPERT_SELECTOR_REGISTRY.entries
+        ))
+
+    config = _config(rerank_enabled=True)
+    first_wiring = resolve_expert_composition(
+        config, selector_registry=registry_for(FirstReranker, "expert.reranker.first/v1"),
+    )
+    changed_wiring = resolve_expert_composition(
+        config, selector_registry=registry_for(ChangedReranker, "expert.reranker.changed/v1"),
+    )
+    first_container, changed_container = Container(), Container()
+    _create_adapters(
+        first_wiring.authority, first_container, first_wiring.plumbing, first_wiring.selectors,
+    )
+    _create_adapters(
+        changed_wiring.authority, changed_container, changed_wiring.plumbing, changed_wiring.selectors,
+    )
+    assert isinstance(first_container.resolve(RerankerPort), FirstReranker)
+    assert isinstance(changed_container.resolve(RerankerPort), ChangedReranker)
+    assert _fingerprint(first_wiring.authority) != _fingerprint(changed_wiring.authority)

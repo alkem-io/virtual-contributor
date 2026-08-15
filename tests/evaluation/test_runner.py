@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -40,43 +41,92 @@ def _expert_identity() -> SimpleNamespace:
     )
 
 
+class _Result:
+    def __init__(self, scores):
+        self.scores = scores
+
+    def to_pandas(self):
+        raise AssertionError("Scorer must use RAGAS score records, not combined pandas rows")
+
+
+def _install_ragas_result(monkeypatch, result) -> None:
+    """Install the minimal real RAGAS 0.4.3 result seam used by Scorer."""
+    class Dataset:
+        def __init__(self, *, samples):
+            self.samples = samples
+
+    class Sample:
+        def __init__(self, **kwargs):
+            self.values = kwargs
+
+    def evaluate(**kwargs):
+        assert isinstance(kwargs["dataset"], Dataset)
+        return result
+
+    monkeypatch.setitem(sys.modules, "ragas", SimpleNamespace(
+        evaluate=evaluate, EvaluationDataset=Dataset, SingleTurnSample=Sample,
+    ))
+
+
 async def test_scorer_maps_real_ragas_metric_names_to_exact_required_inventory(
     monkeypatch,
+    tmp_path,
 ) -> None:
-    from evaluation.report import canonical_metric_scores
+    from evaluation.runner import EvaluationRunner, Scorer
 
-    assert (
-        canonical_metric_scores(
-            {
-                "faithfulness": 0,
-                "answer_relevancy": 1,
-                "llm_context_precision_without_reference": 0.5,
-                "context_recall": 0.5,
-            }
-        )["context_precision"]
-        == 0.5
-    )
+    class Result:
+        scores = [{
+            "faithfulness": 0,
+            "answer_relevancy": 1,
+            "llm_context_precision_without_reference": 0.5,
+            "context_recall": 0.5,
+        }]
+
+        def to_pandas(self):
+            raise AssertionError("combined dataset frame must not be read as metrics")
+
+    _install_ragas_result(monkeypatch, Result())
+    scorer = Scorer([])
+    assert (await scorer.score("q", "a", "expected", ["context"]))["context_precision"] == 0.5
+
+    invoker = AsyncMock()
+    invoker.invoke.return_value = ("a", ["context"], [])
+    run = await EvaluationRunner(invoker, scorer, tmp_path).run(_make_test_cases(1), "guidance")
+    assert run.success_count == 1 and (tmp_path / f"{run.id}.json").exists()
 
 
-async def test_scorer_rejects_missing_required_metric_without_none_coercion() -> None:
-    from evaluation.report import canonical_metric_scores
+async def test_scorer_rejects_missing_required_metric_without_none_coercion(monkeypatch) -> None:
+    from evaluation.runner import Scorer
 
     with pytest.raises(ValueError):
-        canonical_metric_scores({"faithfulness": 0.1})
+        _install_ragas_result(monkeypatch, _Result([{"faithfulness": 0.1}]))
+        await Scorer([]).score("q", "a", "expected", [])
+    with pytest.raises(ValueError):
+        _install_ragas_result(monkeypatch, _Result([]))
+        await Scorer([]).score("q", "a", "expected", [])
+    with pytest.raises(ValueError):
+        _install_ragas_result(monkeypatch, _Result([{}, {}]))
+        await Scorer([]).score("q", "a", "expected", [])
 
 
-async def test_scorer_rejects_null_required_metric_without_zero_coercion() -> None:
-    from evaluation.report import canonical_metric_scores
+async def test_scorer_rejects_null_required_metric_without_zero_coercion(monkeypatch) -> None:
+    from evaluation.runner import Scorer
 
     with pytest.raises(ValueError):
-        canonical_metric_scores(
-            {
+        _install_ragas_result(monkeypatch, _Result([{
                 "faithfulness": 0.1,
                 "answer_relevancy": 0.1,
                 "llm_context_precision_without_reference": None,
                 "context_recall": 0.1,
-            }
-        )
+        }]))
+        await Scorer([]).score("q", "a", "expected", [])
+    with pytest.raises(ValueError):
+        _install_ragas_result(monkeypatch, _Result([{
+            "faithfulness": 0.1, "answer_relevancy": 0.1,
+            "llm_context_precision_without_reference": 0.1, "context_recall": 0.1,
+            "dataset_question": "q",
+        }]))
+        await Scorer([]).score("q", "a", "expected", [])
 
 
 async def test_runner_does_not_persist_incomplete_metric_case_as_success(

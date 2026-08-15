@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import math
+import json
 import numbers
 import statistics
 
@@ -107,6 +108,39 @@ class EvaluationRun(BaseModel):
     duration_seconds: float
     aggregate: dict[str, AggregateMetrics]
     cases: list[EvaluationCase]
+
+
+def load_comparison_run(raw_json: str) -> EvaluationRun:
+    """Strictly import an untrusted v7 comparison artifact.
+
+    Historical display/list reads intentionally keep ``EvaluationRun``
+    permissive.  Comparison is different: reject undeclared run or case keys
+    from the raw JSON object before Pydantic can normalize or discard them.
+    """
+    try:
+        raw = json.loads(raw_json)
+    except json.JSONDecodeError as exc:
+        raise ValueError("Comparison run JSON is malformed") from exc
+    if not isinstance(raw, dict):
+        raise ValueError("Comparison run JSON must be an object")
+
+    unknown_run = set(raw) - set(EvaluationRun.model_fields)
+    if unknown_run:
+        raise ValueError("Comparison run contains unknown fields")
+    cases = raw.get("cases")
+    if not isinstance(cases, list):
+        raise ValueError("Comparison run cases must be a list")
+    allowed_case_fields = set(EvaluationCase.model_fields)
+    for case in cases:
+        if not isinstance(case, dict):
+            raise ValueError("Comparison run case must be an object")
+        if set(case) - allowed_case_fields:
+            raise ValueError("Comparison run case contains unknown fields")
+
+    run = EvaluationRun.model_validate(raw)
+    if run.composition_identity_version != 7:
+        raise ValueError("Comparison runs require v7 composition identity")
+    return run
 
 
 class MetricDelta(BaseModel):

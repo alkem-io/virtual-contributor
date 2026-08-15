@@ -29,7 +29,8 @@ from core.ports.reranker import RerankerPort
 from core.registry import PluginRegistry
 from core.router import Router
 from plugins.expert.composition import (
-    ExpertPlumbing, ResolvedExpertComposition, expert_composition_fingerprint,
+    ExpertPlumbing, ResolvedExpertComposition, ResolvedExpertSelectors,
+    expert_composition_fingerprint,
     expert_runtime_config,
 )
 
@@ -408,6 +409,7 @@ def _compose_expert_dependencies(
     plugin_class: type,
     *,
     plumbing: ExpertPlumbing,
+    selectors: ResolvedExpertSelectors,
     context_observer: object | None = None,
 ) -> inspect.Signature:
     """Apply every Expert setting at the one production/evaluation boundary."""
@@ -424,17 +426,17 @@ def _compose_expert_dependencies(
         if "rerank_top_k" in sig.parameters:
             deps["rerank_top_k"] = config.rerank_top_k
     if config.routing_enabled and "query_router" in sig.parameters:
-        deps["query_router"] = RuleQueryClassifier()
+        deps["query_router"] = selectors.entry("router").target()
         if "routing_table" in sig.parameters:
-            deps["routing_table"] = _build_routing_table(
-                config,
+            deps["routing_table"] = selectors.entry("routing_table").target(
+                composition,
                 n_results=deps.get("n_results", config.expert_n_results),
                 score_threshold=deps.get("score_threshold", config.expert_min_score),
                 max_context_chars=deps.get("max_context_chars", config.max_context_chars),
             )
     if "faithfulness_validator" in sig.parameters:
         deps["faithfulness_validator"] = (
-            ContextSufficiencyValidator()
+            selectors.entry("faithfulness").target()
             if config.faithfulness_validation_enabled else None
         )
     if "max_expansion_ratio" in sig.parameters:
@@ -446,7 +448,7 @@ def _compose_expert_dependencies(
     if "max_history_chars" in sig.parameters:
         deps["max_history_chars"] = config.query_rewrite_max_history_chars
     if "rewrite_policy" in sig.parameters and config.query_rewrite_gating_enabled:
-        policy = _build_rewrite_policy()
+        policy = selectors.entry("rewrite").target()
         if policy is not None:
             deps["rewrite_policy"] = policy
     if context_observer is not None and "context_observer" in sig.parameters:
@@ -502,6 +504,7 @@ def _resolve_plugin_llm_config(config: BaseConfig) -> BaseConfig:
 def _create_adapters(
     config: BaseConfig | ResolvedExpertComposition, container: Container,
     plumbing: ExpertPlumbing | None = None,
+    selectors: ResolvedExpertSelectors | None = None,
 ) -> None:
     """Wire adapter instances into the container based on config."""
     composition = config if isinstance(config, ResolvedExpertComposition) else None
@@ -516,7 +519,8 @@ def _create_adapters(
     from core.provider_factory import create_llm_adapter
 
     effective_config = config if composition is not None else _resolve_plugin_llm_config(config)
-    llm_adapter = create_llm_adapter(effective_config)
+    llm_factory = selectors.entry("llm").target if selectors is not None else create_llm_adapter
+    llm_adapter = llm_factory(effective_config)
     container.register(LLMPort, llm_adapter)
     logger.info(
         "LLM provider: %s | model: %s | base_url: %s",
@@ -529,9 +533,14 @@ def _create_adapters(
     if config.embeddings_api_key and config.embeddings_endpoint:
         from core.adapters.openai_compatible_embeddings import OpenAICompatibleEmbeddingsAdapter
 
+        embeddings_factory = (
+            selectors.entry("embeddings").target
+            if selectors is not None else OpenAICompatibleEmbeddingsAdapter
+        )
+
         container.register(
             EmbeddingsPort,
-            OpenAICompatibleEmbeddingsAdapter(
+            embeddings_factory(
                 api_key=config.embeddings_api_key,
                 endpoint=config.embeddings_endpoint,
                 model_name=config.embeddings_model_name or "qwen3-embedding-8b",
@@ -547,8 +556,13 @@ def _create_adapters(
     if config.vector_db_host:
         from core.adapters.chromadb import ChromaDBAdapter
 
+        store_factory = (
+            selectors.entry("knowledge_store").target
+            if selectors is not None else ChromaDBAdapter
+        )
+
         embeddings_adapter = container._bindings.get(EmbeddingsPort)
-        knowledge_store: KnowledgeStorePort = ChromaDBAdapter(
+        knowledge_store: KnowledgeStorePort = store_factory(
             host=config.vector_db_host,
             port=config.vector_db_port,
             credentials=config.vector_db_credentials,
@@ -574,9 +588,10 @@ def _create_adapters(
     # which is what makes disabling it a true rollback rather than a second
     # code path that merely resembles the old one.
     if config.rerank_enabled:
+        reranker_factory = selectors.entry("reranker").target if selectors is not None else LexicalReranker
         container.register(
             RerankerPort,
-            LexicalReranker(lexical_weight=config.rerank_lexical_weight),
+            reranker_factory(lexical_weight=config.rerank_lexical_weight),
         )
 
 
@@ -899,12 +914,15 @@ async def _run(config: BaseConfig) -> None:
     # factory.  The same view is later used for live wiring and identity.
     expert_composition: ResolvedExpertComposition | None = None
     expert_plumbing: ExpertPlumbing | None = None
+    expert_selectors: ResolvedExpertSelectors | None = None
     if config.plugin_type.lower().replace("-", "_") == "expert":
         from plugins.expert.composition import resolve_expert_composition
         resolved_wiring = resolve_expert_composition(
             config, llm_config=_resolve_plugin_llm_config(config),
         )
-        expert_composition, expert_plumbing = resolved_wiring.authority, resolved_wiring.plumbing
+        expert_composition, expert_plumbing, expert_selectors = (
+            resolved_wiring.authority, resolved_wiring.plumbing, resolved_wiring.selectors,
+        )
         config = expert_runtime_config(expert_composition, expert_plumbing)
 
     # Discover plugin
@@ -914,7 +932,7 @@ async def _run(config: BaseConfig) -> None:
 
     # Wire adapters
     container = Container()
-    _create_adapters(expert_composition or config, container, expert_plumbing)
+    _create_adapters(expert_composition or config, container, expert_plumbing, expert_selectors)
 
     # Create summarization LLM adapter if fully configured
     summarize_llm = None
@@ -986,7 +1004,11 @@ async def _run(config: BaseConfig) -> None:
     if expert_composed:
         assert expert_composition is not None
         assert expert_plumbing is not None
-        sig = _compose_expert_dependencies(expert_composition, deps, plugin_class, plumbing=expert_plumbing)
+        assert expert_selectors is not None
+        sig = _compose_expert_dependencies(
+            expert_composition, deps, plugin_class,
+            plumbing=expert_plumbing, selectors=expert_selectors,
+        )
     else:
         sig = _inject_plugin_config(
             deps, plugin_class, config, summarize_llm, bok_llm,

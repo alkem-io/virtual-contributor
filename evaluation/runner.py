@@ -55,9 +55,17 @@ class Scorer:
         dataset = EvaluationDataset(samples=[sample])
 
         result = await asyncio.to_thread(evaluate, dataset=dataset, metrics=self._metrics)
-        df = result.to_pandas()
-
-        return canonical_metric_scores({str(name): df[name].iloc[0] for name in df.columns})
+        # RAGAS 0.4.3 deliberately combines the input dataset and scores in
+        # ``to_pandas()``.  Its native ``scores`` member is the score-only
+        # record inventory, so read it directly rather than mistaking dataset
+        # columns for metrics.
+        score_records = getattr(result, "scores", None)
+        if not isinstance(score_records, list) or len(score_records) != 1:
+            raise ValueError("RAGAS evaluation result must contain exactly one score record")
+        record = score_records[0]
+        if not isinstance(record, dict):
+            raise ValueError("RAGAS score record must be an object")
+        return canonical_metric_scores({str(name): value for name, value in record.items()})
 
 
 class EvaluationRunner:

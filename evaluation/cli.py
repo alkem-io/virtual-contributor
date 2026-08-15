@@ -12,10 +12,10 @@ import click
 
 from evaluation.dataset import load_test_set
 from evaluation.report import (
-    EvaluationRun,
     format_run_summary,
     compute_comparison,
     format_comparison,
+    load_comparison_run,
 )
 
 
@@ -151,8 +151,8 @@ def compare(baseline_id: str, current_id: str):
         sys.exit(1)
 
     try:
-        baseline = EvaluationRun.model_validate_json(baseline_path.read_text())
-        current = EvaluationRun.model_validate_json(current_path.read_text())
+        baseline = load_comparison_run(baseline_path.read_text())
+        current = load_comparison_run(current_path.read_text())
     except (ValueError, OSError) as exc:
         click.echo(f"Failed to load run files: {exc}", err=True)
         sys.exit(1)
@@ -196,26 +196,54 @@ def list_runs():
         return
 
     click.echo("Evaluation Runs:")
-    header = f"  {'ID':<36}{'Plugin':<12}{'Cases':>6}{'Faith.':>8}{'Relev.':>8}{'Prec.':>8}{'Recall':>8}"
+    header = f"  {'ID':<36}{'Plugin':<12}{'Cases':>6}{'State':<12}{'Faith.':>8}{'Relev.':>8}{'Prec.':>8}{'Recall':>8}"
     click.echo(header)
 
     for f in run_files:
         try:
             data = json.loads(f.read_text())
-            run_id = data.get("id", f.stem)
-            plugin = data.get("plugin_type", "?")
-            cases = data.get("test_case_count", 0)
-            agg = data.get("aggregate", {})
-
-            faith = agg.get("faithfulness", {}).get("mean", 0)
-            relev = agg.get("answer_relevancy", {}).get("mean", 0)
-            prec = agg.get("context_precision", {}).get("mean", 0)
-            recall = agg.get("context_recall", {}).get("mean", 0)
-
+            run_id = str(data.get("id", f.stem))
+            plugin = str(data.get("plugin_type", "?"))
+            cases = data.get("test_case_count", "?")
+            state, metrics = _list_run_state(data)
             click.echo(
-                f"  {run_id:<36}{plugin:<12}{cases:>6}{faith:>8.3f}{relev:>8.3f}{prec:>8.3f}{recall:>8.3f}"
+                f"  {run_id:<36}{plugin:<12}{str(cases):>6}{state:<12}"
+                f"{metrics[0]:>8}{metrics[1]:>8}{metrics[2]:>8}{metrics[3]:>8}"
             )
-        except (json.JSONDecodeError, Exception) as exc:
+        except json.JSONDecodeError:
+            click.echo(f"  {f.stem:<36}{'?':<12}{'?':>6}{'invalid':<12}{'N/A':>8}{'N/A':>8}{'N/A':>8}{'N/A':>8}")
+        except Exception as exc:
             click.echo(f"  {f.stem:<36} — error reading: {exc}")
 
     click.echo(f"\n{len(run_files)} runs found in evaluations/")
+
+
+def _list_run_state(data: object) -> tuple[str, tuple[str, str, str, str]]:
+    """Classify display-only artifacts without inventing absent scores."""
+    unavailable = ("N/A", "N/A", "N/A", "N/A")
+    if not isinstance(data, dict):
+        return "invalid", unavailable
+    counts = (data.get("test_case_count"), data.get("success_count"), data.get("failure_count"))
+    if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in counts):
+        return "invalid", unavailable
+    total, successful, failed = counts
+    if successful + failed != total:
+        return "invalid", unavailable
+    aggregate = data.get("aggregate")
+    if successful == 0 and failed == total and aggregate == {}:
+        return "N/A", unavailable
+    if not isinstance(aggregate, dict):
+        return "invalid", unavailable
+    names = ("faithfulness", "answer_relevancy", "context_precision", "context_recall")
+    if set(aggregate) != set(names):
+        return "incomplete", unavailable
+    values: list[str] = []
+    for name in names:
+        value = aggregate[name]
+        if not isinstance(value, dict) or set(value) < {"mean", "median", "min", "max"}:
+            return "incomplete", unavailable
+        mean = value["mean"]
+        if isinstance(mean, bool) or not isinstance(mean, (int, float)):
+            return "invalid", unavailable
+        values.append(f"{mean:.3f}")
+    return "complete", tuple(values)  # type: ignore[return-value]

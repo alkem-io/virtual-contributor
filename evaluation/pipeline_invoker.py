@@ -15,7 +15,8 @@ from core.registry import PluginRegistry
 from evaluation.tracing import TracingKnowledgeStore
 from plugins.expert.composition import (
     ResolvedExpertComposition, expert_composition_fingerprint,
-    ExpertPlumbing, expert_runtime_config, resolve_expert_composition,
+    ExpertPlumbing, ResolvedExpertSelectors, expert_runtime_config,
+    resolve_expert_composition,
 )
 
 logger = logging.getLogger(__name__)
@@ -68,6 +69,7 @@ class PipelineInvoker:
         self._config = selected
         self._expert_composition: ResolvedExpertComposition | None = None
         self._expert_plumbing: ExpertPlumbing | None = None
+        self._expert_selectors: ResolvedExpertSelectors | None = None
         self._body_of_knowledge_id = body_of_knowledge_id
         self._plugin = None
         self._tracing_store: TracingKnowledgeStore | None = None
@@ -96,10 +98,17 @@ class PipelineInvoker:
             resolved_wiring = resolve_expert_composition(
                 self._config, llm_config=__import__("main")._resolve_plugin_llm_config(self._config),
             )
-            self._expert_composition, self._expert_plumbing = resolved_wiring.authority, resolved_wiring.plumbing
+            self._expert_composition = resolved_wiring.authority
+            self._expert_plumbing = resolved_wiring.plumbing
+            self._expert_selectors = resolved_wiring.selectors
             self._config = expert_runtime_config(self._expert_composition, self._expert_plumbing)
         container = Container()
-        _create_adapters(self._expert_composition or self._config, container, self._expert_plumbing)
+        _create_adapters(
+            self._expert_composition or self._config,
+            container,
+            self._expert_plumbing,
+            self._expert_selectors,
+        )
         try:
             store = container.resolve(KnowledgeStorePort)
         except ContainerError:
@@ -119,9 +128,11 @@ class PipelineInvoker:
         if self._plugin_type.lower().replace("-", "_") == "expert":
             assert self._expert_composition is not None
             assert self._expert_plumbing is not None
+            assert self._expert_selectors is not None
             _compose_expert_dependencies(
                 self._expert_composition, deps, plugin_class,
                 plumbing=self._expert_plumbing,
+                selectors=self._expert_selectors,
                 context_observer=self._tracing_store.capture_generation_context,
             )
             self._generation_context_observer_wired = True

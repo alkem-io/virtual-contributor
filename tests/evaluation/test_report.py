@@ -339,18 +339,31 @@ def test_comparison_rejects_contradictory_case_identity_version():
         compute_comparison(baseline, current)
 
 
-def test_comparison_rejects_future_case_identity_fields():
-    from evaluation.case_identity import evaluation_case_identity_payload
+def test_comparison_rejects_future_case_identity_fields(tmp_path, monkeypatch):
+    """Comparison validates raw run and case objects before model normalization."""
+    from click.testing import CliRunner
+    from evaluation.cli import cli
 
-    with pytest.raises(ValueError):
-        evaluation_case_identity_payload(
-            {
-                "question": "q",
-                "expected_answer": "a",
-                "relevant_documents": [],
-                "future_identity": "x",
-            }
-        )
+    directory = tmp_path / "evaluations"
+    directory.mkdir()
+    baseline, current = _make_run("baseline"), _make_run("current")
+    baseline_raw = baseline.model_dump()
+    current_raw = current.model_dump()
+    # The permissive historical display loader remains able to read this body.
+    historical = baseline_raw | {"historical_display_note": "retained"}
+    assert EvaluationRun.model_validate(historical).id == "baseline"
+
+    for side, payload, field in (
+        ("baseline", baseline_raw | {"future_run_identity": "x"}, "run"),
+        ("current", current_raw | {"cases": [current_raw["cases"][0] | {"future_case_identity": "x"}]}, "case"),
+    ):
+        (directory / "baseline.json").write_text(__import__("json").dumps(baseline_raw))
+        (directory / "current.json").write_text(__import__("json").dumps(current_raw))
+        (directory / f"{side}.json").write_text(__import__("json").dumps(payload))
+        monkeypatch.chdir(tmp_path)
+        result = CliRunner().invoke(cli, ["compare", "baseline", "current"])
+        assert result.exit_code != 0, field
+        assert "unknown fields" in result.output
 
 
 @pytest.mark.parametrize(
