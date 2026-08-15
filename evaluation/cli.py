@@ -5,8 +5,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
+import numbers
 import sys
 from pathlib import Path
+from typing import cast
 
 import click
 
@@ -226,7 +229,7 @@ def _list_run_state(data: object) -> tuple[str, tuple[str, str, str, str]]:
     counts = (data.get("test_case_count"), data.get("success_count"), data.get("failure_count"))
     if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in counts):
         return "invalid", unavailable
-    total, successful, failed = counts
+    total, successful, failed = cast(tuple[int, int, int], counts)
     if successful + failed != total:
         return "invalid", unavailable
     aggregate = data.get("aggregate")
@@ -237,13 +240,20 @@ def _list_run_state(data: object) -> tuple[str, tuple[str, str, str, str]]:
     names = ("faithfulness", "answer_relevancy", "context_precision", "context_recall")
     if set(aggregate) != set(names):
         return "incomplete", unavailable
+    required_statistics = {"mean", "median", "min", "max"}
     values: list[str] = []
     for name in names:
         value = aggregate[name]
-        if not isinstance(value, dict) or set(value) < {"mean", "median", "min", "max"}:
+        if not isinstance(value, dict) or set(value) != required_statistics:
             return "incomplete", unavailable
-        mean = value["mean"]
-        if isinstance(mean, bool) or not isinstance(mean, (int, float)):
+        statistics = tuple(value[statistic] for statistic in ("mean", "median", "min", "max"))
+        if any(
+            isinstance(statistic, bool)
+            or not isinstance(statistic, numbers.Real)
+            or not math.isfinite(float(statistic))
+            or not 0 <= float(statistic) <= 1
+            for statistic in statistics
+        ):
             return "invalid", unavailable
-        values.append(f"{mean:.3f}")
+        values.append(f"{float(value['mean']):.3f}")
     return "complete", tuple(values)  # type: ignore[return-value]

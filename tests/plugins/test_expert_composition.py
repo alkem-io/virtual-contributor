@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -346,3 +347,54 @@ def test_v7_factory_default_change_updates_live_wiring_and_identity() -> None:
     assert isinstance(first_container.resolve(RerankerPort), FirstReranker)
     assert isinstance(changed_container.resolve(RerankerPort), ChangedReranker)
     assert _fingerprint(first_wiring.authority) != _fingerprint(changed_wiring.authority)
+
+
+async def test_selected_hybrid_callable_drives_live_plugin_retrieval_and_identity(
+    monkeypatch,
+) -> None:
+    """The selected hybrid target, not the module global, owns live retrieval."""
+    from core.domain.routing import RetrievalProfile
+    from core.ports.knowledge_store import QueryResult
+    from main import _compose_expert_dependencies
+    from plugins.expert.composition import (
+        EXPERT_SELECTOR_REGISTRY,
+        ExpertSelectorRegistry,
+        expert_composition_fingerprint,
+    )
+    from plugins.expert.plugin import ExpertPlugin
+
+    selected_calls = []
+
+    async def selected_retriever(*args, **kwargs):
+        selected_calls.append((args, kwargs))
+        return QueryResult([["selected"]], [[{}]], [[0.1]], [["selected-id"]])
+
+    old_global = AsyncMock(side_effect=AssertionError("module-global hybrid target must not be called"))
+
+    registry = ExpertSelectorRegistry(tuple(
+        replace(entry, target=selected_retriever, primitive_id="expert.hybrid.selected/v1")
+        if entry.name == "hybrid" else entry
+        for entry in EXPERT_SELECTOR_REGISTRY.entries
+    ))
+    config = _config(rerank_enabled=False)
+    selected = resolve_expert_composition(config, selector_registry=registry)
+    default = resolve_expert_composition(config)
+    assert expert_composition_fingerprint(selected.authority) != expert_composition_fingerprint(default.authority)
+
+    monkeypatch.setattr("plugins.expert.plugin.hybrid_retrieval.retrieve", old_global)
+    deps = {"llm": _LLM(), "knowledge_store": _Store()}
+    _compose_expert_dependencies(
+        selected.authority, deps, ExpertPlugin,
+        plumbing=selected.plumbing, selectors=selected.selectors,
+    )
+    plugin = ExpertPlugin(**deps)
+    outcome = await plugin._retrieve_pipeline(
+        "collection", "question", RetrievalProfile(True, 1, 0.0, 1000),
+        where=None, hierarchy=False,
+    )
+    assert selected_calls and outcome.result.ids == [["selected-id"]]
+    old_global.assert_not_awaited()
+
+    direct = ExpertPlugin(_LLM(), _Store())
+    from core.domain import hybrid_retrieval
+    assert direct._hybrid_retriever is hybrid_retrieval.retrieve

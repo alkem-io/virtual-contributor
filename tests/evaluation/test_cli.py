@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from click.testing import CliRunner
+import pytest
 from evaluation.cli import cli
 
 
@@ -29,6 +30,48 @@ def test_cli_never_renders_missing_required_metric_as_zero(tmp_path, monkeypatch
     assert "incomplete" in result.output
     assert "N/A" in result.output
     assert "0.000" not in result.output
+
+
+@pytest.mark.parametrize("bad_statistic", [float("nan"), float("inf"), -0.1, 1.1, True, "0.5"])
+def test_cli_never_marks_invalid_aggregate_statistics_complete(
+    tmp_path, monkeypatch, bad_statistic
+) -> None:
+    import json
+
+    directory = tmp_path / "evaluations"
+    directory.mkdir()
+    aggregate = {
+        metric: {"mean": 0.5, "median": 0.5, "min": 0.5, "max": 0.5}
+        for metric in ("faithfulness", "answer_relevancy", "context_precision", "context_recall")
+    }
+    aggregate["faithfulness"]["median"] = bad_statistic
+    (directory / "invalid.json").write_text(json.dumps({
+        "id": "invalid", "plugin_type": "expert", "test_case_count": 1,
+        "success_count": 1, "failure_count": 0, "aggregate": aggregate,
+    }))
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(cli, ["list"])
+    assert result.exit_code == 0
+    assert "complete" not in result.output
+    assert "invalid" in result.output
+    assert result.output.count("N/A") == 4
+
+
+def test_cli_accepts_exact_metric_boundaries_and_honest_all_failed_run() -> None:
+    from evaluation.cli import _list_run_state
+
+    aggregate = {
+        metric: {"mean": 0, "median": 1, "min": 0, "max": 1}
+        for metric in ("faithfulness", "answer_relevancy", "context_precision", "context_recall")
+    }
+    assert _list_run_state({
+        "test_case_count": 1, "success_count": 1, "failure_count": 0,
+        "aggregate": aggregate,
+    }) == ("complete", ("0.000",) * 4)
+    assert _list_run_state({
+        "test_case_count": 1, "success_count": 0, "failure_count": 1,
+        "aggregate": {},
+    }) == ("N/A", ("N/A",) * 4)
 
 
 def _run_command(monkeypatch, plugin: str, *extra: str) -> dict[str, object]:

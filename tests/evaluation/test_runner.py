@@ -72,27 +72,45 @@ async def test_scorer_maps_real_ragas_metric_names_to_exact_required_inventory(
     monkeypatch,
     tmp_path,
 ) -> None:
+    """Use installed RAGAS 0.4.3 objects; only provider execution is patched."""
     from evaluation.runner import EvaluationRunner, Scorer
+    from ragas import EvaluationDataset, SingleTurnSample
+    from ragas.callbacks import ChainRun
+    from ragas.dataset_schema import EvaluationResult
 
-    class Result:
-        scores = [{
+    sample = SingleTurnSample(
+        user_input="q", response="a", reference="expected", retrieved_contexts=["context"],
+    )
+    dataset = EvaluationDataset(samples=[sample])
+    result = EvaluationResult(
+        scores=[{
             "faithfulness": 0,
             "answer_relevancy": 1,
             "llm_context_precision_without_reference": 0.5,
             "context_recall": 0.5,
-        }]
+        }],
+        dataset=dataset,
+        ragas_traces={
+            "root": ChainRun(run_id="root", parent_run_id=None, name="root", inputs={}, metadata={}, children=["row"]),
+            "row": ChainRun(run_id="row", parent_run_id="root", name="row", inputs={}, metadata={}),
+        },
+    )
+    frame = result.to_pandas()
+    assert {"user_input", "response", "faithfulness", "context_recall"} <= set(frame.columns)
 
-        def to_pandas(self):
-            raise AssertionError("combined dataset frame must not be read as metrics")
+    def evaluate(*, dataset, metrics):
+        assert isinstance(dataset, EvaluationDataset)
+        return result
 
-    _install_ragas_result(monkeypatch, Result())
+    monkeypatch.setattr("ragas.evaluate", evaluate)
     scorer = Scorer([])
     assert (await scorer.score("q", "a", "expected", ["context"]))["context_precision"] == 0.5
 
     invoker = AsyncMock()
     invoker.invoke.return_value = ("a", ["context"], [])
     run = await EvaluationRunner(invoker, scorer, tmp_path).run(_make_test_cases(1), "guidance")
-    assert run.success_count == 1 and (tmp_path / f"{run.id}.json").exists()
+    assert run.success_count == 1 and run.cases[0].scores is not None
+    assert (tmp_path / f"{run.id}.json").exists()
 
 
 async def test_scorer_rejects_missing_required_metric_without_none_coercion(monkeypatch) -> None:

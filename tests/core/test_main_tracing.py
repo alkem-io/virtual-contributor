@@ -48,6 +48,57 @@ def test_startup_log_with_safety_controls_omits_secrets_and_dynamic_values(caplo
     assert "llm-secret" not in caplog.text
 
 
+def test_complete_startup_logging_omits_configured_endpoint_sentinels(caplog, monkeypatch) -> None:
+    """Config and adapter construction share one endpoint-free startup surface."""
+    from core.container import Container
+    from main import _create_adapters
+
+    sentinels = (
+        "llm.unique.invalid/path?query=one#fragment",
+        "vector.unique.invalid/path?query=two#fragment",
+        "otlp.unique.invalid/path?query=three#fragment",
+        "summary.unique.invalid/path?query=four#fragment",
+        "bok.unique.invalid/path?query=five#fragment",
+    )
+    config = BaseConfig(
+        llm_base_url=f"https://{sentinels[0]}",
+        vector_db_host=sentinels[1],
+        tracing_otlp_endpoint=f"https://{sentinels[2]}",
+        summarize_llm_base_url=f"https://{sentinels[3]}",
+        bok_llm_base_url=f"https://{sentinels[4]}",
+        embeddings_query_max_utf8_bytes=111,
+        query_rewrite_max_utf8_bytes=99,
+        embeddings_max_attempts=2,
+        embeddings_attempt_timeout_seconds=3,
+        embeddings_total_deadline_seconds=4,
+        expert_hierarchical_retrieval_enabled=True,
+        expert_hierarchy_max_branches=2,
+        expert_hierarchy_display_names_enabled=False,
+    )
+    class Store:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+    monkeypatch.setattr("core.provider_factory.create_llm_adapter", lambda _config: object())
+    monkeypatch.setattr("core.adapters.chromadb.ChromaDBAdapter", Store)
+    caplog.set_level(logging.INFO)
+    _log_config(config)
+    _create_adapters(config, Container())
+    captured = "\n".join(record.getMessage() for record in caplog.records)
+    assert all(sentinel not in captured for sentinel in sentinels)
+    for key, value in (
+        ("EMBEDDINGS_QUERY_MAX_UTF8_BYTES", 111),
+        ("QUERY_REWRITE_MAX_UTF8_BYTES", 99),
+        ("EMBEDDINGS_MAX_ATTEMPTS", 2),
+        ("EMBEDDINGS_ATTEMPT_TIMEOUT_SECONDS", 3),
+        ("EMBEDDINGS_TOTAL_DEADLINE_SECONDS", 4),
+        ("EXPERT_HIERARCHICAL_RETRIEVAL_ENABLED", True),
+        ("EXPERT_HIERARCHY_MAX_BRANCHES", 2),
+        ("EXPERT_HIERARCHY_DISPLAY_NAMES_ENABLED", False),
+    ):
+        assert f"{key}={value}" in captured
+
+
 def test_url_userinfo_is_masked() -> None:
     assert _mask_sensitive("llm_base_url", "https://user:secret@llm.internal/v1") == "https://***@llm.internal/v1"
     assert _mask_sensitive("tracing_otlp_endpoint", "https://token@collector.internal/v1/traces") == "https://***@collector.internal/v1/traces"

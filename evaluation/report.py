@@ -131,11 +131,18 @@ def load_comparison_run(raw_json: str) -> EvaluationRun:
     if not isinstance(cases, list):
         raise ValueError("Comparison run cases must be a list")
     allowed_case_fields = set(EvaluationCase.model_fields)
+    allowed_score_fields = set(MetricScores.model_fields)
     for case in cases:
         if not isinstance(case, dict):
             raise ValueError("Comparison run case must be an object")
         if set(case) - allowed_case_fields:
             raise ValueError("Comparison run case contains unknown fields")
+        # This import boundary is stricter than display/list parsing. Pydantic
+        # would otherwise discard an undeclared score before canonical
+        # inventory validation and paired-run digests can reject it.
+        scores = case.get("scores")
+        if isinstance(scores, dict) and set(scores) - allowed_score_fields:
+            raise ValueError("Comparison run case scores contain unknown fields")
 
     run = EvaluationRun.model_validate(raw)
     if run.composition_identity_version != 7:

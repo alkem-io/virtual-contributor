@@ -366,6 +366,21 @@ def test_comparison_rejects_future_case_identity_fields(tmp_path, monkeypatch):
         assert "unknown fields" in result.output
 
 
+def test_comparison_rejects_unknown_raw_case_score_before_normalization():
+    """The strict comparison loader sees score keys Pydantic would discard."""
+    import json
+    from evaluation.report import load_comparison_run
+
+    baseline = _make_run("baseline")
+    raw = baseline.model_dump()
+    raw["cases"][0]["scores"]["undeclared_provider_score"] = 0.5
+
+    # Historical display remains permissive; only comparison is strict.
+    assert EvaluationRun.model_validate(raw).id == "baseline"
+    with pytest.raises(ValueError, match="scores contain unknown fields"):
+        load_comparison_run(json.dumps(raw))
+
+
 @pytest.mark.parametrize(
     "mutation",
     [

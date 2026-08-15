@@ -194,6 +194,7 @@ class ExpertPlugin:
         answering_temperature: float | None = None,
         chain_of_thought_enabled: bool = True,
         hybrid_config: Any = None,
+        hybrid_retriever: Callable[..., Any] | None = None,
         reranker: RerankerPort | None = None,
         rerank_candidate_n: int = 20,
         rerank_top_k: int = 5,
@@ -221,6 +222,14 @@ class ExpertPlugin:
         # None keeps retrieval exactly as it was: hybrid_retrieval.retrieve
         # reads the flag off this and falls through to the dense path.
         self._hybrid_config = hybrid_config
+        # The resolved composition supplies this from the same selector
+        # snapshot whose primitive ID is fingerprinted. Direct construction
+        # retains the historical default callable unchanged.
+        self._hybrid_retriever = (
+            hybrid_retriever
+            if hybrid_retriever is not None
+            else hybrid_retrieval.retrieve
+        )
         # Absent unless re-ranking is enabled, so an existing deployment keeps
         # exactly its current retrieval behaviour with no new code path.
         self._reranker = reranker
@@ -502,7 +511,7 @@ class ExpertPlugin:
             if self._reranker is not None
             else profile.n_results
         )
-        result = await hybrid_retrieval.retrieve(
+        result = await self._hybrid_retriever(
             self._knowledge_store, collection, query, self._hybrid_config,
             n_results=pool_n, where=where,
         )

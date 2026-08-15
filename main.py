@@ -235,13 +235,11 @@ def _log_config(config: BaseConfig, plugin_class: type | None = None) -> None:
         "summarize_llm_provider",
         "summarize_llm_model",
         "summarize_llm_api_key",
-        "summarize_llm_base_url",
         "summarize_llm_temperature",
         "summarize_llm_timeout",
         "bok_llm_provider",
         "bok_llm_model",
         "bok_llm_api_key",
-        "bok_llm_base_url",
         "expert_n_results",
         "expert_min_score",
         "expert_hierarchical_retrieval_enabled",
@@ -277,10 +275,7 @@ def _log_config(config: BaseConfig, plugin_class: type | None = None) -> None:
         "chunk_overlap",
         "summary_length",
         "pipeline_timeout",
-        "llm_base_url",
-        "vector_db_host",
         "tracing_enabled",
-        "tracing_otlp_endpoint",
         "tracing_otlp_headers",
         "tracing_service_name",
         "tracing_sample_ratio",
@@ -420,6 +415,8 @@ def _compose_expert_dependencies(
     _inject_answering_config(config, deps, sig)
     if "hybrid_config" in sig.parameters:
         deps["hybrid_config"] = composition
+    if "hybrid_retriever" in sig.parameters:
+        deps["hybrid_retriever"] = selectors.entry("hybrid").target
     if "reranker" in deps:
         if "rerank_candidate_n" in sig.parameters:
             deps["rerank_candidate_n"] = config.rerank_candidate_n
@@ -523,10 +520,9 @@ def _create_adapters(
     llm_adapter = llm_factory(effective_config)
     container.register(LLMPort, llm_adapter)
     logger.info(
-        "LLM provider: %s | model: %s | base_url: %s",
+        "LLM provider configured: %s | model: %s",
         effective_config.llm_provider.value,
         effective_config.llm_model or "default",
-        effective_config.llm_base_url or "default",
     )
 
     # Embeddings adapters
@@ -1120,7 +1116,7 @@ async def _run(config: BaseConfig) -> None:
                 email=admin_email,
                 password=admin_password,
             )
-            logger.info("GraphQL client configured: %s", gql_endpoint)
+            logger.info("GraphQL client configured")
         else:
             logger.warning("GraphQL client not configured — missing API_ENDPOINT_PRIVATE_GRAPHQL, AUTH_ADMIN_EMAIL, or AUTH_ADMIN_PASSWORD")
     plugin = plugin_class(**deps)
