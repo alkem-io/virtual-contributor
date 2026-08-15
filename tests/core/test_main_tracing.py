@@ -48,24 +48,48 @@ def test_startup_log_with_safety_controls_omits_secrets_and_dynamic_values(caplo
     assert "llm-secret" not in caplog.text
 
 
-def test_complete_startup_logging_omits_configured_endpoint_sentinels(caplog, monkeypatch) -> None:
-    """Config and adapter construction share one endpoint-free startup surface."""
-    from core.container import Container
-    from main import _create_adapters
+async def test_complete_startup_logging_omits_configured_endpoint_sentinels(caplog, monkeypatch) -> None:
+    """A fully configured startup never renders configured connection targets."""
+    import main
+    from core.config import LLMProvider
 
+    endpoints = (
+        "llm-user:llm-token@llm.unique.invalid:18001/llm-path?llm-query=one#llm-fragment",
+        "vector-user:vector-token@vector.unique.invalid:18002/vector-path?vector-query=two#vector-fragment",
+        "otlp-user:otlp-token@otlp.unique.invalid:18003/otlp-path?otlp-query=three#otlp-fragment",
+        "summary-user:summary-token@summary.unique.invalid:18004/summary-path?summary-query=four#summary-fragment",
+        "bok-user:bok-token@bok.unique.invalid:18005/bok-path?bok-query=five#bok-fragment",
+        "broker-user:broker-token@broker.unique.invalid:18006/broker-path?broker-query=six#broker-fragment",
+    )
     sentinels = (
-        "llm.unique.invalid/path?query=one#fragment",
-        "vector.unique.invalid/path?query=two#fragment",
-        "otlp.unique.invalid/path?query=three#fragment",
-        "summary.unique.invalid/path?query=four#fragment",
-        "bok.unique.invalid/path?query=five#fragment",
+        "llm-user", "llm-token", "llm.unique.invalid", ":18001", "/llm-path", "llm-query=one", "llm-fragment",
+        "vector-user", "vector-token", "vector.unique.invalid", ":18002", "/vector-path", "vector-query=two", "vector-fragment",
+        "otlp-user", "otlp-token", "otlp.unique.invalid", ":18003", "/otlp-path", "otlp-query=three", "otlp-fragment",
+        "summary-user", "summary-token", "summary.unique.invalid", ":18004", "/summary-path", "summary-query=four", "summary-fragment",
+        "bok-user", "bok-token", "bok.unique.invalid", ":18005", "/bok-path", "bok-query=five", "bok-fragment",
+        "broker-user", "broker-token", "broker.unique.invalid", ":18006", "/broker-path", "broker-query=six", "broker-fragment",
+        "broker-password-token",
     )
     config = BaseConfig(
-        llm_base_url=f"https://{sentinels[0]}",
-        vector_db_host=sentinels[1],
-        tracing_otlp_endpoint=f"https://{sentinels[2]}",
-        summarize_llm_base_url=f"https://{sentinels[3]}",
-        bok_llm_base_url=f"https://{sentinels[4]}",
+        llm_base_url=f"https://{endpoints[0]}",
+        vector_db_host=endpoints[1],
+        vector_db_port=18002,
+        tracing_otlp_endpoint=f"https://{endpoints[2]}",
+        embeddings_api_key="embedding-token",
+        embeddings_endpoint="https://embedding-user:embedding-token@embedding.unique.invalid:18007/embedding-path?embedding-query=seven#embedding-fragment",
+        summarize_llm_provider=LLMProvider.mistral,
+        summarize_llm_model="summary-model",
+        summarize_llm_api_key="summary-api-token",
+        summarize_llm_base_url=f"https://{endpoints[3]}",
+        bok_llm_provider=LLMProvider.mistral,
+        bok_llm_model="bok-model",
+        bok_llm_api_key="bok-api-token",
+        bok_llm_base_url=f"https://{endpoints[4]}",
+        rabbitmq_host=endpoints[5],
+        rabbitmq_port=18006,
+        rabbitmq_user="broker-user",
+        rabbitmq_password="broker-password-token",
+        plugin_type="in-memory",
         embeddings_query_max_utf8_bytes=111,
         query_rewrite_max_utf8_bytes=99,
         embeddings_max_attempts=2,
@@ -75,15 +99,93 @@ def test_complete_startup_logging_omits_configured_endpoint_sentinels(caplog, mo
         expert_hierarchy_max_branches=2,
         expert_hierarchy_display_names_enabled=False,
     )
+    class Plugin:
+        name = "in-memory"
+
+        async def startup(self) -> None:
+            pass
+
+        async def shutdown(self) -> None:
+            pass
+
     class Store:
         def __init__(self, **kwargs) -> None:
             pass
 
-    monkeypatch.setattr("core.provider_factory.create_llm_adapter", lambda _config: object())
+    class Embeddings:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+    class Queue:
+        async def bind(self, *args, **kwargs) -> None:
+            pass
+
+        async def consume(self, *args, **kwargs) -> None:
+            pass
+
+    class Channel:
+        is_closed = False
+
+        async def set_qos(self, **kwargs) -> None:
+            pass
+
+        async def declare_exchange(self, *args, **kwargs) -> object:
+            return object()
+
+        async def declare_queue(self, *args, **kwargs) -> Queue:
+            return Queue()
+
+    class Connection:
+        is_closed = False
+
+        async def channel(self) -> Channel:
+            return Channel()
+
+        async def close(self) -> None:
+            self.is_closed = True
+
+    class Health:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def add_check(self, *args, **kwargs) -> None:
+            pass
+
+        async def start(self) -> None:
+            pass
+
+        async def stop(self) -> None:
+            pass
+
+    class StopEvent:
+        async def wait(self) -> None:
+            pass
+
+        def set(self) -> None:
+            pass
+
+    class Loop:
+        def add_signal_handler(self, *args, **kwargs) -> None:
+            pass
+
+    async def connect_robust(*args, **kwargs) -> Connection:
+        return Connection()
+
+    async def shutdown_tracing() -> None:
+        pass
+
+    monkeypatch.setattr("core.provider_factory.create_llm_adapter", lambda _config, **_kwargs: object())
     monkeypatch.setattr("core.adapters.chromadb.ChromaDBAdapter", Store)
+    monkeypatch.setattr("core.adapters.openai_compatible_embeddings.OpenAICompatibleEmbeddingsAdapter", Embeddings)
+    monkeypatch.setattr(main.PluginRegistry, "discover", lambda *_args: Plugin)
+    monkeypatch.setattr("core.adapters.rabbitmq.aio_pika.connect_robust", connect_robust)
+    monkeypatch.setattr(main, "HealthServer", Health)
+    monkeypatch.setattr(main, "_shutdown_tracing_bounded", shutdown_tracing)
+    monkeypatch.setattr(main.asyncio, "Event", StopEvent)
+    monkeypatch.setattr(main.asyncio, "get_running_loop", lambda: Loop())
     caplog.set_level(logging.INFO)
     _log_config(config)
-    _create_adapters(config, Container())
+    await main._run(config)
     captured = "\n".join(record.getMessage() for record in caplog.records)
     assert all(sentinel not in captured for sentinel in sentinels)
     for key, value in (

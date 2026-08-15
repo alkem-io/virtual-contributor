@@ -74,6 +74,61 @@ def test_cli_accepts_exact_metric_boundaries_and_honest_all_failed_run() -> None
     }) == ("N/A", ("N/A",) * 4)
 
 
+def test_cli_rejects_zero_success_nonempty_aggregate(tmp_path, monkeypatch) -> None:
+    """A report cannot claim aggregate evidence when no case succeeded."""
+    import json
+
+    directory = tmp_path / "evaluations"
+    directory.mkdir()
+    aggregate = {
+        metric: {"mean": 0.5, "median": 0.5, "min": 0.5, "max": 0.5}
+        for metric in ("faithfulness", "answer_relevancy", "context_precision", "context_recall")
+    }
+    (directory / "zero-success.json").write_text(json.dumps({
+        "id": "zero-success", "plugin_type": "expert", "test_case_count": 1,
+        "success_count": 0, "failure_count": 1, "aggregate": aggregate,
+    }))
+    monkeypatch.chdir(tmp_path)
+
+    result = CliRunner().invoke(cli, ["list"])
+
+    assert result.exit_code == 0
+    assert "complete" not in result.output
+    assert "0.500" not in result.output
+    assert result.output.count("N/A") == 4
+
+
+def test_cli_handles_arbitrary_size_json_integer_as_invalid(tmp_path, monkeypatch) -> None:
+    """Display-only parsing must not overflow on a syntactically valid JSON int."""
+    import json
+
+    directory = tmp_path / "evaluations"
+    directory.mkdir()
+    giant_integer = "1" + ("0" * 400)
+    metric_names = ("faithfulness", "answer_relevancy", "context_precision", "context_recall")
+    aggregate = ",".join(
+        f'{json.dumps(metric)}:{{"mean":{giant_integer if metric == "faithfulness" else "0.5"},'
+        '"median":0.5,"min":0.5,"max":0.5}'
+        for metric in metric_names
+    )
+    (directory / "giant-integer.json").write_text(
+        "{"
+        '\"id\":\"giant-integer\",\"plugin_type\":\"expert\",'
+        '\"test_case_count\":1,\"success_count\":1,\"failure_count\":0,'
+        f'\"aggregate\":{{{aggregate}}}'
+        "}"
+    )
+    monkeypatch.chdir(tmp_path)
+
+    result = CliRunner().invoke(cli, ["list"])
+
+    assert result.exit_code == 0
+    assert "error reading" not in result.output
+    assert "complete" not in result.output
+    assert "invalid" in result.output
+    assert result.output.count("N/A") == 4
+
+
 def _run_command(monkeypatch, plugin: str, *extra: str) -> dict[str, object]:
     captured: dict[str, object] = {}
 

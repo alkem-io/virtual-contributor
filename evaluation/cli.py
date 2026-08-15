@@ -233,8 +233,12 @@ def _list_run_state(data: object) -> tuple[str, tuple[str, str, str, str]]:
     if successful + failed != total:
         return "invalid", unavailable
     aggregate = data.get("aggregate")
-    if successful == 0 and failed == total and aggregate == {}:
-        return "N/A", unavailable
+    # Aggregate statistics are evidence from successful cases. A failed-only
+    # run is useful inventory, but has no metric evidence to display.
+    if successful == 0:
+        if aggregate == {}:
+            return "N/A", unavailable
+        return "invalid", unavailable
     if not isinstance(aggregate, dict):
         return "invalid", unavailable
     names = ("faithfulness", "answer_relevancy", "context_precision", "context_recall")
@@ -247,13 +251,16 @@ def _list_run_state(data: object) -> tuple[str, tuple[str, str, str, str]]:
         if not isinstance(value, dict) or set(value) != required_statistics:
             return "incomplete", unavailable
         statistics = tuple(value[statistic] for statistic in ("mean", "median", "min", "max"))
-        if any(
-            isinstance(statistic, bool)
-            or not isinstance(statistic, numbers.Real)
-            or not math.isfinite(float(statistic))
-            or not 0 <= float(statistic) <= 1
-            for statistic in statistics
-        ):
-            return "invalid", unavailable
-        values.append(f"{float(value['mean']):.3f}")
+        converted: list[float] = []
+        for statistic in statistics:
+            if isinstance(statistic, bool) or not isinstance(statistic, numbers.Real):
+                return "invalid", unavailable
+            try:
+                numeric = float(statistic)
+            except (OverflowError, TypeError, ValueError):
+                return "invalid", unavailable
+            if not math.isfinite(numeric) or not 0 <= numeric <= 1:
+                return "invalid", unavailable
+            converted.append(numeric)
+        values.append(f"{converted[0]:.3f}")
     return "complete", tuple(values)  # type: ignore[return-value]

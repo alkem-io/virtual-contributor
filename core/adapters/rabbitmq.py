@@ -52,7 +52,7 @@ class RabbitMQAdapter:
             ExchangeType.DIRECT,
             durable=True,
         )
-        logger.info("Connected to RabbitMQ at %s:%d", self._host, self._port)
+        logger.info("Connected to RabbitMQ")
 
     def is_connected(self) -> bool:
         """Check if the connection is alive."""

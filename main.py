@@ -958,10 +958,10 @@ async def _run(config: BaseConfig) -> None:
             BaseConfig(**synth_data), disable_thinking=True
         )
         logger.info(
-            "Summarization LLM configured: provider=%s, model=%s, base_url=%s",
+            "Summarization LLM configured: provider=%s, model=%s, endpoint=%s",
             config.summarize_llm_provider.value,
             config.summarize_llm_model,
-            config.summarize_llm_base_url or "(inherited from main LLM)",
+            "configured" if config.summarize_llm_base_url else "inherited",
         )
 
     # Create BoK LLM adapter if fully configured (needs large context window)
@@ -987,10 +987,10 @@ async def _run(config: BaseConfig) -> None:
             synth_data["llm_timeout"] = config.bok_llm_timeout
         bok_llm = create_llm_adapter(BaseConfig(**synth_data), disable_thinking=True)
         logger.info(
-            "BoK LLM configured: provider=%s, model=%s, base_url=%s",
+            "BoK LLM configured: provider=%s, model=%s, endpoint=%s",
             config.bok_llm_provider.value,
             config.bok_llm_model,
-            config.bok_llm_base_url or "(inherited from main LLM)",
+            "configured" if config.bok_llm_base_url else "inherited",
         )
 
     # Construct plugin with dependencies
