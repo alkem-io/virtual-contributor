@@ -166,6 +166,27 @@ async def test_hybrid_propagates_scoped_predicate_to_dense_and_lexical_arms() ->
     assert [source.source for source in response.sources] == ["a-1", "a-2"]
 
 
+@pytest.mark.parametrize("error_type", [
+    __import__("core.ports.embeddings", fromlist=["EmbeddingInputError"]).EmbeddingInputError,
+    __import__("core.ports.embeddings", fromlist=["EmbeddingPermanentError"]).EmbeddingPermanentError,
+])
+async def test_lexical_embedding_error_reaches_expert_boundary_without_flat_fallback(error_type) -> None:
+    """The real Expert boundary must preserve typed lexical failure identity."""
+    error = error_type("private lexical failure")
+
+    class Store(MockKnowledgeStorePort):
+        async def query_lexical(self, *args, **kwargs):
+            raise error
+
+    store = Store()
+    with pytest.raises(error_type) as raised:
+        await _plugin(store, hybrid_config=_Hybrid()).handle(_event())  # type: ignore[arg-type]
+    assert raised.value is error
+    # The first two calls are the real Stage-1/Stage-2 hierarchy path.  A flat
+    # fallback would make an additional unfiltered query after the typed error.
+    assert len(store.query_calls) == 2
+
+
 async def test_pipeline_order_keeps_short_nonempty_scoped_result() -> None:
     store = _store()
     store.collections["c-knowledge"] = [entry for entry in _entries() if entry["id"] != "a-2"]

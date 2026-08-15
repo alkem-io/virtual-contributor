@@ -80,7 +80,28 @@ class OpenAICompatibleEmbeddingsAdapter:
             )
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
-        return await self._call(texts)
+        # Ingestion deliberately retains the repository's frozen document
+        # policy: retry any exception and re-raise the original on exhaustion.
+        last_exc: Exception | None = None
+        # This is the frozen ingestion-side client contract from develop.
+        # Query deadlines intentionally do not alter document ingestion.
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            for attempt in range(MAX_RETRIES):
+                try:
+                    response = await client.post(
+                        f"{self._endpoint}/embeddings",
+                        headers={"Authorization": f"Bearer {self._api_key}", "Content-Type": "application/json"},
+                        json={"model": self._model_name, "input": texts},
+                    )
+                    response.raise_for_status()
+                    data = response.json()
+                    return [item["embedding"] for item in data["data"]]
+                except Exception as exc:
+                    last_exc = exc
+                    if attempt + 1 < MAX_RETRIES:
+                        await asyncio.sleep(BASE_DELAY * (2 ** attempt))
+        assert last_exc is not None
+        raise last_exc
 
     async def embed_query(self, texts: list[str]) -> list[list[float]]:
         if self._query_instruction:
@@ -94,7 +115,7 @@ class OpenAICompatibleEmbeddingsAdapter:
 
     @staticmethod
     def _transient(exc: Exception) -> bool:
-        if isinstance(exc, (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError)):
+        if isinstance(exc, (TimeoutError, httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError)):
             return True
         if isinstance(exc, httpx.HTTPStatusError):
             return exc.response.status_code == 408 or exc.response.status_code == 429 or exc.response.status_code >= 500

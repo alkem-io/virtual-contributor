@@ -28,3 +28,30 @@ async def test_openai_embedding_retry_budget_is_bounded(monkeypatch) -> None:
     with pytest.raises(EmbeddingTransientError):
         await adapter.embed_query(["q"])
     assert adapter._client.embeddings.create.await_count == 2
+
+
+async def test_openai_document_embed_retries_base_errors_and_recovers(monkeypatch) -> None:
+    """Ingestion retains the historical retry-any-exception policy."""
+    import json
+
+    adapter = OpenAIEmbeddingsAdapter("k")
+    response = type("Response", (), {"data": [type("Item", (), {"embedding": [.1]})()]})()
+    adapter._client.embeddings.create = AsyncMock(
+        side_effect=[json.JSONDecodeError("bad", "{", 0), response]
+    )
+    monkeypatch.setattr("core.adapters.openai_embeddings.BASE_DELAY", 0)
+    assert await adapter.embed(["document"]) == [[.1]]
+    assert adapter._client.embeddings.create.await_count == 2
+
+
+async def test_openai_document_embed_exhaustion_reraises_original_error(monkeypatch) -> None:
+    import json
+
+    error = json.JSONDecodeError("bad", "{", 0)
+    adapter = OpenAIEmbeddingsAdapter("k")
+    adapter._client.embeddings.create = AsyncMock(side_effect=error)
+    monkeypatch.setattr("core.adapters.openai_embeddings.BASE_DELAY", 0)
+    with pytest.raises(json.JSONDecodeError) as raised:
+        await adapter.embed(["document"])
+    assert raised.value is error
+    assert adapter._client.embeddings.create.await_count == 3

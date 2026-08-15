@@ -72,6 +72,13 @@ def expert_composition_descriptor(
         descriptor["embeddings"] = {
             "model": config.embeddings_model_name,
             "query_instruction": config.embeddings_query_instruction,
+            # These are live query-side safety controls, not deployment
+            # plumbing.  A paired evaluation with any one changed is no
+            # longer a hierarchy-only experiment.
+            "query_max_utf8_bytes": config.embeddings_query_max_utf8_bytes,
+            "max_attempts": config.embeddings_max_attempts,
+            "attempt_timeout_seconds": config.embeddings_attempt_timeout_seconds,
+            "total_deadline_seconds": config.embeddings_total_deadline_seconds,
             "adapter": _identity(embeddings),
         }
     if config.hybrid_retrieval_enabled:
@@ -112,6 +119,7 @@ def expert_composition_descriptor(
         "max_expansion_ratio": config.query_rewrite_max_expansion_ratio,
         "max_history_turns": effective_history_turns,
         "max_history_chars": config.query_rewrite_max_history_chars,
+        "max_utf8_bytes": config.query_rewrite_max_utf8_bytes,
         "policy": _identity(dependencies.get("rewrite_policy")),
     }
     return descriptor
@@ -138,7 +146,7 @@ def expert_full_composition_fingerprint(invariant: str, mode: str) -> str:
         raise ValueError("Expert composition mode must be flat or hierarchical")
     if len(invariant) != 64 or any(c not in "0123456789abcdef" for c in invariant):
         raise ValueError("Expert invariant fingerprint must be a SHA-256 hex digest")
-    payload = {"schema": "expert-composition/v4", "invariant": invariant, "mode": mode}
+    payload = {"schema": "expert-composition/v5", "invariant": invariant, "mode": mode}
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()

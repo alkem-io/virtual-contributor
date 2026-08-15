@@ -53,6 +53,47 @@ class TestExpertResolvesFollowUpsBeforeRetrieval:
         assert llm.n == 1
 
 
+async def test_history_rewrite_exact_utf8_cap_calls_provider() -> None:
+    llm, store = CountingLLM(), MockKnowledgeStorePort()
+    question = "abcd"
+    await ExpertPlugin(llm=llm, knowledge_store=store, rewrite_max_utf8_bytes=4).handle(
+        make_input(message=question, history=HISTORY)
+    )
+    # The exact-boundary original is eligible for rewrite; its oversized
+    # candidate is then safely rejected in favour of the original.
+    assert llm.n == 2 and store.query_calls[0][1] == [question]
+
+
+async def test_history_rewrite_over_utf8_cap_skips_provider() -> None:
+    llm, store = CountingLLM(), MockKnowledgeStorePort()
+    question = "abcde"
+    await ExpertPlugin(llm=llm, knowledge_store=store, rewrite_max_utf8_bytes=4).handle(
+        make_input(message=question, history=HISTORY)
+    )
+    assert llm.n == 1 and store.query_calls[0][1] == [question]
+
+
+async def test_multibyte_history_rewrite_over_cap_skips_provider() -> None:
+    llm, store = CountingLLM(), MockKnowledgeStorePort()
+    question = "ééé"
+    await ExpertPlugin(llm=llm, knowledge_store=store, rewrite_max_utf8_bytes=5).handle(
+        make_input(message=question, history=HISTORY)
+    )
+    assert llm.n == 1 and store.query_calls[0][1] == [question]
+
+
+async def test_oversized_rewrite_candidate_falls_back_to_bounded_original() -> None:
+    class _Oversized(CountingLLM):
+        async def invoke(self, messages, **kwargs):
+            self.n += 1
+            return "x" * 20 if self.n == 1 else "answer"
+    llm, store = _Oversized(), MockKnowledgeStorePort()
+    await ExpertPlugin(llm=llm, knowledge_store=store, rewrite_max_utf8_bytes=4).handle(
+        make_input(message="four", history=HISTORY)
+    )
+    assert llm.n == 2 and store.query_calls[0][1] == ["four"]
+
+
 class TestExpertHonoursTheGate:
     @pytest.mark.parametrize("message", CONVERSATIONAL[:3])
     async def test_conversational_turns_skip_the_rewrite(self, message: str) -> None:

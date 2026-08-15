@@ -90,6 +90,11 @@ EFFECTIVE_SETTING_MUTATIONS = [
     ("query_rewrite_max_expansion_ratio", 9.0),
     ("query_rewrite_max_history_turns", 19),
     ("query_rewrite_max_history_chars", 11_999),
+    ("embeddings_query_max_utf8_bytes", 32_767),
+    ("query_rewrite_max_utf8_bytes", 4_095),
+    ("embeddings_max_attempts", 2),
+    ("embeddings_attempt_timeout_seconds", 19),
+    ("embeddings_total_deadline_seconds", 44),
     ("llm_provider", "openai"), ("llm_model", "model-b"),
     ("vector_db_distance_fn", "l2"),
     ("llm_temperature", 0.4), ("llm_max_tokens", 512),
@@ -197,3 +202,18 @@ def test_invariant_fingerprint_excludes_only_hierarchy_mode() -> None:
 def test_full_fingerprint_includes_hierarchy_mode() -> None:
     invariant = expert_composition_fingerprint(_config(), _dependencies(), embeddings=_Embeddings())
     assert expert_full_composition_fingerprint(invariant, "flat") != expert_full_composition_fingerprint(invariant, "hierarchical")
+
+
+def test_v5_invariant_descriptor_contains_all_five_embedding_safety_controls() -> None:
+    descriptor = expert_composition_descriptor(_config(), _dependencies(), embeddings=_Embeddings())
+    assert set(descriptor["embeddings"]) >= {"query_max_utf8_bytes", "max_attempts", "attempt_timeout_seconds", "total_deadline_seconds"}
+    assert "max_utf8_bytes" in descriptor["rewrite"]
+
+
+@pytest.mark.parametrize(("field", "value"), [
+    ("embeddings_query_max_utf8_bytes", 32_767), ("query_rewrite_max_utf8_bytes", 4_095),
+    ("embeddings_max_attempts", 2), ("embeddings_attempt_timeout_seconds", 19),
+    ("embeddings_total_deadline_seconds", 44),
+])
+def test_each_embedding_safety_control_mutation_changes_the_invariant_fingerprint(field, value) -> None:
+    assert expert_composition_fingerprint(_config(), _dependencies(), embeddings=_Embeddings()) != expert_composition_fingerprint(_config(**{field: value}), _dependencies(), embeddings=_Embeddings())

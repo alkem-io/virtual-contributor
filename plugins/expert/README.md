@@ -71,8 +71,10 @@ model-visible names while scoped retrieval remains available.
 Provider processing/minimization approval is a human `RG-05P` gate before
 display names may be enabled; this code does not grant or imply that approval.
 `RG-05` is the representative paired flat/on RAGAS gate. Its production and
-evaluation runs use the same effective composition and a non-secret fingerprint;
-comparison fails closed unless both fingerprints are present and equal.
+evaluation runs use the same effective composition and an invariant plus
+mode-bound full non-secret fingerprint. Comparison fails closed unless invariant
+fingerprints are equal and both full fingerprints are present, recomputable from
+the invariant plus mode, and different for flat versus hierarchical runs.
 `SC-009` remains the full-suite regression gate, not an evaluation substitute.
 
 ## Grounded, citable answers

@@ -113,6 +113,60 @@ async def test_chromadb_embedding_scope_does_not_reuse_across_requests(adapter: 
         await adapter._embed_query(["same"])
     assert adapter._embeddings.embed_query.await_count == 2
 
+async def test_chromadb_embedding_scope_coalesces_concurrent_exact_input(adapter):
+    adapter._query_embedding_cache = contextvars.ContextVar("sf", default=None)
+    gate = asyncio.Event()
+    async def embed(_):
+        await gate.wait()
+        return [[.1]]
+    adapter._embeddings.embed_query = AsyncMock(side_effect=embed)
+    async with adapter.query_embedding_scope():
+        first = asyncio.create_task(adapter._embed_query(["same"]))
+        await asyncio.sleep(0)
+        second = asyncio.create_task(adapter._embed_query(["same"]))
+        gate.set()
+        await asyncio.gather(first, second)
+    assert adapter._embeddings.embed_query.await_count == 1
+
+async def test_chromadb_embedding_scope_shares_one_transient_retry_ladder(adapter):
+    adapter._query_embedding_cache = contextvars.ContextVar("ladder", default=None)
+    calls = 0
+    async def embed(_):
+        nonlocal calls
+        calls += 1
+        try:
+            raise RuntimeError("transient")
+        except RuntimeError:
+            calls += 1
+        return [[.1]]
+    adapter._embeddings.embed_query = AsyncMock(side_effect=embed)
+    async with adapter.query_embedding_scope():
+        first, second = await asyncio.gather(adapter._embed_query(["same"]), adapter._embed_query(["same"]))
+    assert first == second == [[.1]]
+    assert adapter._embeddings.embed_query.await_count == 1 and calls == 2
+
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_chromadb_embedding_scope_evicts_failed_or_cancelled_inflight_entry(adapter, cancel):
+    adapter._query_embedding_cache = contextvars.ContextVar("evict", default=None)
+    adapter._embeddings.embed_query = AsyncMock(side_effect=[asyncio.CancelledError() if cancel else RuntimeError("x"), [[.1]]])
+    async with adapter.query_embedding_scope():
+        with pytest.raises(asyncio.CancelledError if cancel else RuntimeError):
+            await adapter._embed_query(["same"])
+        await adapter._embed_query(["same"])
+    assert adapter._embeddings.embed_query.await_count == 2
+
+async def test_chromadb_embedding_scope_cleans_pending_entries_on_exit(adapter):
+    adapter._query_embedding_cache = contextvars.ContextVar("clean", default=None)
+    wait = asyncio.Event()
+    async def embed(_):
+        await wait.wait()
+        return [[.1]]
+    adapter._embeddings.embed_query = AsyncMock(side_effect=embed)
+    async with adapter.query_embedding_scope():
+        task = asyncio.create_task(adapter._embed_query(["same"]))
+        await asyncio.sleep(0)
+    assert task.cancelled()
+
 
 def test_chromadb_query_signature_remains_knowledge_store_compatible() -> None:
     from core.ports.knowledge_store import KnowledgeStorePort

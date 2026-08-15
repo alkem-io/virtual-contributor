@@ -5,7 +5,7 @@ Unified microkernel engine with pluggable handlers for AI-powered virtual contri
 Expert evaluation normalizes its selected plugin before adapter composition and
 stores invariant plus mode-bound full composition fingerprints. Paired Expert
 comparison is fail-closed: it accepts only a failure-free flat-to-hierarchical
-v4 pair with matching canonical test-set, BoK, corpus-revision, and successful
+v5 pair with matching canonical test-set, BoK, corpus-revision, and successful
 case identities. Corpus revision is an audit token, not deployment or
 re-ingestion proof; privacy approval, evaluation, enablement, and rollout stay
 human gates.
@@ -335,9 +335,10 @@ hierarchy names without disabling scoped retrieval.
 
 Enable only after deployment with both controls off, re-ingestion of selected
 spaces, and the required human gates. `RG-05` is the representative paired
-flat/on RAGAS evaluation on one reviewed query set; its runs require matching
-effective, non-secret production/evaluation fingerprints and comparison fails
-closed when either fingerprint is absent or differs. `RG-05P` is the separate
+flat/on RAGAS evaluation on one reviewed query set; its runs require equal
+invariant fingerprints and present, recomputable mode-bound full fingerprints
+that differ between flat and hierarchical modes. Comparison fails closed when
+those conditions are not met. `RG-05P` is the separate
 provider-processing gate required before display names may be enabled. The
 repository's deterministic proxy is structural evidence only, while `SC-009`
 is the full-suite regression gate. `SUMMARIZE_ENABLED` remains unchanged.
@@ -630,9 +631,11 @@ poetry run python -m evaluation.cli list
 3. **Scorer**: Wraps RAGAS metrics, uses the pipeline's own LLM as judge via `LangchainLLMWrapper`
 4. **Runner**: Executes the test suite, computes per-metric aggregates, persists results to `evaluations/{id}.json`
 
-Paired Expert comparisons require both non-secret effective-composition
-fingerprints to be present and equal; otherwise comparison fails closed rather
-than treating a configuration change as a hierarchy-only experiment.
+Paired Expert comparisons require equal non-secret invariant-composition
+fingerprints. Both full fingerprints must be present, recomputable from the
+invariant identity and their explicit modes, and different for flat versus
+hierarchical runs; otherwise comparison fails closed rather than treating a
+configuration change as a hierarchy-only experiment.
 
 ## Testing
 

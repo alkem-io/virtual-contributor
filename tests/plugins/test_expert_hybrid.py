@@ -47,6 +47,89 @@ class _Store(MockKnowledgeStorePort):
         )
 
 
+async def test_concurrent_hybrid_arms_share_one_exact_embedding_submission() -> None:
+    """Expert opens one real request scope around both hybrid arms."""
+    import contextvars
+    from core.adapters.chromadb import ChromaDBAdapter
+
+    adapter = ChromaDBAdapter.__new__(ChromaDBAdapter)
+    adapter._query_embedding_cache = contextvars.ContextVar("expert-scope", default=None)
+    adapter._embeddings = type("Embeddings", (), {})()
+    gate = __import__("asyncio").Event()
+    calls = 0
+    async def embed_query(texts):
+        nonlocal calls
+        calls += 1
+        await gate.wait()
+        return [[.1]]
+    adapter._embeddings.embed_query = embed_query
+
+    class Store(MockKnowledgeStorePort):
+        def query_embedding_scope(self):
+            return adapter.query_embedding_scope()
+        async def query(self, *args, **kwargs):
+            return await adapter._embed_query(["same"]) and QueryResult([[]], [[]], [[]], [[]])
+        async def query_lexical(self, *args, **kwargs):
+            return await adapter._embed_query(["same"]) and QueryResult([[]], [[]], [[]], [[]])
+
+    plugin = _plugin(Store(), hybrid=_Hybrid())
+    task = __import__("asyncio").create_task(plugin.handle(_event("same")))
+    await __import__("asyncio").sleep(0)
+    gate.set()
+    await task
+    assert calls == 1
+
+
+async def test_traced_concurrent_hybrid_arms_share_one_retry_ladder() -> None:
+    """The tracing wrapper forwards the same scope rather than opening two."""
+    from core.tracing_knowledge_store import TracedKnowledgeStore
+    import contextvars
+    from core.adapters.chromadb import ChromaDBAdapter
+
+    adapter = ChromaDBAdapter.__new__(ChromaDBAdapter)
+    adapter._query_embedding_cache = contextvars.ContextVar("traced-expert-scope", default=None)
+    outer_calls = 0
+    provider_attempts = 0
+    first_attempt = __import__("asyncio").Event()
+    release_retry = __import__("asyncio").Event()
+    class Embeddings:
+        async def embed_query(self, texts):
+            nonlocal outer_calls, provider_attempts
+            outer_calls += 1
+            async def provider():
+                nonlocal provider_attempts
+                provider_attempts += 1
+                if provider_attempts == 1:
+                    first_attempt.set()
+                    await release_retry.wait()
+                    raise ConnectionError("transient provider failure")
+                return [[.1]]
+            try:
+                return await provider()
+            except ConnectionError:
+                # The adapter-owned outer operation retries internally; the
+                # second hybrid arm must join this same task and ladder.
+                return await provider()
+    adapter._embeddings = Embeddings()
+    class Store(MockKnowledgeStorePort):
+        def query_embedding_scope(self):
+            return adapter.query_embedding_scope()
+        async def query(self, *args, **kwargs):
+            await adapter._embed_query(["same"])
+            return QueryResult([[]], [[]], [[]], [[]])
+        async def query_lexical(self, *args, **kwargs):
+            await adapter._embed_query(["same"])
+            return QueryResult([[]], [[]], [[]], [[]])
+    # Forwarding capability is the contract; retrieval uses the wrapped store.
+    store = TracedKnowledgeStore(Store())
+    task = __import__("asyncio").create_task(_plugin(store, hybrid=_Hybrid()).handle(_event("same")))
+    await first_attempt.wait()
+    await __import__("asyncio").sleep(0)
+    release_retry.set()
+    await task
+    assert outer_calls == 1 and provider_attempts == 2
+
+
 def _plugin(store, *, hybrid) -> ExpertPlugin:
     return ExpertPlugin(
         llm=MockLLMPort(response="answer"),

@@ -210,6 +210,7 @@ class EvaluationRunner:
             label=label,
             plugin_type=plugin_type,
             composition_fingerprint=fingerprint,
+            composition_identity_version=5 if normalized_plugin == "expert" else None,
             hierarchy_mode=mode if normalized_plugin == "expert" else None,
             test_set_digest=canonical_test_set_digest(test_cases) if normalized_plugin == "expert" else None,
             body_of_knowledge_digest=hashlib.sha256((body_of_knowledge_id or "").encode("utf-8")).hexdigest() if normalized_plugin == "expert" else None,

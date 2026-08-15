@@ -31,7 +31,19 @@ class OpenAIEmbeddingsAdapter:
         self._total_deadline_seconds = total_deadline_seconds
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
-        return await self._call(texts)
+        last_exc: Exception | None = None
+        for attempt in range(MAX_RETRIES):
+            try:
+                response = await self._client.embeddings.create(
+                    model=self._model_name, input=texts,
+                )
+                return [item.embedding for item in response.data]
+            except Exception as exc:
+                last_exc = exc
+                if attempt + 1 < MAX_RETRIES:
+                    await asyncio.sleep(BASE_DELAY * (2 ** attempt))
+        assert last_exc is not None
+        raise last_exc
 
     async def embed_query(self, texts: list[str]) -> list[list[float]]:
         if any(len(text.encode("utf-8")) > self._query_max_utf8_bytes for text in texts):

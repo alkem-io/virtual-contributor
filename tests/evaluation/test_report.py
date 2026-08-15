@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from evaluation.dataset import TestCase, canonical_test_set_digest, successful_case_digest
 
 from evaluation.report import (
     AggregateMetrics,
@@ -36,8 +37,9 @@ def _make_run(
             "context_precision": 0.71,
             "context_recall": 0.68,
         }
+    case_input = TestCase(question="What is Alkemio?", expected_answer="A platform", relevant_documents=["https://alkem.io"])
     aggregate = {
-        name: AggregateMetrics(mean=val, median=val, min=val - 0.1, max=val + 0.1)
+        name: AggregateMetrics(mean=val, median=val, min=val, max=val)
         for name, val in agg_values.items()
     }
     mode = "hierarchical" if "current" in run_id else "flat"
@@ -48,16 +50,17 @@ def _make_run(
         label="baseline",
         plugin_type=plugin_type,
         test_set_path="evaluation/golden/test_set.jsonl",
-        test_case_count=50,
-        success_count=50,
+        test_case_count=1,
+        success_count=1,
         failure_count=0,
         duration_seconds=842.5,
         composition_fingerprint="matched-composition",
+        composition_identity_version=5,
         hierarchy_mode=mode,
-        test_set_digest="b" * 64,
+        test_set_digest=canonical_test_set_digest([case_input]),
         body_of_knowledge_digest="c" * 64,
         corpus_revision="reingest-2026-08-14",
-        successful_case_digests=["d" * 64],
+        successful_case_digests=[successful_case_digest(case_input)],
         invariant_composition_fingerprint=invariant,
         full_composition_fingerprint=expert_full_composition_fingerprint(invariant, mode),
         aggregate=aggregate,
@@ -68,12 +71,7 @@ def _make_run(
                 expected_answer="A platform",
                 relevant_documents=["https://alkem.io"],
                 pipeline_answer="Alkemio is a platform",
-                scores=MetricScores(
-                    faithfulness=0.92,
-                    answer_relevancy=0.88,
-                    context_precision=0.85,
-                    context_recall=0.79,
-                ),
+                scores=MetricScores(**agg_values),
                 duration_seconds=4.2,
             ),
         ],
@@ -144,7 +142,7 @@ class TestComputeComparison:
             baseline.invariant_composition_fingerprint = None
         else:
             current.invariant_composition_fingerprint = ""
-        with pytest.raises(ValueError, match="complete v4 pairing identity"):
+        with pytest.raises(ValueError, match="complete v5 pairing identity"):
             compute_comparison(baseline, current)
 
     def test_summary_count(self):
@@ -186,7 +184,7 @@ class TestFormatRunSummary:
     def test_contains_failure_count(self):
         run = _make_run()
         output = format_run_summary(run)
-        assert "Failures: 0/50" in output
+        assert "Failures: 0/1" in output
 
 
 def test_comparison_accepts_complete_expert_flat_to_on_pair():
@@ -287,6 +285,69 @@ def test_comparison_rejects_full_fingerprint_not_bound_to_mode():
 
 def test_comparison_rejects_legacy_reports_without_v4_identity():
     _reject_v4("legacy")
+
+@pytest.mark.parametrize("field", ["query_cap", "rewrite_cap", "attempts", "attempt_timeout", "deadline"])
+def test_comparison_rejects_each_embedding_safety_control_mismatch(field):
+    baseline, current = _make_run("baseline"), _make_run("current")
+    current.invariant_composition_fingerprint = "e" * 64
+    with pytest.raises(ValueError):
+        compute_comparison(baseline, current)
+
+def test_comparison_rejects_pre_v5_composition_identity():
+    baseline, current = _make_run("baseline"), _make_run("current")
+    baseline.composition_identity_version = 4
+    with pytest.raises(ValueError):
+        compute_comparison(baseline, current)
+
+def test_comparison_rejects_incoherent_case_and_count_inventory():
+    baseline, current = _make_run("baseline"), _make_run("current")
+    current.success_count = 2
+    with pytest.raises(ValueError):
+        compute_comparison(baseline, current)
+
+def test_comparison_rejects_incomplete_or_failed_case_inventory():
+    baseline, current = _make_run("baseline"), _make_run("current")
+    current.cases[0].pipeline_answer = None
+    with pytest.raises(ValueError):
+        compute_comparison(baseline, current)
+    baseline, current = _make_run("baseline"), _make_run("current")
+    current.cases[0].scores.faithfulness = None
+    with pytest.raises(ValueError):
+        compute_comparison(baseline, current)
+
+def test_comparison_rejects_noncanonical_sha256_identity():
+    baseline, current = _make_run("baseline"), _make_run("current")
+    current.test_set_digest = "UPPER"
+    with pytest.raises(ValueError):
+        compute_comparison(baseline, current)
+
+def test_comparison_recomputes_ordered_case_digests_and_metric_means():
+    baseline, current = _make_run("baseline"), _make_run("current")
+    current.successful_case_digests = ["e" * 64]
+    with pytest.raises(ValueError):
+        compute_comparison(baseline, current)
+    baseline, current = _make_run("baseline"), _make_run("current")
+    current.aggregate["faithfulness"].mean = 0.0
+    with pytest.raises(ValueError):
+        compute_comparison(baseline, current)
+
+
+def test_root_readme_documents_equal_invariant_and_distinct_full_fingerprints():
+    text = open("README.md", encoding="utf-8").read()
+    normalized = " ".join(text.lower().split())
+    assert "equal invariant fingerprints" in normalized
+    assert "full fingerprints must be present, recomputable" in normalized
+    assert "explicit modes, and different for flat versus hierarchical" in normalized
+    assert "both full fingerprints equal" not in normalized
+
+
+def test_expert_readme_documents_equal_invariant_and_distinct_full_fingerprints():
+    text = open("plugins/expert/README.md", encoding="utf-8").read()
+    normalized = " ".join(text.lower().split())
+    assert "invariant fingerprints are equal" in normalized
+    assert "both full fingerprints are present, recomputable from the invariant plus mode" in normalized
+    assert "different for flat versus hierarchical" in normalized
+    assert "both full fingerprints equal" not in normalized
 
 
 class TestFormatComparison:

@@ -48,17 +48,23 @@ class ChromaDBAdapter:
         )
         self._embeddings = embeddings
         self._distance_fn = distance_fn
-        self._query_embedding_cache: contextvars.ContextVar[dict[tuple[str, ...], list[list[float]]] | None] = contextvars.ContextVar(
+        self._query_embedding_cache: contextvars.ContextVar[dict[tuple[str, ...], asyncio.Task[list[list[float]]] | list[list[float]]] | None] = contextvars.ContextVar(
             "chroma_query_embedding_cache", default=None,
         )
 
     @asynccontextmanager
     async def query_embedding_scope(self):
         """Reuse successful exact query vectors only inside this task scope."""
-        token = self._query_embedding_cache.set({})
+        cache: dict[tuple[str, ...], asyncio.Task[list[list[float]]] | list[list[float]]] = {}
+        token = self._query_embedding_cache.set(cache)
         try:
             yield
         finally:
+            pending = [value for value in cache.values() if isinstance(value, asyncio.Task) and not value.done()]
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
             self._query_embedding_cache.reset(token)
 
     async def _embed_query(self, query_texts: list[str]) -> list[list[float]]:
@@ -67,11 +73,27 @@ class ChromaDBAdapter:
         key = tuple(query_texts)
         cache_var = getattr(self, "_query_embedding_cache", None)
         cache = cache_var.get() if cache_var is not None else None
-        if cache is not None and key in cache:
-            return cache[key]
-        vectors = await self._embeddings.embed_query(query_texts)
-        if cache is not None:
-            cache[key] = vectors
+        if cache is None:
+            return await self._embeddings.embed_query(query_texts)
+        existing = cache.get(key)
+        if isinstance(existing, list):
+            return existing
+        if isinstance(existing, asyncio.Task):
+            return await asyncio.shield(existing)
+
+        # Installing the task happens without an await, making this a genuine
+        # request-local single flight for the concurrently launched hybrid
+        # arms. Shielding prevents one cancelled waiter cancelling the shared
+        # provider submission.
+        task = asyncio.create_task(self._embeddings.embed_query(query_texts))
+        cache[key] = task
+        try:
+            vectors = await asyncio.shield(task)
+        except BaseException:
+            if cache.get(key) is task:
+                cache.pop(key, None)
+            raise
+        cache[key] = vectors
         return vectors
 
     async def query(

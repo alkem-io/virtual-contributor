@@ -627,14 +627,16 @@ def build_message_handler(
                     plugin.handle(event),
                     timeout=config.pipeline_timeout,
                 )
-                if root is not None:
-                    from core.tracing import set_content_attribute
-                    set_content_attribute(root, "vc.message", getattr(event, "message", None), config)
                 envelope = router.build_response_envelope(response, event)
                 await _publish_result(envelope)
                 if root is not None:
                     from opentelemetry import trace
 
+                    # Early-ACK events have already acknowledged delivery;
+                    # retain the same success-only structural ordering for
+                    # future message-bearing early-ACK event types.
+                    from core.tracing import set_content_attribute
+                    set_content_attribute(root, "vc.message", getattr(event, "message", None), config)
                     root.set_status(trace.Status(trace.StatusCode.OK))
             except LLMInvocationTimeoutError as exc:
                 logger.error(
@@ -709,9 +711,6 @@ def build_message_handler(
                             plugin.handle(event),
                             timeout=config.pipeline_timeout,
                         )
-                        if root is not None:
-                            from core.tracing import set_content_attribute
-                            set_content_attribute(root, "vc.message", getattr(event, "message", None), config)
                         envelope = router.build_response_envelope(response, event)
                         await _publish_result(envelope)
                         published = True
@@ -719,6 +718,8 @@ def build_message_handler(
                         if root is not None:
                             from opentelemetry import trace
 
+                            from core.tracing import set_content_attribute
+                            set_content_attribute(root, "vc.message", getattr(event, "message", None), config)
                             root.set_status(trace.Status(trace.StatusCode.OK))
                     except LLMInvocationTimeoutError as exc:
                         logger.error(

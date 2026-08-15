@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import re
+import hashlib
+import json
+import statistics
 
 from plugins.expert.composition import expert_full_composition_fingerprint
 
@@ -58,6 +61,7 @@ class EvaluationRun(BaseModel):
     label: str | None = None
     plugin_type: str
     composition_fingerprint: str | None = None
+    composition_identity_version: int | None = None
     # v4 pairing identity. Optional only so historical JSON remains displayable;
     # comparison below intentionally requires every member.
     hierarchy_mode: str | None = None
@@ -179,13 +183,17 @@ def compute_comparison(
         "invariant_composition_fingerprint", "full_composition_fingerprint",
     )
     if any(getattr(run, field) in (None, "") for run in runs for field in required):
-        raise ValueError("Evaluation runs lack complete v4 pairing identity")
+        raise ValueError("Evaluation runs lack complete v5 pairing identity")
+    if any(run.composition_identity_version != 5 for run in runs):
+        raise ValueError("Evaluation runs require v5 composition identity")
     if baseline.plugin_type != "expert" or current.plugin_type != "expert":
         raise ValueError("Only Expert evaluation runs are comparable")
     if baseline.hierarchy_mode != "flat" or current.hierarchy_mode != "hierarchical":
         raise ValueError("Evaluation comparison requires Expert flat-to-hierarchical ordering")
     if baseline.failure_count or current.failure_count:
         raise ValueError("Evaluation comparison requires failure-free runs")
+    for run in runs:
+        _validate_persisted_run(run)
     if not all(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}", run.corpus_revision or "") for run in runs):
         raise ValueError("Evaluation corpus revision is invalid")
     for field in ("test_set_digest", "body_of_knowledge_digest", "corpus_revision", "successful_case_digests", "invariant_composition_fingerprint"):
@@ -218,3 +226,58 @@ def compute_comparison(
         current_id=current.id,
         deltas=deltas,
     )
+
+
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+
+
+def _case_digest(case: EvaluationCase) -> str:
+    """Return the canonical input identity for one persisted successful case."""
+    payload = {
+        "expected_answer": case.expected_answer,
+        "question": case.question,
+        "relevant_documents": case.relevant_documents,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _validate_persisted_run(run: EvaluationRun) -> None:
+    """Fail closed when persisted evidence is not a coherent v5 experiment."""
+    if any(value < 0 for value in (run.test_case_count, run.success_count, run.failure_count)):
+        raise ValueError("Evaluation counts must be nonnegative")
+    if run.test_case_count != len(run.cases) or run.success_count + run.failure_count != run.test_case_count:
+        raise ValueError("Evaluation case and count inventory is incoherent")
+    if [case.index for case in run.cases] != list(range(run.test_case_count)):
+        raise ValueError("Evaluation cases must be complete and ordered")
+    if any(case.error is not None or case.scores is None or not case.pipeline_answer for case in run.cases):
+        raise ValueError("Evaluation comparison requires complete successful cases")
+    identities = [
+        run.test_set_digest, run.body_of_knowledge_digest,
+        run.invariant_composition_fingerprint, run.full_composition_fingerprint,
+        *(run.successful_case_digests or []),
+    ]
+    if any(not isinstance(value, str) or _SHA256.fullmatch(value) is None for value in identities):
+        raise ValueError("Evaluation identities must be lowercase SHA-256 digests")
+    digests = [_case_digest(case) for case in run.cases]
+    if run.successful_case_digests != digests:
+        raise ValueError("Evaluation successful case digests do not match cases")
+    dataset_payload = [
+        {"expected_answer": case.expected_answer, "question": case.question, "relevant_documents": case.relevant_documents}
+        for case in run.cases
+    ]
+    expected_dataset = hashlib.sha256(
+        json.dumps(dataset_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    if run.test_set_digest != expected_dataset:
+        raise ValueError("Evaluation test-set digest does not match cases")
+    if set(run.aggregate) != set(METRIC_NAMES):
+        raise ValueError("Evaluation aggregate metrics must include exactly the required metrics")
+    for metric in METRIC_NAMES:
+        if any(getattr(case.scores, metric) is None for case in run.cases):
+            raise ValueError("Evaluation cases must include every required metric score")
+        values = [getattr(case.scores, metric) for case in run.cases if getattr(case.scores, metric) is not None]
+        aggregate = run.aggregate.get(metric)
+        if not values or aggregate is None or aggregate.mean != statistics.mean(values) or aggregate.median != statistics.median(values) or aggregate.min != min(values) or aggregate.max != max(values):
+            raise ValueError("Evaluation aggregate metrics do not match cases")

@@ -742,6 +742,11 @@ class ExpertPlugin:
         # it must not first be copied to an LLM rewrite provider.
         if len(event.message.encode("utf-8")) > self._embedding_query_max_utf8_bytes:
             return event.message
+        # The rewrite model is an egress boundary in its own right.  Apply its
+        # smaller limit before policy/prompt construction, not merely to the
+        # returned candidate.
+        if len(event.message.encode("utf-8")) > self._rewrite_max_utf8_bytes:
+            return event.message
         if not should_rewrite(event.message, event.history, self._rewrite_policy):
             return event.message
         from plugins.guidance.prompts import condense_prompt

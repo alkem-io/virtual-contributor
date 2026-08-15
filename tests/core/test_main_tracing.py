@@ -4,6 +4,8 @@ import json
 import logging
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from core.config import BaseConfig
 from core.tracing import configure_tracing, reset_tracing_for_tests, shutdown_tracing
 from main import _log_config, _mask_sensitive, _shutdown_tracing_bounded
@@ -116,16 +118,17 @@ class _MainConfig(BaseConfig):
     embeddings_total_deadline_seconds: int = 1
 
 
-def _wiring(plugin_handle, plugin_type: str = "guidance", **config_overrides):
+def _wiring(plugin_handle, plugin_type: str = "guidance", plugin_object=None, **config_overrides):
     import asyncio as _asyncio
     from unittest.mock import AsyncMock
 
     from core.router import Router
     from main import build_message_handler
 
-    plugin = MagicMock()
+    plugin = plugin_object or MagicMock()
     plugin.name = plugin_type
-    plugin.handle = plugin_handle
+    if plugin_object is None:
+        plugin.handle = plugin_handle
     transport = AsyncMock()
     router = Router(plugin_type=plugin_type)
     active: set[_asyncio.Task] = set()
@@ -385,3 +388,274 @@ async def test_exhausted_transient_embedding_failure_is_not_republished(
     assert _published_result(transport) == "Error: unable to process request"
     assert "token=abc123" not in caplog.text
     assert "token=abc123" not in str(traced_exporter.get_finished_spans())
+
+
+@pytest.mark.parametrize("error_type", [
+    __import__("core.ports.embeddings", fromlist=["EmbeddingInputError"]).EmbeddingInputError,
+    __import__("core.ports.embeddings", fromlist=["EmbeddingTransientError"]).EmbeddingTransientError,
+])
+async def test_lexical_embedding_error_is_terminal_without_rabbit_republish(
+    traced_exporter, error_type,
+) -> None:
+    """The real handler retains the typed lexical exception and ends locally."""
+    from core import tracing
+    failure = error_type("private lexical predicate")
+    captured = []
+    original = tracing.record_failure
+    def keep(span, exc, mode, *, config=None):
+        captured.append(exc)
+        return original(span, exc, mode, config=config)
+    async def handle(event): raise failure
+    handler, _, _, transport = _wiring(handle)
+    message = _Message()
+    with patch("core.tracing.record_failure", side_effect=keep):
+        await handler(_query_body(), message)
+    shutdown_tracing()
+    assert captured == [failure] and transport.republish_with_headers.await_count == 0
+    assert _published_result(transport) == "Error: unable to process request"
+    assert message.acked or message.rejected
+
+
+def _root_without_message(exporter):
+    root = next(span for span in exporter.get_finished_spans() if span.name == "vc.handle")
+    assert "vc.message" not in root.attributes
+    assert root.status.status_code.name == "ERROR"
+    return root
+
+
+def _assert_failure_sinks(exporter, caplog, sentinel: str, transport=None):
+    """One assertion surface, while each test keeps its own real fault path."""
+    root = _root_without_message(exporter)
+    surfaces = caplog.text + str(root.attributes) + str(root.events) + str(root.status)
+    assert sentinel not in surfaces and "stacktrace" not in surfaces
+    if transport is not None and transport.publish.await_count:
+        payloads = [json.loads(call.args[2]) for call in transport.publish.await_args_list]
+        assert all(sentinel not in str(payload) for payload in payloads)
+    return root
+
+
+async def test_real_handler_terminal_failure_preserves_identity_and_redacts_all_sinks(traced_exporter, caplog) -> None:
+    from core import tracing
+    failure, seen = RuntimeError("member@example.test secret"), []
+    original = tracing.record_failure
+    def keep(span, exc, mode, *, config=None):
+        seen.append(exc)
+        return original(span, exc, mode, config=config)
+    async def handle(event):
+        raise failure
+    caplog.set_level(logging.ERROR)
+    handler, _, _, transport = _wiring(handle, tracing_capture_content=True)
+    with patch("core.tracing.record_failure", side_effect=keep):
+        await handler(_query_body(), _Message())
+    shutdown_tracing()
+    root = _assert_failure_sinks(traced_exporter, caplog, "member@example.test", transport)
+    assert seen == [failure] and _published_result(transport) == "Error: unable to process request"
+    assert "member@example.test" not in caplog.text + str(root.attributes) + str(root.events)
+
+
+async def test_real_handler_retry_republish_failure_redacts_all_sinks(traced_exporter, caplog) -> None:
+    async def handle(event): raise RuntimeError("retry secret")
+    handler, _, _, transport = _wiring(handle, rabbitmq_max_retries=2, tracing_capture_content=True)
+    transport.republish_with_headers.side_effect = ConnectionError("republish secret")
+    caplog.set_level(logging.ERROR)
+    await handler(_query_body(), _Message())
+    shutdown_tracing()
+    _assert_failure_sinks(traced_exporter, caplog, "retry secret", transport)
+    _assert_failure_sinks(traced_exporter, caplog, "republish secret", transport)
+    assert transport.republish_with_headers.await_count == 1
+
+
+async def test_real_handler_result_publish_failure_redacts_all_sinks(traced_exporter, caplog) -> None:
+    from core.events.response import Response
+    async def handle(event): return Response(result="answer")
+    handler, _, _, transport = _wiring(handle, tracing_capture_content=True)
+    transport.publish.side_effect = ConnectionError("publish secret")
+    caplog.set_level(logging.ERROR)
+    await handler(_query_body(), _Message())
+    shutdown_tracing()
+    _assert_failure_sinks(traced_exporter, caplog, "publish secret", transport)
+    assert transport.publish.await_count == 2
+
+
+async def test_real_handler_late_ack_failure_redacts_all_sinks(traced_exporter, caplog) -> None:
+    from core.events.response import Response
+    class AckFails(_Message):
+        async def ack(self): raise ConnectionError("ack secret")
+    async def handle(event): return Response(result="answer")
+    handler, _, _, transport = _wiring(handle, tracing_capture_content=True)
+    caplog.set_level(logging.ERROR)
+    await handler(_query_body(), AckFails())
+    shutdown_tracing()
+    _assert_failure_sinks(traced_exporter, caplog, "ack secret", transport)
+    assert transport.publish.await_count == 1
+
+
+async def test_real_handler_envelope_failure_redacts_all_sinks(traced_exporter, caplog) -> None:
+    from core.events.response import Response
+    async def handle(event): return Response(result="answer")
+    handler, _, _, transport = _wiring(handle, tracing_capture_content=True)
+    caplog.set_level(logging.ERROR)
+    with patch("core.router.Router.build_response_envelope", side_effect=ValueError("envelope secret")):
+        await handler(_query_body(), _Message())
+    shutdown_tracing()
+    _assert_failure_sinks(traced_exporter, caplog, "envelope secret", transport)
+    assert transport.publish.await_count == 0
+
+
+async def test_real_expert_flat_failure_redacts_all_sinks(traced_exporter, caplog) -> None:
+    from core import tracing
+    from core.ports.embeddings import EmbeddingInputError
+    from plugins.expert.plugin import ExpertPlugin
+    from tests.conftest import MockKnowledgeStorePort, MockLLMPort
+    failure = EmbeddingInputError("flat lexical secret")
+    class Store(MockKnowledgeStorePort):
+        def __init__(self):
+            super().__init__()
+            self.calls = []
+        async def query(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            raise failure
+    store = Store()
+    expert = ExpertPlugin(MockLLMPort(), store)
+    handler, _, _, transport = _wiring(None, plugin_type="expert", plugin_object=expert, tracing_capture_content=True)
+    recorded = []
+    original = tracing.record_failure
+    def keep(span, exc, mode, *, config=None):
+        recorded.append(exc)
+        return original(span, exc, mode, config=config)
+    caplog.set_level(logging.ERROR)
+    with patch("core.tracing.record_failure", side_effect=keep):
+        await handler(_query_body(), _Message())
+    shutdown_tracing()
+    _assert_failure_sinks(traced_exporter, caplog, "flat lexical secret", transport)
+    assert recorded and all(exc is failure for exc in recorded) and len(store.calls) == 1
+    assert _published_result(transport) == "Error: unable to process request"
+
+
+async def test_real_expert_hierarchy_failure_redacts_all_sinks(traced_exporter, caplog) -> None:
+    from core import tracing
+    from core.ports.embeddings import EmbeddingPermanentError
+    from plugins.expert.plugin import ExpertPlugin
+    from tests.conftest import MockKnowledgeStorePort, MockLLMPort
+    failure = EmbeddingPermanentError("hierarchy lexical secret")
+    class Store(MockKnowledgeStorePort):
+        def __init__(self):
+            super().__init__()
+            self.calls = []
+        async def query(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            raise failure
+    store = Store()
+    expert = ExpertPlugin(MockLLMPort(), store, hierarchical_retrieval_enabled=True)
+    handler, _, _, transport = _wiring(None, plugin_type="expert", plugin_object=expert, tracing_capture_content=True)
+    recorded = []
+    original = tracing.record_failure
+    def keep(span, exc, mode, *, config=None):
+        recorded.append(exc)
+        return original(span, exc, mode, config=config)
+    caplog.set_level(logging.ERROR)
+    with patch("core.tracing.record_failure", side_effect=keep):
+        await handler(_query_body(), _Message())
+    shutdown_tracing()
+    _assert_failure_sinks(traced_exporter, caplog, "hierarchy lexical secret", transport)
+    assert recorded and all(exc is failure for exc in recorded) and len(store.calls) == 1
+    assert store.calls[0][1]["where"] is not None
+    assert _published_result(transport) == "Error: unable to process request"
+
+
+async def test_real_handler_capture_modes_export_content_only_after_success(traced_exporter) -> None:
+    from core.events.response import Response
+    async def handle(event): return Response(result="answer")
+    handler, _, _, _ = _wiring(handle, tracing_capture_content=False)
+    await handler(_query_body(), _Message())
+    shutdown_tracing()
+    root = next(span for span in traced_exporter.get_finished_spans() if span.name == "vc.handle")
+    assert root.status.status_code.name == "OK" and "vc.message" not in root.attributes
+
+
+async def test_successful_late_ack_span_records_bounded_message_after_publish_and_ack(traced_exporter) -> None:
+    from core import tracing
+    from core.events.response import Response
+    async def handle(event): return Response(result="answer")
+    handler, _, config, transport = _wiring(handle, tracing_capture_content=True, tracing_content_max_chars=3)
+    order = []
+    async def publish(*args): order.append("publish")
+    transport.publish.side_effect = publish
+    class OrderedMessage(_Message):
+        async def ack(self):
+            order.append("ack")
+            await super().ack()
+    original = tracing.set_content_attribute
+    def capture(span, key, text, cfg):
+        order.append("content")
+        return original(span, key, text, cfg)
+    with patch("core.tracing.set_content_attribute", side_effect=capture):
+        message = OrderedMessage()
+        await handler(_query_body(), message)
+    shutdown_tracing()
+    root = next(span for span in traced_exporter.get_finished_spans() if span.name == "vc.handle")
+    assert transport.publish.await_count == 1 and message.acked and order == ["publish", "ack", "content"]
+    assert root.attributes["vc.message"] == "Wha"
+    assert root.status.status_code.name == "OK"
+
+
+async def test_envelope_failure_span_never_records_member_message(traced_exporter) -> None:
+    from core.events.response import Response
+    async def handle(event): return Response(result="answer")
+    handler, _, _, _ = _wiring(handle, tracing_capture_content=True)
+    with patch("core.router.Router.build_response_envelope", side_effect=ValueError("envelope")):
+        await handler(_query_body(), _Message())
+    shutdown_tracing()
+    _root_without_message(traced_exporter)
+
+
+async def test_result_publish_failure_span_never_records_member_message(traced_exporter) -> None:
+    from core.events.response import Response
+    async def handle(event): return Response(result="answer")
+    handler, _, _, transport = _wiring(handle, tracing_capture_content=True)
+    transport.publish.side_effect = ConnectionError("publisher")
+    await handler(_query_body(), _Message())
+    shutdown_tracing()
+    _root_without_message(traced_exporter)
+
+
+async def test_late_ack_failure_span_never_records_member_message(traced_exporter) -> None:
+    from core.events.response import Response
+    class AckFails(_Message):
+        async def ack(self): raise ConnectionError("ack")
+    async def handle(event): return Response(result="answer")
+    handler, _, _, _ = _wiring(handle, tracing_capture_content=True)
+    await handler(_query_body(), AckFails())
+    shutdown_tracing()
+    _root_without_message(traced_exporter)
+
+
+async def test_retry_republish_failure_span_never_records_member_message(traced_exporter) -> None:
+    async def handle(event): raise RuntimeError("plugin")
+    handler, _, _, transport = _wiring(handle, rabbitmq_max_retries=2, tracing_capture_content=True)
+    transport.republish_with_headers.side_effect = ConnectionError("republish")
+    await handler(_query_body(), _Message())
+    shutdown_tracing()
+    _root_without_message(traced_exporter)
+
+
+async def test_terminal_or_fallback_publish_failure_span_never_records_member_message(traced_exporter) -> None:
+    async def handle(event): raise RuntimeError("plugin")
+    handler, _, _, transport = _wiring(handle, tracing_capture_content=True)
+    transport.publish.side_effect = ConnectionError("fallback")
+    await handler(_query_body(), _Message())
+    shutdown_tracing()
+    _root_without_message(traced_exporter)
+
+
+async def test_early_ack_failure_span_never_records_content_attribute(traced_exporter) -> None:
+    async def handle(event): raise RuntimeError("post-ack pipeline failure")
+    handler, active, _, _ = _wiring(handle, plugin_type="ingest-website", tracing_capture_content=True)
+    body = {"eventType": "IngestWebsite", "baseUrl": "https://example.com", "type": "website", "purpose": "knowledge", "personaId": "p"}
+    message = _Message()
+    await handler(body, message)
+    await __import__("asyncio").gather(*active)
+    shutdown_tracing()
+    roots = [span for span in traced_exporter.get_finished_spans() if span.name == "vc.handle"]
+    assert message.acked and len(roots) == 1 and roots[0].status.status_code.name == "ERROR"
+    assert "vc.message" not in roots[0].attributes

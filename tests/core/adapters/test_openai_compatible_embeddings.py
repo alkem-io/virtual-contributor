@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -10,7 +11,7 @@ from core.adapters.openai_compatible_embeddings import (
     QWEN3_RETRIEVAL_INSTRUCTION,
     OpenAICompatibleEmbeddingsAdapter,
 )
-from core.ports.embeddings import EmbeddingInputError, EmbeddingPermanentError
+from core.ports.embeddings import EmbeddingInputError, EmbeddingPermanentError, EmbeddingTransientError
 
 
 def _fake_response(dim: int = 4, n: int = 1):
@@ -161,3 +162,70 @@ class TestWrappingBehaviour:
             with pytest.raises(Exception):
                 await adapter.embed_query(["q"])
         assert "private-query" not in caplog.text and "error_type=ConnectError" in caplog.text
+
+    async def test_local_attempt_timeout_is_retried_as_transient(self, monkeypatch):
+        adapter = OpenAICompatibleEmbeddingsAdapter("k", "http://x", "model", max_attempts=2, attempt_timeout_seconds=.001, total_deadline_seconds=.1)
+        async def slow(*args, **kwargs):
+            await asyncio.sleep(.02)
+        with patch("httpx.AsyncClient") as cls:
+            client = cls.return_value.__aenter__.return_value
+            client.post = AsyncMock(side_effect=slow)
+            monkeypatch.setattr("core.adapters.openai_compatible_embeddings.BASE_DELAY", 0)
+            with pytest.raises(EmbeddingTransientError):
+                await adapter.embed_query(["q"])
+        assert client.post.await_count == 2
+
+    async def test_local_attempt_timeout_exhaustion_preserves_typed_transient_error(self, monkeypatch):
+        adapter = OpenAICompatibleEmbeddingsAdapter("k", "http://x", "model", max_attempts=1, attempt_timeout_seconds=.001, total_deadline_seconds=.1)
+        async def slow(*args, **kwargs): await asyncio.sleep(.02)
+        with patch("httpx.AsyncClient") as cls:
+            client = cls.return_value.__aenter__.return_value
+            client.post = AsyncMock(side_effect=slow)
+            with pytest.raises(EmbeddingTransientError) as raised:
+                await adapter.embed_query(["q"])
+        assert isinstance(raised.value.__cause__, TimeoutError) and client.post.await_count == 1
+
+    async def test_total_deadline_preempts_local_attempt_timeout_retries(self, monkeypatch):
+        adapter = OpenAICompatibleEmbeddingsAdapter("k", "http://x", "model", max_attempts=5, attempt_timeout_seconds=.05, total_deadline_seconds=.001)
+        async def slow(*args, **kwargs): await asyncio.sleep(.02)
+        with patch("httpx.AsyncClient") as cls:
+            client = cls.return_value.__aenter__.return_value
+            client.post = AsyncMock(side_effect=slow)
+            monkeypatch.setattr("core.adapters.openai_compatible_embeddings.BASE_DELAY", 0)
+            with pytest.raises(EmbeddingTransientError):
+                await adapter.embed_query(["q"])
+        assert client.post.await_count < 5
+
+    async def test_local_attempt_timeout_respects_max_provider_calls(self, monkeypatch):
+        adapter = OpenAICompatibleEmbeddingsAdapter("k", "http://x", "model", max_attempts=3, attempt_timeout_seconds=.001, total_deadline_seconds=.1)
+        async def slow(*args, **kwargs): await asyncio.sleep(.02)
+        with patch("httpx.AsyncClient") as cls:
+            client = cls.return_value.__aenter__.return_value
+            client.post = AsyncMock(side_effect=slow)
+            monkeypatch.setattr("core.adapters.openai_compatible_embeddings.BASE_DELAY", 0)
+            with pytest.raises(EmbeddingTransientError):
+                await adapter.embed_query(["q"])
+        assert client.post.await_count == 3
+
+    async def test_document_embed_retries_decode_error_and_recovers_with_base_semantics(self, monkeypatch):
+        import json
+        adapter = OpenAICompatibleEmbeddingsAdapter("k", "http://x", "model")
+        with patch("httpx.AsyncClient") as cls:
+            client = cls.return_value.__aenter__.return_value
+            client.post = AsyncMock(side_effect=[json.JSONDecodeError("x", "x", 0), _fake_response()])
+            monkeypatch.setattr("core.adapters.openai_compatible_embeddings.BASE_DELAY", 0)
+            assert await adapter.embed(["document"]) == [[0.1] * 4]
+        assert client.post.await_count == 2
+        cls.assert_called_with(timeout=60.0)
+
+    async def test_document_embed_exhaustion_reraises_original_error(self, monkeypatch):
+        import json
+        error = json.JSONDecodeError("x", "x", 0)
+        adapter = OpenAICompatibleEmbeddingsAdapter("k", "http://x", "model")
+        with patch("httpx.AsyncClient") as cls:
+            client = cls.return_value.__aenter__.return_value
+            client.post = AsyncMock(side_effect=error)
+            monkeypatch.setattr("core.adapters.openai_compatible_embeddings.BASE_DELAY", 0)
+            with pytest.raises(json.JSONDecodeError) as raised:
+                await adapter.embed(["document"])
+        assert raised.value is error and client.post.await_count == 3
