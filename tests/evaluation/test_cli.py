@@ -148,30 +148,68 @@ def _run_command(monkeypatch, plugin: str, *extra: str) -> dict[str, object]:
     return captured
 
 
-def test_expert_cli_selection_overrides_blank_plugin_identity(monkeypatch) -> None:
-    monkeypatch.setenv("PLUGIN_TYPE", "")
-    assert (
-        _run_command(monkeypatch, "expert", "--corpus-revision", "r1")["plugin"]
-        == "expert"
+def _run_real_expert_cli(monkeypatch, tmp_path, ambient_plugin: str) -> None:
+    """Drive Click, the real evaluation setup, and Expert construction end to end."""
+    from core.container import Container
+    from core.ports.knowledge_store import KnowledgeStorePort
+    from core.ports.llm import LLMPort
+    from evaluation.cli import cli
+    from plugins.expert.plugin import ExpertPlugin
+    from tests.conftest import MockKnowledgeStorePort, MockLLMPort
+
+    class Scorer:
+        def __init__(self, _metrics) -> None:
+            pass
+        async def score(self, **_kwargs):
+            return {
+                "faithfulness": 0.5, "answer_relevancy": 0.5,
+                "context_precision": 0.5, "context_recall": 0.5,
+            }
+
+    def adapters(_config, container: Container, *_args) -> None:
+        llm = MockLLMPort(response="answer")
+        llm._llm = object()
+        container.register(LLMPort, llm)
+        container.register(KnowledgeStorePort, MockKnowledgeStorePort())
+
+    class Embeddings:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+    test_set = tmp_path / "cases.jsonl"
+    test_set.write_text(
+        '{"question":"q","expected_answer":"a","relevant_documents":["d"]}\n'
     )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PLUGIN_TYPE", ambient_plugin)
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_BASE_URL", "http://local")
+    monkeypatch.setattr("main._create_adapters", adapters)
+    monkeypatch.setattr("evaluation.pipeline_invoker.PluginRegistry.discover", lambda *_: ExpertPlugin)
+    monkeypatch.setattr("evaluation.runner.Scorer", Scorer)
+    monkeypatch.setattr("evaluation.metrics.create_metrics", lambda *_args: [])
+    monkeypatch.setattr("langchain_openai.OpenAIEmbeddings", Embeddings)
+    result = CliRunner().invoke(
+        cli,
+        ["run", "--plugin", "EXPERT", "--corpus-revision", "r1", "--test-set", str(test_set)],
+    )
+    assert result.exit_code == 0, result.output
+    raw = next((tmp_path / "evaluations").glob("*.json")).read_text()
+    assert '"plugin_type": "expert"' in raw
 
 
-def test_expert_cli_selection_overrides_generic_plugin_identity(monkeypatch) -> None:
-    monkeypatch.setenv("PLUGIN_TYPE", "generic")
-    assert (
-        _run_command(monkeypatch, "expert", "--corpus-revision", "r1")["plugin"]
-        == "expert"
-    )
+def test_expert_cli_selection_overrides_blank_plugin_identity(monkeypatch, tmp_path) -> None:
+    _run_real_expert_cli(monkeypatch, tmp_path, "")
+
+
+def test_expert_cli_selection_overrides_generic_plugin_identity(monkeypatch, tmp_path) -> None:
+    _run_real_expert_cli(monkeypatch, tmp_path, "generic")
 
 
 def test_expert_cli_selection_overrides_conflicting_plugin_identity(
-    monkeypatch,
+    monkeypatch, tmp_path,
 ) -> None:
-    monkeypatch.setenv("PLUGIN_TYPE", "guidance")
-    assert (
-        _run_command(monkeypatch, "EXPERT", "--corpus-revision", "r1")["plugin"]
-        == "expert"
-    )
+    _run_real_expert_cli(monkeypatch, tmp_path, "guidance")
 
 
 def test_expert_run_requires_safe_corpus_revision() -> None:

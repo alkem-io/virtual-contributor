@@ -52,6 +52,8 @@ def _make_run(
     }
     mode = "hierarchical" if "current" in run_id else "flat"
     invariant = "a" * 64
+    from evaluation.case_identity import CASE_IDENTITY_VERSION
+
     return EvaluationRun(
         id=run_id,
         timestamp="2026-04-06T14:30:22Z",
@@ -64,7 +66,7 @@ def _make_run(
         duration_seconds=842.5,
         composition_fingerprint="matched-composition",
         composition_identity_version=7,
-        case_identity_version="evaluation-case-identity/v1",
+        case_identity_version=CASE_IDENTITY_VERSION,
         hierarchy_mode=mode,
         test_set_digest=canonical_test_set_digest([case_input]),
         body_of_knowledge_digest="c" * 64,
@@ -255,11 +257,66 @@ def test_accepts_exact_zero_and_one_metric_boundaries():
 def test_report_rejects_unknown_case_identity_version():
     from evaluation.case_identity import CASE_IDENTITY_VERSION
 
-    assert CASE_IDENTITY_VERSION == "evaluation-case-identity/v1"
     run = _make_run("baseline")
-    run.composition_identity_version = 5
-    with pytest.raises(ValueError, match="v7"):
+    run.case_identity_version = "unknown-case-schema"
+    with pytest.raises(ValueError, match=CASE_IDENTITY_VERSION):
         compute_comparison(run, _make_run("current"))
+
+
+async def test_case_identity_authority_advance_moves_serializer_runner_and_verifier(
+    tmp_path, monkeypatch,
+) -> None:
+    """An authority change must advance every freshly produced comparison input."""
+    import importlib
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    import evaluation.case_identity as case_identity
+    import evaluation.report as report_module
+    import evaluation.runner as runner_module
+    from evaluation.dataset import TestCase
+    from plugins.expert.composition import expert_full_composition_fingerprint
+
+    advanced = "evaluation-case-identity/v2"
+    with monkeypatch.context() as patcher:
+        patcher.setattr(case_identity, "CASE_IDENTITY_VERSION", advanced)
+        report_module = importlib.reload(report_module)
+        runner_module = importlib.reload(runner_module)
+        invariant = "a" * 64
+
+        async def run(mode: str, label: str):
+            invoker = AsyncMock()
+            invoker.composition_fingerprint = invariant
+            invoker.evaluation_identity = SimpleNamespace(
+                hierarchy_mode=mode,
+                invariant_composition_fingerprint=invariant,
+                full_composition_fingerprint=expert_full_composition_fingerprint(
+                    invariant, mode,
+                ),
+            )
+            invoker.invoke.return_value = ("answer", ["context"], [])
+            scorer = AsyncMock()
+            scorer.score.return_value = dict.fromkeys(
+                ("faithfulness", "answer_relevancy", "context_precision", "context_recall"),
+                0.5,
+            )
+            return await runner_module.EvaluationRunner(invoker, scorer, tmp_path).run(
+                [TestCase(question="q", expected_answer="a", relevant_documents=["d"])],
+                "expert", label=label, corpus_revision="r1",
+            )
+
+        flat = await run("flat", "flat")
+        hierarchical = await run("hierarchical", "hierarchical")
+        assert case_identity.evaluation_case_identity_payload({
+            "question": "q", "expected_answer": "a", "relevant_documents": ["d"],
+        })["schema"] == advanced
+        persisted = report_module.load_comparison_run(
+            next(tmp_path.glob("*flat.json")).read_text()
+        )
+        assert flat.case_identity_version == persisted.case_identity_version == advanced
+        assert report_module.compute_comparison(flat, hierarchical).deltas
+
+    importlib.reload(report_module)
+    importlib.reload(runner_module)
 
 
 def test_case_schema_extension_cannot_diverge_producer_and_verifier():

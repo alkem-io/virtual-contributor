@@ -60,6 +60,7 @@ async def test_complete_startup_logging_omits_configured_endpoint_sentinels(capl
         "summary-user:summary-token@summary.unique.invalid:18004/summary-path?summary-query=four#summary-fragment",
         "bok-user:bok-token@bok.unique.invalid:18005/bok-path?bok-query=five#bok-fragment",
         "broker-user:broker-token@broker.unique.invalid:18006/broker-path?broker-query=six#broker-fragment",
+        "embedding-user:embedding-token@embedding.unique.invalid:18007/embedding-path?embedding-query=seven#embedding-fragment",
     )
     sentinels = (
         "llm-user", "llm-token", "llm.unique.invalid", ":18001", "/llm-path", "llm-query=one", "llm-fragment",
@@ -69,6 +70,8 @@ async def test_complete_startup_logging_omits_configured_endpoint_sentinels(capl
         "bok-user", "bok-token", "bok.unique.invalid", ":18005", "/bok-path", "bok-query=five", "bok-fragment",
         "broker-user", "broker-token", "broker.unique.invalid", ":18006", "/broker-path", "broker-query=six", "broker-fragment",
         "broker-password-token",
+        "embedding-user", "embedding-token", "embedding.unique.invalid", ":18007", "/embedding-path", "embedding-query=seven", "embedding-fragment",
+        "summary-api-token", "bok-api-token",
     )
     config = BaseConfig(
         llm_base_url=f"https://{endpoints[0]}",
@@ -186,7 +189,11 @@ async def test_complete_startup_logging_omits_configured_endpoint_sentinels(capl
     caplog.set_level(logging.INFO)
     _log_config(config)
     await main._run(config)
-    captured = "\n".join(record.getMessage() for record in caplog.records)
+    captured_records = [
+        (record.getMessage(), record.msg, record.args, record.exc_info)
+        for record in caplog.records
+    ]
+    captured = str(captured_records)
     assert all(sentinel not in captured for sentinel in sentinels)
     for key, value in (
         ("EMBEDDINGS_QUERY_MAX_UTF8_BYTES", 111),
@@ -199,6 +206,111 @@ async def test_complete_startup_logging_omits_configured_endpoint_sentinels(capl
         ("EXPERT_HIERARCHY_DISPLAY_NAMES_ENABLED", False),
     ):
         assert f"{key}={value}" in captured
+
+
+async def test_refused_broker_startup_omits_complete_configuration_sentinels(
+    caplog, monkeypatch,
+) -> None:
+    """A real loopback refusal must not escape library connection diagnostics."""
+    import main
+    from core.config import LLMProvider
+
+    sentinels = (
+        "llm-user", "llm-key", "llm.invalid", "vector.invalid", "otlp-user",
+        "otlp-key", "otlp.invalid", "embedding-user", "embedding-key",
+        "embedding.invalid", "summary-user", "summary-key", "summary.invalid",
+        "bok-user", "bok-key", "bok.invalid", "broker-user-sentinel",
+        "broker-password-sentinel", "127.0.0.1", ":9", "333",
+    )
+    config = BaseConfig(
+        plugin_type="in-memory",
+        llm_base_url="https://llm-user:llm-key@llm.invalid/path?query#fragment",
+        llm_api_key="llm-key",
+        vector_db_host="vector.invalid",
+        vector_db_port=18002,
+        tracing_otlp_endpoint="https://otlp-user:otlp-key@otlp.invalid/path?query#fragment",
+        embeddings_endpoint="https://embedding-user:embedding-key@embedding.invalid/path?query#fragment",
+        embeddings_api_key="embedding-key",
+        summarize_llm_provider=LLMProvider.mistral,
+        summarize_llm_model="summary-model",
+        summarize_llm_api_key="summary-key",
+        summarize_llm_base_url="https://summary-user:summary-key@summary.invalid/path?query#fragment",
+        bok_llm_provider=LLMProvider.mistral,
+        bok_llm_model="bok-model",
+        bok_llm_api_key="bok-key",
+        bok_llm_base_url="https://bok-user:bok-key@bok.invalid/path?query#fragment",
+        rabbitmq_host="127.0.0.1",
+        rabbitmq_port=9,
+        rabbitmq_user="broker-user-sentinel",
+        rabbitmq_password="broker-password-sentinel",
+        rabbitmq_heartbeat=333,
+        embeddings_query_max_utf8_bytes=111,
+        query_rewrite_max_utf8_bytes=99,
+        embeddings_max_attempts=2,
+        embeddings_attempt_timeout_seconds=3,
+        embeddings_total_deadline_seconds=4,
+        expert_hierarchical_retrieval_enabled=True,
+        expert_hierarchy_max_branches=2,
+        expert_hierarchy_display_names_enabled=False,
+    )
+
+    class Plugin:
+        name = "in-memory"
+
+        async def startup(self) -> None:
+            pass
+
+    monkeypatch.setattr(main.PluginRegistry, "discover", lambda *_: Plugin)
+    monkeypatch.setattr(main, "_create_adapters", lambda *_: None)
+    monkeypatch.setattr("core.provider_factory.create_llm_adapter", lambda *_args, **_kwargs: object())
+    caplog.set_level(logging.INFO)
+    _log_config(config)
+    with pytest.raises(RuntimeError, match="RabbitMQ startup failed") as failure:
+        await main._run(config)
+
+    records = [
+        (record.getMessage(), record.msg, record.args, record.exc_info)
+        for record in caplog.records
+    ]
+    rendered = str(records)
+    assert all(sentinel not in rendered for sentinel in sentinels)
+    assert failure.value.__cause__ is None
+    assert all(sentinel not in str(failure.value) for sentinel in sentinels)
+    errors = [record for record in caplog.records if record.levelno >= logging.ERROR]
+    assert [(record.msg, record.args, record.exc_info) for record in errors] == [
+        ("RabbitMQ startup failed: stage=connect error_type=%s", ("AMQPConnectionError",), False),
+    ]
+    for key, value in (
+        ("EMBEDDINGS_QUERY_MAX_UTF8_BYTES", 111),
+        ("QUERY_REWRITE_MAX_UTF8_BYTES", 99),
+        ("EMBEDDINGS_MAX_ATTEMPTS", 2),
+        ("EMBEDDINGS_ATTEMPT_TIMEOUT_SECONDS", 3),
+        ("EMBEDDINGS_TOTAL_DEADLINE_SECONDS", 4),
+        ("EXPERT_HIERARCHICAL_RETRIEVAL_ENABLED", True),
+        ("EXPERT_HIERARCHY_MAX_BRANCHES", 2),
+        ("EXPERT_HIERARCHY_DISPLAY_NAMES_ENABLED", False),
+    ):
+        assert f"{key}={value}" in rendered
+
+
+async def test_broker_connection_log_filter_is_context_local(caplog) -> None:
+    """A connection attempt filters its child diagnostics, not other tasks."""
+    import asyncio
+    from core.adapters.rabbitmq import _suppress_connection_dependency_diagnostics
+
+    dependency_logger = logging.getLogger("aiormq.connection")
+
+    async def emit(message: str) -> None:
+        dependency_logger.error(message)
+
+    caplog.set_level(logging.ERROR)
+    outside = asyncio.create_task(emit("outside startup context"))
+    with _suppress_connection_dependency_diagnostics():
+        await emit("inside startup context")
+        await asyncio.create_task(emit("child startup context"))
+    await outside
+    messages = [record.getMessage() for record in caplog.records]
+    assert messages == ["outside startup context"]
 
 
 def test_url_userinfo_is_masked() -> None:

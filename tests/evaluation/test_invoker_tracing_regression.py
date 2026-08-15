@@ -78,8 +78,8 @@ async def test_invoker_wires_hierarchy_settings_to_expert(monkeypatch) -> None:
     assert captured == {"enabled": True, "branches": 2, "display_names": True}
 
 
-async def test_invoker_nondefault_production_composition_and_fingerprint(monkeypatch) -> None:
-    """Evaluation must retain production retrieval/answering construction."""
+async def _build_nondefault_expert_invoker(monkeypatch):
+    """Construct the real evaluation Expert path with external ports replaced."""
     captured: dict = {}
 
     class Store:
@@ -125,6 +125,12 @@ async def test_invoker_nondefault_production_composition_and_fingerprint(monkeyp
     )
     invoker = PipelineInvoker("expert", config)
     await invoker.setup()
+    return captured, invoker, config
+
+
+async def test_invoker_nondefault_production_composition_and_fingerprint(monkeypatch) -> None:
+    """Evaluation must retain production retrieval/answering construction."""
+    captured, invoker, config = await _build_nondefault_expert_invoker(monkeypatch)
     assert captured["n_results"] == 9 and captured["score_threshold"] == 0.1
     assert captured["max_context_chars"] == 1200
     assert captured["answering_temperature"] == 0.2
@@ -226,23 +232,82 @@ def test_public_evaluation_identity_binds_mode_and_full_fingerprint() -> None:
 
 async def test_expert_cli_path_applies_actual_expert_retrieval_and_llm_values(monkeypatch) -> None:
     """The production composition seam, not an evaluation-only constructor, owns Expert values."""
-    await test_invoker_nondefault_production_composition_and_fingerprint(monkeypatch)
+    captured, invoker, _ = await _build_nondefault_expert_invoker(monkeypatch)
+    assert captured["n_results"] == 9 and captured["score_threshold"] == 0.1
+    assert captured["answering_temperature"] == 0.2
+    assert captured["hierarchical_retrieval_enabled"] is True
+    assert captured["knowledge_store"] is invoker._tracing_store
 
 
 async def test_expert_invoker_fingerprints_describe_live_composition(monkeypatch) -> None:
-    await test_invoker_nondefault_production_composition_and_fingerprint(monkeypatch)
+    captured, invoker, _ = await _build_nondefault_expert_invoker(monkeypatch)
+    assert captured["hybrid_config"] is invoker._expert_composition
+    assert captured["rerank_candidate_n"] == 11 and captured["rerank_top_k"] == 4
+    assert captured["query_router"] is not None and captured["routing_table"] is not None
+    assert len(invoker.composition_fingerprint) == 64
+    assert invoker.evaluation_identity.invariant_composition_fingerprint == invoker.composition_fingerprint
 
 
 async def test_guidance_invoker_preserves_legacy_raw_contexts_without_observer(monkeypatch) -> None:
-    await test_invoker_setup_retains_evaluation_context_capture(monkeypatch)
+    class Store:
+        async def query(self, *args, **kwargs):
+            return QueryResult([["raw context"]], [[{}]], [[0.1]], [["id"]])
+
+    class Plugin:
+        async def handle(self, _event):
+            await invoker._tracing_store.query("knowledge", ["question"])
+            from core.events.response import Response
+            return Response(result="answer")
+
+    invoker = PipelineInvoker.__new__(PipelineInvoker)
+    invoker._tracing_store = TracingKnowledgeStore(Store())
+    invoker._generation_context_observer_wired = False
+    invoker._plugin = Plugin()
+    invoker._plugin_type = "guidance"
+    invoker._body_of_knowledge_id = None
+    _, contexts, _ = await invoker.invoke("question")
+    assert contexts == ["raw context"]
 
 
 async def test_expert_invoker_uses_observer_final_contexts(monkeypatch) -> None:
-    await test_invoker_wires_hierarchy_settings_to_expert(monkeypatch)
+    class Store:
+        async def query(self, *args, **kwargs):
+            return QueryResult([["raw context"]], [[{}]], [[0.1]], [["id"]])
+
+    class Plugin:
+        async def handle(self, _event):
+            await invoker._tracing_store.query("knowledge", ["question"])
+            invoker._tracing_store.capture_generation_context(["final context"])
+            from core.events.response import Response
+            return Response(result="answer")
+
+    invoker = PipelineInvoker.__new__(PipelineInvoker)
+    invoker._tracing_store = TracingKnowledgeStore(Store())
+    invoker._generation_context_observer_wired = True
+    invoker._plugin = Plugin()
+    invoker._plugin_type = "expert"
+    invoker._body_of_knowledge_id = None
+    _, contexts, _ = await invoker.invoke("question")
+    assert contexts == ["final context"]
 
 
 async def test_expert_empty_final_context_never_falls_back_to_raw_capture(monkeypatch) -> None:
-    await test_invoker_setup_retains_evaluation_context_capture(monkeypatch)
+    class Store:
+        async def query(self, *args, **kwargs):
+            return QueryResult([["raw context"]], [[{}]], [[0.1]], [["id"]])
+
+    class Plugin:
+        async def handle(self, _event):
+            await invoker._tracing_store.query("knowledge", ["question"])
+            invoker._tracing_store.capture_generation_context([])
+            from core.events.response import Response
+            return Response(result="answer")
+
     invoker = PipelineInvoker.__new__(PipelineInvoker)
+    invoker._tracing_store = TracingKnowledgeStore(Store())
     invoker._generation_context_observer_wired = True
-    assert invoker._generation_context_observer_wired  # final publication is a capability, not truthiness
+    invoker._plugin = Plugin()
+    invoker._plugin_type = "expert"
+    invoker._body_of_knowledge_id = None
+    _, contexts, _ = await invoker.invoke("question")
+    assert contexts == []

@@ -2,12 +2,44 @@ from __future__ import annotations
 
 import json
 import logging
+from contextvars import ContextVar
+from contextlib import contextmanager
 from collections.abc import Awaitable, Callable
 
 import aio_pika
 from aio_pika import ExchangeType, Message
 
 logger = logging.getLogger(__name__)
+
+
+_connection_diagnostic_suppressed: ContextVar[bool] = ContextVar(
+    "rabbitmq_connection_diagnostic_suppressed", default=False,
+)
+
+
+class _ConnectionDiagnosticFilter(logging.Filter):
+    """Filter dependency connection logs only in the active startup context."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not _connection_diagnostic_suppressed.get()
+
+
+_connection_diagnostic_filter = _ConnectionDiagnosticFilter()
+for _dependency_logger_name in (
+    "aio_pika.robust_connection",
+    "aiormq.connection",
+):
+    logging.getLogger(_dependency_logger_name).addFilter(_connection_diagnostic_filter)
+
+
+@contextmanager
+def _suppress_connection_dependency_diagnostics():
+    """Keep connection/reconnect details out of this startup task's logs."""
+    token = _connection_diagnostic_suppressed.set(True)
+    try:
+        yield
+    finally:
+        _connection_diagnostic_suppressed.reset(token)
 
 
 class RabbitMQAdapter:
@@ -41,10 +73,19 @@ class RabbitMQAdapter:
         """Establish connection and channel."""
         url = f"amqp://{self._user}:{self._password}@{self._host}:{self._port}/?heartbeat={self._heartbeat}"
         # Enable TCP keepalive to prevent Docker/kernel from killing idle connections
-        self._connection = await aio_pika.connect_robust(
-            url,
-            tcp_keepalive=True,
-        )
+        try:
+            with _suppress_connection_dependency_diagnostics():
+                self._connection = await aio_pika.connect_robust(
+                    url,
+                    tcp_keepalive=True,
+                )
+        except Exception as exc:
+            logger.error(
+                "RabbitMQ startup failed: stage=connect error_type=%s",
+                type(exc).__name__,
+                exc_info=False,
+            )
+            raise RuntimeError("RabbitMQ startup failed") from None
         self._channel = await self._connection.channel()
         await self._channel.set_qos(prefetch_count=1)
         self._exchange = await self._channel.declare_exchange(

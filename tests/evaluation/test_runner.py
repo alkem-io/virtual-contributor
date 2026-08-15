@@ -163,6 +163,7 @@ async def test_runner_does_not_persist_incomplete_metric_case_as_success(
 
 
 async def test_runner_persists_explicit_case_identity_version(tmp_path) -> None:
+    from evaluation.case_identity import CASE_IDENTITY_VERSION
     from evaluation.runner import EvaluationRunner
 
     invoker = AsyncMock()
@@ -179,7 +180,50 @@ async def test_runner_persists_explicit_case_identity_version(tmp_path) -> None:
     run = await EvaluationRunner(invoker, scorer, tmp_path).run(
         _make_test_cases(1), "expert", corpus_revision="r1"
     )
-    assert run.case_identity_version == "evaluation-case-identity/v1"
+    assert run.case_identity_version == CASE_IDENTITY_VERSION
+
+
+async def test_runner_canonicalizes_direct_uppercase_expert_artifacts_for_comparison(
+    tmp_path,
+) -> None:
+    """The runner is a persistence boundary even when callers bypass Click."""
+    from evaluation.report import compute_comparison, load_comparison_run
+    from evaluation.runner import EvaluationRunner
+    from plugins.expert.composition import expert_full_composition_fingerprint
+
+    async def run(mode: str, label: str):
+        invoker = AsyncMock()
+        invariant = "a" * 64
+        invoker.composition_fingerprint = invariant
+        invoker.evaluation_identity = SimpleNamespace(
+            hierarchy_mode=mode,
+            invariant_composition_fingerprint=invariant,
+            full_composition_fingerprint=expert_full_composition_fingerprint(
+                invariant, mode,
+            ),
+        )
+        invoker.invoke.return_value = ("answer", ["context"], [])
+        scorer = AsyncMock()
+        scorer.score.return_value = {
+            "faithfulness": 0.5,
+            "answer_relevancy": 0.5,
+            "context_precision": 0.5,
+            "context_recall": 0.5,
+        }
+        return await EvaluationRunner(invoker, scorer, tmp_path).run(
+            _make_test_cases(1), "EXPERT", label=label, corpus_revision="r1",
+        )
+
+    flat = await run("flat", "flat")
+    hierarchical = await run("hierarchical", "hierarchical")
+    strict_flat = load_comparison_run(next(tmp_path.glob("*flat.json")).read_text())
+    strict_hierarchical = load_comparison_run(
+        next(tmp_path.glob("*hierarchical.json")).read_text()
+    )
+
+    assert flat.plugin_type == strict_flat.plugin_type == "expert"
+    assert hierarchical.plugin_type == strict_hierarchical.plugin_type == "expert"
+    assert compute_comparison(strict_flat, strict_hierarchical).deltas
 
 
 async def test_expert_identity_missing_fails_before_invocation_or_scoring(

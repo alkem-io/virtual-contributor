@@ -9,6 +9,7 @@ import numbers
 import statistics
 
 from plugins.expert.composition import expert_full_composition_fingerprint
+from evaluation.case_identity import CASE_IDENTITY_VERSION
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -276,8 +277,8 @@ def compute_comparison(
         raise ValueError("Evaluation runs lack complete v7 pairing identity")
     if any(run.composition_identity_version != 7 for run in runs):
         raise ValueError("Evaluation runs require v7 composition identity")
-    if any(run.case_identity_version != "evaluation-case-identity/v1" for run in runs):
-        raise ValueError("Evaluation runs require evaluation-case-identity/v1")
+    if any(run.case_identity_version != CASE_IDENTITY_VERSION for run in runs):
+        raise ValueError(f"Evaluation runs require {CASE_IDENTITY_VERSION}")
     if baseline.plugin_type != "expert" or current.plugin_type != "expert":
         raise ValueError("Only Expert evaluation runs are comparable")
     if baseline.hierarchy_mode != "flat" or current.hierarchy_mode != "hierarchical":
@@ -336,7 +337,7 @@ def _case_digest(case: EvaluationCase) -> str:
 
 def _validate_persisted_run(run: EvaluationRun) -> None:
     """Fail closed when persisted evidence is not a coherent v7 experiment."""
-    if run.case_identity_version != "evaluation-case-identity/v1":
+    if run.case_identity_version != CASE_IDENTITY_VERSION:
         raise ValueError("Evaluation run case identity version is invalid")
     if any(value < 0 for value in (run.test_case_count, run.success_count, run.failure_count)):
         raise ValueError("Evaluation counts must be nonnegative")

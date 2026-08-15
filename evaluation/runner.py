@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from evaluation.dataset import TestCase, canonical_test_set_digest, successful_case_digest
+from evaluation.case_identity import CASE_IDENTITY_VERSION
 from evaluation.report import (
     AggregateMetrics,
     EvaluationCase,
@@ -220,10 +221,10 @@ class EvaluationRunner:
             id=run_id,
             timestamp=ts.isoformat(),
             label=label,
-            plugin_type=plugin_type,
+            plugin_type="expert" if normalized_plugin == "expert" else plugin_type,
             composition_fingerprint=fingerprint,
             composition_identity_version=7 if normalized_plugin == "expert" else None,
-            case_identity_version="evaluation-case-identity/v1" if normalized_plugin == "expert" else None,
+            case_identity_version=CASE_IDENTITY_VERSION if normalized_plugin == "expert" else None,
             hierarchy_mode=mode,
             test_set_digest=canonical_test_set_digest(test_cases) if normalized_plugin == "expert" else None,
             body_of_knowledge_digest=hashlib.sha256((body_of_knowledge_id or "").encode("utf-8")).hexdigest() if normalized_plugin == "expert" else None,

@@ -241,7 +241,10 @@ class TestTimeoutError:
 
         adapter = LangChainLLMAdapter(mock_llm, timeout=0.001)
 
-        async def raise_timeout(*args, **kwargs):
+        async def raise_timeout(awaitable, *args, **kwargs):
+            close = getattr(awaitable, "close", None)
+            if callable(close):
+                close()
             raise asyncio.TimeoutError()
 
         with patch("core.adapters.langchain_llm.asyncio.wait_for", side_effect=raise_timeout):
@@ -258,9 +261,12 @@ class TestTimeoutError:
 
         call_count = 0
 
-        async def timeout_then_succeed(*args, **kwargs):
+        async def timeout_then_succeed(awaitable, *args, **kwargs):
             nonlocal call_count
             call_count += 1
+            close = getattr(awaitable, "close", None)
+            if callable(close):
+                close()
             raise asyncio.TimeoutError()
 
         with patch("core.adapters.langchain_llm.asyncio.wait_for", side_effect=timeout_then_succeed):

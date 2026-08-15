@@ -104,6 +104,13 @@ def _plugin(store: MockKnowledgeStorePort, **kwargs: object) -> ExpertPlugin:
     )
 
 
+def _graph_plugin(store: MockKnowledgeStorePort, **kwargs: object) -> ExpertPlugin:
+    return ExpertPlugin(
+        LangChainLLMAdapter(_CapturingGraphModel()), store, n_results=5,
+        hierarchical_retrieval_enabled=True, **kwargs,
+    )
+
+
 def _event() -> object:
     return make_input(message="What is the Alpha liability decision?", bodyOfKnowledgeID="c")
 
@@ -563,24 +570,64 @@ async def test_precision_proxy_scoped_results_reduce_off_branch_noise() -> None:
 
 
 async def test_graph_scoped_success_returns_aligned_sources_after_filter_topk_and_budget() -> None:
-    await test_real_graph_answer_receives_the_exact_observed_final_context()
+    response = await _graph_plugin(_store()).handle(make_input(
+        message="Alpha liability", bodyOfKnowledgeID="c", promptGraph=REAL_ANSWER_GRAPH,
+    ))
+    assert [source.source for source in response.sources] == ["a-1", "a-2"]
 
 async def test_graph_feature_off_preserves_empty_sources() -> None:
-    await test_disabled_graph_has_exact_flat_context_and_no_sources()
+    response = await ExpertPlugin(LangChainLLMAdapter(_CapturingGraphModel()), _store()).handle(make_input(
+        message="Alpha liability", bodyOfKnowledgeID="c", promptGraph=REAL_ANSWER_GRAPH,
+    ))
+    assert response.sources == []
 
 async def test_graph_root_only_fallback_preserves_empty_sources() -> None:
     store = _store()
     store.collections["c-knowledge"][0]["metadata"].pop("subspaceId")
-    assert "Alpha liability detail" in (await _graph_retrieve(_plugin(store)))["combined_knowledge_docs"]
+    response = await _graph_plugin(store).handle(make_input(
+        message="Alpha liability", bodyOfKnowledgeID="c", promptGraph=REAL_ANSWER_GRAPH,
+    ))
+    assert response.sources == []
 
 async def test_graph_stage_one_error_fallback_preserves_empty_sources() -> None:
-    await test_fallback_stage_one_failure_recovers_to_flat()
+    class Store(MockKnowledgeStorePort):
+        async def query(self, *args, **kwargs):
+            if not getattr(self, "failed", False):
+                self.failed = True
+                raise RuntimeError("routing failed")
+            return await super().query(*args, **kwargs)
+    store = Store()
+    store.collections["c-knowledge"] = _entries()
+    response = await _graph_plugin(store).handle(make_input(
+        message="Alpha liability", bodyOfKnowledgeID="c", promptGraph=REAL_ANSWER_GRAPH,
+    ))
+    assert response.sources == []
 
 async def test_graph_stage_two_error_fallback_preserves_empty_sources() -> None:
-    await test_fallback_stage_two_failure_recovers_to_flat()
+    class Store(MockKnowledgeStorePort):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+            self.collections["c-knowledge"] = _entries()
+        async def query(self, *args, **kwargs):
+            self.calls += 1
+            if self.calls == 2:
+                raise RuntimeError("detail failed")
+            return await super().query(*args, **kwargs)
+    response = await _graph_plugin(Store()).handle(make_input(
+        message="Alpha liability", bodyOfKnowledgeID="c", promptGraph=REAL_ANSWER_GRAPH,
+    ))
+    assert response.sources == []
 
 async def test_graph_empty_scoped_fallback_preserves_empty_sources() -> None:
-    await test_fallback_empty_scoped_detail_uses_flat_once()
+    store = _store()
+    store.collections["c-knowledge"] = [
+        entry for entry in _entries() if entry["id"] not in {"a-1", "a-2"}
+    ]
+    response = await _graph_plugin(store).handle(make_input(
+        message="Alpha liability", bodyOfKnowledgeID="c", promptGraph=REAL_ANSWER_GRAPH,
+    ))
+    assert response.sources == []
 
 async def test_feature_off_multibyte_metadata_preserves_frozen_prompt_and_sources() -> None:
     store, llm = _store(), MockLLMPort(response="answer")
