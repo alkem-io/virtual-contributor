@@ -75,6 +75,61 @@ def _legacy_metadata_text(metadata: Mapping[str, object], key: str) -> str:
     return text[:limit] if limit is not None else text
 
 
+def _stable_hierarchy_ids(metadata: Mapping[str, object]) -> frozenset[str]:
+    """Return the passage's own stored stable hierarchy identifiers.
+
+    These are retrieval-only identifiers. A legacy alias that merely repeats
+    one of them — bare, or wrapped in the ``space:<id>`` ingestion alias
+    shape — carries no independent identity information and must never reach
+    a provider-visible label.
+    """
+
+    ids: set[str] = set()
+    for key in ("spaceId", "subspaceId"):
+        value = metadata.get(key)
+        if value is None:
+            continue
+        if isinstance(value, Enum):
+            value = value.value
+        text = str(value).strip()
+        if text:
+            ids.add(text)
+    return frozenset(ids)
+
+
+def _carries_stable_hierarchy_id(text: str, stable_ids: frozenset[str]) -> bool:
+    """True when a rendered legacy alias value discloses a stable identifier.
+
+    Matches both the bare identifier and the ``space:<id>`` ingestion alias
+    shape, so this catches ``source``/``uri`` values built as
+    ``f"space:{space_id}"`` as well as any alias that was given the identifier
+    directly.
+    """
+
+    if not text or not stable_ids:
+        return False
+    for stable_id in stable_ids:
+        if text == stable_id or text == f"space:{stable_id}":
+            return True
+    return False
+
+
+def _legacy_alias_text(
+    metadata: Mapping[str, object], key: str, stable_ids: frozenset[str],
+) -> str:
+    """Legacy alias text, with raw stable hierarchy identity excised.
+
+    A value that discloses a stable hierarchy identifier is treated as
+    absent so it falls through the existing fallback chain, exactly as if
+    the alias had never been supplied.
+    """
+
+    text = _legacy_metadata_text(metadata, key)
+    if _carries_stable_hierarchy_id(text, stable_ids):
+        return ""
+    return text
+
+
 def _hierarchy_name(metadata: Mapping[str, object], key: str) -> str:
     """Return hardened, UTF-8 bounded hierarchy display metadata only."""
     value = metadata.get(key)
@@ -125,10 +180,11 @@ def render_document_block(
         raise ValueError("Document numbers must be 1-based")
 
     metadata = metadata or {}
-    title = _legacy_metadata_text(metadata, "title")
-    uri = _legacy_metadata_text(metadata, "uri")
-    source = _legacy_metadata_text(metadata, "source")
-    kind = _legacy_metadata_text(metadata, "type")
+    stable_ids = _stable_hierarchy_ids(metadata)
+    title = _legacy_alias_text(metadata, "title", stable_ids)
+    uri = _legacy_alias_text(metadata, "uri", stable_ids)
+    source = _legacy_alias_text(metadata, "source", stable_ids)
+    kind = _legacy_alias_text(metadata, "type", stable_ids)
     origin = uri or source
     identity = title or uri or source or "Untitled"
 

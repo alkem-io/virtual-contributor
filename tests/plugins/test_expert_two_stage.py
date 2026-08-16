@@ -739,6 +739,105 @@ async def _production_separator_boundary(*, hierarchy: bool, graph: bool) -> Non
         assert join_document_blocks(over_blocks) in over_context
 
 
+# Every stored passage below carries a legacy alias equal to its own
+# spaceId/subspaceId, or the ``space:<id>`` ingestion alias shape used by
+# real space/subspace description documents. None of these strings may ever
+# reach a provider-visible label, in any retrieval path or display mode.
+_IDENTITY_SENTINELS = ("space:a", "space:a-sub", "a-sub", "b-sub")
+
+
+def _entries_with_identity_leaking_aliases() -> list[dict]:
+    entries = _entries()
+    entries[0]["metadata"]["title"] = ""
+    entries[0]["metadata"]["source"] = "space:a"
+    entries[1]["metadata"]["source"] = "space:a-sub"
+    entries[1]["metadata"]["uri"] = "a-sub"
+    entries[2]["metadata"]["source"] = "a-sub"
+    entries[2]["metadata"]["type"] = "space:a-sub"
+    entries[3]["metadata"]["source"] = "b-sub"
+    return entries
+
+
+def _sentinel_store() -> MockKnowledgeStorePort:
+    store = MockKnowledgeStorePort()
+    store.collections["c-knowledge"] = _entries_with_identity_leaking_aliases()
+    return store
+
+
+def _assert_no_identity_sentinel(text: str) -> None:
+    for sentinel in _IDENTITY_SENTINELS:
+        assert sentinel not in text
+
+
+@pytest.mark.parametrize("names_on", [False, True])
+async def test_feature_off_flat_context_excises_identity_bearing_aliases(names_on: bool) -> None:
+    """Feature-off flat path never discloses a passage's own stable hierarchy
+    id through a legacy alias, regardless of the display-name flag — the flag
+    has no effect while the feature itself is disabled."""
+    store, llm = _sentinel_store(), MockLLMPort(response="answer")
+    await ExpertPlugin(
+        llm, store, hierarchy_display_names_enabled=names_on,
+    ).handle(_event())  # type: ignore[arg-type]
+    _assert_no_identity_sentinel(llm.calls[-1][0]["content"])
+
+
+@pytest.mark.parametrize("names_on", [False, True])
+async def test_enabled_root_fallback_context_excises_identity_bearing_aliases(names_on: bool) -> None:
+    """Root-only routing re-enters flat retrieval, and the excision still
+    applies on that recovered path."""
+    store = _sentinel_store()
+    store.collections["c-knowledge"][0]["metadata"].pop("subspaceId")
+    llm = MockLLMPort(response="answer")
+    plugin = ExpertPlugin(
+        llm, store, hierarchical_retrieval_enabled=True,
+        hierarchy_display_names_enabled=names_on,
+    )
+    await plugin.handle(_event())  # type: ignore[arg-type]
+    prompt = llm.calls[-1][0]["content"]
+    _assert_no_identity_sentinel(prompt)
+    if names_on:
+        assert "Space: Alpha" not in prompt  # root fallback carries no hierarchy
+
+
+@pytest.mark.parametrize("names_on", [False, True])
+async def test_enabled_scoped_success_context_excises_identity_bearing_aliases(names_on: bool) -> None:
+    """The simple (non-graph) scoped-success path never discloses the
+    branch's own id through a legacy alias; the sanitized display name still
+    renders when names are on."""
+    store = _sentinel_store()
+    llm = MockLLMPort(response="answer")
+    plugin = ExpertPlugin(
+        llm, store, hierarchical_retrieval_enabled=True,
+        hierarchy_display_names_enabled=names_on,
+    )
+    response = await plugin.handle(_event())  # type: ignore[arg-type]
+    prompt = llm.calls[-1][0]["content"]
+    _assert_no_identity_sentinel(prompt)
+    assert [source.source for source in response.sources]
+    if names_on:
+        assert "Space: Alpha" in prompt
+    else:
+        assert "Space:" not in prompt
+
+
+@pytest.mark.parametrize("names_on", [False, True])
+async def test_graph_scoped_success_context_excises_identity_bearing_aliases(names_on: bool) -> None:
+    """The graph retrieve-node context is the same provider-bound text and
+    must be equally free of leaked identity."""
+    store = _sentinel_store()
+    plugin = ExpertPlugin(
+        MockLLMPort(response="answer"), store, hierarchical_retrieval_enabled=True,
+        hierarchy_display_names_enabled=names_on,
+    )
+    result = await _graph_retrieve(plugin)
+    context = result["combined_knowledge_docs"]
+    _assert_no_identity_sentinel(context)
+    if names_on:
+        assert "Space: Alpha" in context
+    else:
+        assert "Space:" not in context
+
+
 async def test_flat_simple_production_separator_budget_boundary_preserves_alignment() -> None:
     await _production_separator_boundary(hierarchy=False, graph=False)
 

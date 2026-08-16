@@ -1166,7 +1166,7 @@ async def _run(config: BaseConfig) -> None:
     health.add_check("plugin", lambda: True)
     await health.start()
 
-    logger.info("Engine ready — consuming from %s", config.rabbitmq_input_queue)
+    logger.info("Engine ready — consuming")
 
     # Shutdown handling
     stop_event = asyncio.Event()

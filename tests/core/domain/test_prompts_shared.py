@@ -165,6 +165,79 @@ def test_hierarchy_never_falls_back_to_stored_identifiers() -> None:
     assert "s-1" not in block and "ss-2" not in block
 
 
+@pytest.mark.parametrize("hierarchy", [False, True])
+def test_legacy_aliases_never_disclose_the_passage_stable_hierarchy_id(
+    hierarchy: bool,
+) -> None:
+    """A space/subspace description document with no profile URL renders
+    ``source=space:<id>`` and an empty title; the raw stable ID must never
+    reach the identity or origin label segments, in either display mode."""
+    metadata = {
+        "spaceId": "sentinel-space-id",
+        "title": "",
+        "uri": None,
+        "source": "space:sentinel-space-id",
+    }
+    block = render_document_block(1, "passage", metadata, hierarchy=hierarchy)
+
+    assert "sentinel-space-id" not in block
+    assert block.startswith("[Document 1 · Untitled]")
+
+
+@pytest.mark.parametrize("hierarchy", [False, True])
+@pytest.mark.parametrize("alias_key", ["title", "type", "uri", "source"])
+def test_every_legacy_alias_is_excised_when_it_carries_a_stable_id(
+    alias_key: str, hierarchy: bool,
+) -> None:
+    """Each of the four legacy aliases individually carrying either the bare
+    stable ID or the ``space:<id>`` shape must be excluded from the label,
+    falling through to the next alias rather than leaking the identifier."""
+    for candidate in ("sentinel-id-value", "space:sentinel-id-value"):
+        metadata = {"spaceId": "sentinel-id-value", alias_key: candidate}
+        block = render_document_block(1, "passage", metadata, hierarchy=hierarchy)
+        assert "sentinel-id-value" not in block
+
+
+@pytest.mark.parametrize("hierarchy", [False, True])
+def test_subspace_stable_id_is_also_excised_from_legacy_aliases(
+    hierarchy: bool,
+) -> None:
+    metadata = {
+        "subspaceId": "sentinel-subspace-id",
+        "title": "",
+        "source": "space:sentinel-subspace-id",
+    }
+    block = render_document_block(1, "passage", metadata, hierarchy=hierarchy)
+    assert "sentinel-subspace-id" not in block
+
+
+def test_legacy_aliases_without_stable_id_overlap_render_unchanged() -> None:
+    """Control: values that do not carry the passage's own stable hierarchy
+    identity are unaffected by the excision — the frozen legacy contract is
+    preserved byte-for-byte when there is nothing to excise."""
+    metadata = {
+        "spaceId": "s-1",
+        "title": "Welcome",
+        "type": "callout",
+        "uri": "https://welcome.alkem.io",
+        "source": "legacy-source",
+    }
+    block = render_document_block(1, "passage", metadata)
+    assert block == (
+        "[Document 1 · Welcome · callout · origin: https://welcome.alkem.io]\n"
+        "passage"
+    )
+
+
+def test_legacy_alias_equal_to_a_different_documents_stable_id_is_unaffected() -> None:
+    """The excision is scoped to the passage's own stored ID, not any ID
+    string in general — a coincidental match against an unrelated ID must
+    not trigger it."""
+    metadata = {"spaceId": "s-1", "source": "space:s-2"}
+    block = render_document_block(1, "passage", metadata)
+    assert "space:s-2" in block
+
+
 def test_hierarchy_metadata_is_sanitized_and_bounded() -> None:
     block = render_document_block(
         1, "passage", {"spaceName": "[evil]\n" + "x" * 300}, hierarchy=True,

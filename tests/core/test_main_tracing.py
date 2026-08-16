@@ -72,6 +72,7 @@ async def test_complete_startup_logging_omits_configured_endpoint_sentinels(capl
         "broker-password-token",
         "embedding-user", "embedding-token", "embedding.unique.invalid", ":18007", "/embedding-path", "embedding-query=seven", "embedding-fragment",
         "summary-api-token", "bok-api-token",
+        "connection-repr-canary", "channel-repr-canary", "aiormq-channel-canary", "marshall-frame-canary",
     )
     config = BaseConfig(
         llm_base_url=f"https://{endpoints[0]}",
@@ -141,8 +142,32 @@ async def test_complete_startup_logging_omits_configured_endpoint_sentinels(capl
     class Connection:
         is_closed = False
 
+        def __repr__(self) -> str:
+            return "<Connection connection-repr-canary>"
+
         async def channel(self) -> Channel:
-            return Channel()
+            # Mirrors aio_pika.connection.Connection.channel()'s DEBUG diagnostic,
+            # which logs a %r of the connection (host/user/vhost included) via
+            # the "aio_pika.connection" logger, and aio_pika.channel's own
+            # creation diagnostic — both through the real dependency loggers,
+            # not through this codebase's own logger.
+            logging.getLogger("aio_pika.connection").debug(
+                "Creating AMQP channel for connection: %r", self,
+            )
+            channel = Channel()
+            logging.getLogger("aio_pika.channel").debug(
+                "Channel created: channel-repr-canary %r", channel,
+            )
+            # aiormq.channel logs its own open sequence; aiormq.connection's
+            # ChannelFrame.marshall creates a dynamic ".marshall" child logger
+            # per call rather than logging through the parent directly.
+            logging.getLogger("aiormq.channel").debug(
+                "aiormq-channel-canary opening channel",
+            )
+            logging.getLogger("aiormq.connection").getChild("marshall").debug(
+                "marshall-frame-canary encoding frame",
+            )
+            return channel
 
         async def close(self) -> None:
             self.is_closed = True
@@ -186,7 +211,11 @@ async def test_complete_startup_logging_omits_configured_endpoint_sentinels(capl
     monkeypatch.setattr(main, "_shutdown_tracing_bounded", shutdown_tracing)
     monkeypatch.setattr(main.asyncio, "Event", StopEvent)
     monkeypatch.setattr(main.asyncio, "get_running_loop", lambda: Loop())
-    caplog.set_level(logging.INFO)
+    # DEBUG (not just INFO) so the dependency-shaped diagnostics the stub
+    # Connection emits through the real aio_pika/aiormq logger names above are
+    # actually captured — proving the boundary suppresses them rather than
+    # merely never having anything to suppress.
+    caplog.set_level(logging.DEBUG)
     _log_config(config)
     await main._run(config)
     captured_records = [
@@ -311,6 +340,188 @@ async def test_broker_connection_log_filter_is_context_local(caplog) -> None:
     await outside
     messages = [record.getMessage() for record in caplog.records]
     assert messages == ["outside startup context"]
+
+
+async def test_complete_startup_and_one_message_cycle_omit_the_queue_name(
+    caplog, monkeypatch,
+) -> None:
+    """A unique RABBITMQ_QUEUE sentinel must appear in zero log lines across
+    a capture spanning complete ``main._run`` startup (through consume
+    registration and the engine-ready record) AND one full message-processing
+    cycle (received -> callback handled -> acknowledged), while the approved
+    control values and the fixed lifecycle markers remain observably
+    present."""
+    import main
+    from core.events.response import Response
+
+    queue_sentinel = "sentinel-input-queue-7c2e"
+    config = BaseConfig(
+        llm_base_url="http://local",
+        plugin_type="in-memory",
+        rabbitmq_input_queue=queue_sentinel,
+        rabbitmq_exchange="exchange-under-test",
+        rabbitmq_result_routing_key="result-under-test",
+        embeddings_query_max_utf8_bytes=111,
+        query_rewrite_max_utf8_bytes=99,
+        embeddings_max_attempts=2,
+        embeddings_attempt_timeout_seconds=3,
+        embeddings_total_deadline_seconds=4,
+        expert_hierarchical_retrieval_enabled=True,
+        expert_hierarchy_max_branches=2,
+        expert_hierarchy_display_names_enabled=False,
+    )
+
+    class Plugin:
+        name = "in-memory"
+
+        async def startup(self) -> None:
+            pass
+
+        async def shutdown(self) -> None:
+            pass
+
+        async def handle(self, event) -> Response:
+            return Response(result="ok")
+
+    class Queue:
+        def __init__(self) -> None:
+            self.handler = None
+
+        async def bind(self, *args, **kwargs) -> None:
+            pass
+
+        async def consume(self, handler, *args, **kwargs) -> None:
+            self.handler = handler
+
+    class Exchange:
+        async def publish(self, *args, **kwargs) -> None:
+            pass
+
+    class Channel:
+        is_closed = False
+
+        def __init__(self) -> None:
+            self.queue = Queue()
+
+        async def set_qos(self, **kwargs) -> None:
+            pass
+
+        async def declare_exchange(self, *args, **kwargs) -> Exchange:
+            return Exchange()
+
+        async def declare_queue(self, *args, **kwargs) -> Queue:
+            return self.queue
+
+        async def close(self) -> None:
+            pass
+
+    class Connection:
+        is_closed = False
+
+        async def channel(self) -> Channel:
+            self.opened_channel = Channel()
+            return self.opened_channel
+
+        async def close(self) -> None:
+            self.is_closed = True
+
+    connection_holder: dict = {}
+
+    async def connect_robust(*args, **kwargs) -> Connection:
+        connection = Connection()
+        connection_holder["connection"] = connection
+        return connection
+
+    class Health:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def add_check(self, *args, **kwargs) -> None:
+            pass
+
+        async def start(self) -> None:
+            pass
+
+        async def stop(self) -> None:
+            pass
+
+    class StopEvent:
+        async def wait(self) -> None:
+            pass
+
+        def set(self) -> None:
+            pass
+
+    class Loop:
+        def add_signal_handler(self, *args, **kwargs) -> None:
+            pass
+
+    async def shutdown_tracing() -> None:
+        pass
+
+    class _Message:
+        def __init__(self, body: bytes) -> None:
+            self.body = body
+            self.content_type = "application/json"
+            self.headers: dict = {}
+            self.acked = False
+
+        async def ack(self) -> None:
+            self.acked = True
+
+        async def reject(self, requeue: bool = False) -> None:
+            pass
+
+    monkeypatch.setattr(main.PluginRegistry, "discover", lambda *_args: Plugin)
+    monkeypatch.setattr("core.adapters.rabbitmq.aio_pika.connect_robust", connect_robust)
+    monkeypatch.setattr(main, "HealthServer", Health)
+    monkeypatch.setattr(main, "_shutdown_tracing_bounded", shutdown_tracing)
+    monkeypatch.setattr(main.asyncio, "Event", StopEvent)
+    monkeypatch.setattr(main.asyncio, "get_running_loop", lambda: Loop())
+    monkeypatch.setattr(
+        main, "_create_adapters", lambda *args, **kwargs: None,
+    )
+
+    caplog.set_level(logging.DEBUG)
+    _log_config(config)
+    await main._run(config)
+
+    connection = connection_holder["connection"]
+    channel = connection.opened_channel
+    queue = channel.queue
+    assert queue.handler is not None, "consume() was never called during startup"
+
+    import json as _json
+
+    from tests.conftest import make_input
+
+    body = {"input": make_input().model_dump(by_alias=True)}
+    message = _Message(_json.dumps(body).encode("utf-8"))
+    await queue.handler(message)
+    assert message.acked is True
+
+    rendered = "\n".join(
+        f"{record.getMessage()} {record.args}" for record in caplog.records
+    )
+    assert queue_sentinel not in rendered
+
+    # Fixed replacement markers still fire — proving the events genuinely
+    # occur rather than the sentinel's absence being achieved by silencing
+    # the lifecycle entirely.
+    assert "Consuming (with message) from queue" in rendered
+    assert "Engine ready — consuming" in rendered
+
+    for key, value in (
+        ("EMBEDDINGS_QUERY_MAX_UTF8_BYTES", 111),
+        ("QUERY_REWRITE_MAX_UTF8_BYTES", 99),
+        ("EMBEDDINGS_MAX_ATTEMPTS", 2),
+        ("EMBEDDINGS_ATTEMPT_TIMEOUT_SECONDS", 3),
+        ("EMBEDDINGS_TOTAL_DEADLINE_SECONDS", 4),
+        ("EXPERT_HIERARCHICAL_RETRIEVAL_ENABLED", True),
+        ("EXPERT_HIERARCHY_MAX_BRANCHES", 2),
+        ("EXPERT_HIERARCHY_DISPLAY_NAMES_ENABLED", False),
+    ):
+        assert f"{key}={value}" in rendered
 
 
 def test_url_userinfo_is_masked() -> None:

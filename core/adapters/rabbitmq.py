@@ -16,20 +16,45 @@ _connection_diagnostic_suppressed: ContextVar[bool] = ContextVar(
     "rabbitmq_connection_diagnostic_suppressed", default=False,
 )
 
+# Both locked dependencies derive every module/child logger from these two
+# base names (``aio_pika.log.get_logger`` and aiormq's per-module
+# ``getLogger(__name__)`` calls, including dynamic ``.getChild(...)``
+# children such as ``aiormq.connection.marshall``). Matching by dot-boundary
+# prefix at the point every propagated record is actually observed catches
+# all of them, present and future, unlike an enumerated leaf-logger list.
+_SUPPRESSED_DEPENDENCY_LOGGER_PREFIXES = ("aio_pika", "aiormq")
 
-class _ConnectionDiagnosticFilter(logging.Filter):
-    """Filter dependency connection logs only in the active startup context."""
 
-    def filter(self, record: logging.LogRecord) -> bool:
-        return not _connection_diagnostic_suppressed.get()
+def _is_suppressed_dependency_logger(name: str) -> bool:
+    return any(
+        name == prefix or name.startswith(f"{prefix}.")
+        for prefix in _SUPPRESSED_DEPENDENCY_LOGGER_PREFIXES
+    )
 
 
-_connection_diagnostic_filter = _ConnectionDiagnosticFilter()
-for _dependency_logger_name in (
-    "aio_pika.robust_connection",
-    "aiormq.connection",
-):
-    logging.getLogger(_dependency_logger_name).addFilter(_connection_diagnostic_filter)
+# Logger-level filters only run for the logger a record was logged through,
+# not for its ancestors — so a filter attached to ``aiormq.connection``
+# never sees a record from its dynamically created ``.marshall`` child.
+# ``Handler.filter`` runs once per handler on every record that reaches it
+# after propagation, regardless of which logger originated it, which is the
+# layer that can actually enforce this boundary completely. Patched once at
+# import time; there is exactly one handler installed for this process
+# (``core.logging.setup_logging``).
+_stdlib_handler_filter = logging.Handler.filter
+
+
+def _connection_diagnostic_handler_filter(
+    self: logging.Handler, record: logging.LogRecord,
+) -> bool:
+    if _connection_diagnostic_suppressed.get() and _is_suppressed_dependency_logger(record.name):
+        return False
+    # logging.Handler.filter always returns a plain bool at runtime; the
+    # typeshed stub widens it via Filterer.filter's overload, so pin the
+    # narrowed type explicitly rather than let the unbound-method call widen it.
+    return bool(_stdlib_handler_filter(self, record))
+
+
+logging.Handler.filter = _connection_diagnostic_handler_filter  # type: ignore[method-assign]
 
 
 @contextmanager
@@ -70,30 +95,89 @@ class RabbitMQAdapter:
         self._exchange: aio_pika.abc.AbstractExchange | None = None
 
     async def connect(self) -> None:
-        """Establish connection and channel."""
+        """Establish connection and channel.
+
+        The suppression boundary and the static-exception projection span the
+        complete handshake — connection, channel creation, QoS, and exchange
+        declaration — not just the initial connect. A failure at any stage
+        after the connection is open closes that connection inside the same
+        boundary before the sanitized failure is raised.
+        """
         url = f"amqp://{self._user}:{self._password}@{self._host}:{self._port}/?heartbeat={self._heartbeat}"
         # Enable TCP keepalive to prevent Docker/kernel from killing idle connections
-        try:
-            with _suppress_connection_dependency_diagnostics():
-                self._connection = await aio_pika.connect_robust(
-                    url,
-                    tcp_keepalive=True,
+        with _suppress_connection_dependency_diagnostics():
+            try:
+                connection = await aio_pika.connect_robust(url, tcp_keepalive=True)
+            except Exception as exc:
+                logger.error(
+                    "RabbitMQ startup failed: stage=connect error_type=%s",
+                    type(exc).__name__,
+                    exc_info=False,
                 )
-        except Exception as exc:
+                raise RuntimeError("RabbitMQ startup failed") from None
+
+            try:
+                channel = await connection.channel()
+            except Exception as exc:
+                await self._close_after_stage_failure(connection)
+                logger.error(
+                    "RabbitMQ startup failed: stage=channel error_type=%s",
+                    type(exc).__name__,
+                    exc_info=False,
+                )
+                raise RuntimeError("RabbitMQ startup failed") from None
+
+            try:
+                await channel.set_qos(prefetch_count=1)
+            except Exception as exc:
+                await self._close_after_stage_failure(connection)
+                logger.error(
+                    "RabbitMQ startup failed: stage=qos error_type=%s",
+                    type(exc).__name__,
+                    exc_info=False,
+                )
+                raise RuntimeError("RabbitMQ startup failed") from None
+
+            try:
+                exchange = await channel.declare_exchange(
+                    self._exchange_name,
+                    ExchangeType.DIRECT,
+                    durable=True,
+                )
+            except Exception as exc:
+                await self._close_after_stage_failure(connection)
+                logger.error(
+                    "RabbitMQ startup failed: stage=exchange error_type=%s",
+                    type(exc).__name__,
+                    exc_info=False,
+                )
+                raise RuntimeError("RabbitMQ startup failed") from None
+
+        self._connection = connection
+        self._channel = channel
+        self._exchange = exchange
+        logger.info("Connected to RabbitMQ")
+
+    @staticmethod
+    async def _close_after_stage_failure(
+        connection: aio_pika.abc.AbstractRobustConnection,
+    ) -> None:
+        """Close an already-opened connection after a later stage fails.
+
+        Cleanup itself must not leak a sanitized-boundary violation: any
+        exception raised while closing is caught and projected through the
+        same static, sentinel-free vocabulary as the stage failure it
+        followed.
+        """
+        try:
+            if not connection.is_closed:
+                await connection.close()
+        except Exception as cleanup_exc:
             logger.error(
-                "RabbitMQ startup failed: stage=connect error_type=%s",
-                type(exc).__name__,
+                "RabbitMQ startup cleanup failed: error_type=%s",
+                type(cleanup_exc).__name__,
                 exc_info=False,
             )
-            raise RuntimeError("RabbitMQ startup failed") from None
-        self._channel = await self._connection.channel()
-        await self._channel.set_qos(prefetch_count=1)
-        self._exchange = await self._channel.declare_exchange(
-            self._exchange_name,
-            ExchangeType.DIRECT,
-            durable=True,
-        )
-        logger.info("Connected to RabbitMQ")
 
     def is_connected(self) -> bool:
         """Check if the connection is alive."""
@@ -129,7 +213,7 @@ class RabbitMQAdapter:
 
             try:
                 body = json.loads(message.body.decode("utf-8"))
-                logger.info("Received message on queue %s (attempt %d/%d)", queue, retry_count + 1, max_retries)
+                logger.info("Received message (attempt %d/%d)", retry_count + 1, max_retries)
                 await callback(body)
                 await message.ack()
             except Exception as exc:
@@ -158,7 +242,7 @@ class RabbitMQAdapter:
                     await message.reject(requeue=False)
 
         await q.consume(on_message)
-        logger.info("Consuming from queue: %s", queue)
+        logger.info("Consuming from queue")
 
     async def consume_with_message(
         self,
@@ -182,7 +266,7 @@ class RabbitMQAdapter:
         async def on_message(message: aio_pika.abc.AbstractIncomingMessage) -> None:
             try:
                 body = json.loads(message.body.decode("utf-8"))
-                logger.info("Received message on queue %s", queue)
+                logger.info("Received message")
                 await callback(body, message)
             except Exception as exc:
                 # The application callback has already made its bounded delivery
@@ -205,7 +289,7 @@ class RabbitMQAdapter:
                     )
 
         await q.consume(on_message)
-        logger.info("Consuming (with message) from queue: %s", queue)
+        logger.info("Consuming (with message) from queue")
 
     async def publish(self, exchange: str, routing_key: str, message: bytes) -> None:
         """Publish a message to the exchange with the given routing key."""
