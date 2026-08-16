@@ -27,10 +27,9 @@ before provider/scorer/file work; each successful run has exactly four required
 finite unit metrics. Embedding failures never use flat
 fallback or RabbitMQ redelivery and receive a generic safe response.
 
-This remediation evidence supports only the pending review sequence: review
-round 05 may begin after its independent gate, while rounds 06–07 remain
-contingent human reviews. It does not authorize enablement, deployment, or data
-mutation.
+This remediation evidence does not, by itself, authorize enablement,
+deployment, or data mutation; enablement remains contingent on the human
+gates described under Hierarchical retrieval below.
 
 ## Table of Contents
 
@@ -350,14 +349,14 @@ flat retrieval, while setting display names to `false` omits model-visible
 hierarchy names without disabling scoped retrieval.
 
 Enable only after deployment with both controls off, re-ingestion of selected
-spaces, and the required human gates. `RG-05` is the representative paired
-flat/on RAGAS evaluation on one reviewed query set; its runs require equal
-invariant fingerprints and present, recomputable mode-bound full fingerprints
-that differ between flat and hierarchical modes. Comparison fails closed when
-those conditions are not met. `RG-05P` is the separate
-provider-processing gate required before display names may be enabled. The
-repository's deterministic proxy is structural evidence only, while `SC-009`
-is the full-suite regression gate. `SUMMARIZE_ENABLED` remains unchanged.
+spaces, and the required human gates: a representative paired flat/hierarchical
+RAGAS evaluation on one reviewed query set (its runs require equal invariant
+fingerprints and present, recomputable mode-bound full fingerprints that
+differ between flat and hierarchical modes — comparison fails closed when
+those conditions are not met), and a separate documented provider-processing/
+data-minimization approval required before display names may be enabled. The
+repository's deterministic proxy is structural evidence only; the full test
+suite is the regression gate. `SUMMARIZE_ENABLED` remains unchanged.
 
 ### Re-ranking
 
@@ -676,9 +675,10 @@ poetry run pytest tests/plugins/test_expert.py
 poetry run pytest tests/plugins/test_expert.py::test_handle
 ```
 
-For this hierarchy feature, the full suite is the `SC-009` regression gate;
-focused tests and the deterministic precision proxy do not replace the
-representative paired RAGAS gate (`RG-05`).
+For this hierarchy feature, the full test suite is the regression gate;
+focused tests and the deterministic precision proxy do not replace a
+representative paired flat/hierarchical RAGAS evaluation on a reviewed query
+set.
 
 ### Test Infrastructure
 

@@ -69,30 +69,31 @@ the hierarchy segment is omitted. Setting hierarchy retrieval to `false`
 restores flat retrieval; setting display names to `false` independently omits
 model-visible names while scoped retrieval remains available.
 
-Provider processing/minimization approval is a human `RG-05P` gate before
-display names may be enabled; this code does not grant or imply that approval.
-`RG-05` is the representative paired flat/on RAGAS gate. Its production and
-evaluation runs use the same deeply immutable resolved v7 composition and an invariant plus
-mode-bound full non-secret fingerprint. Comparison fails closed unless invariant
-fingerprints are equal and both full fingerprints are present, recomputable from
-the invariant plus mode, and different for flat versus hierarchical runs.
-Evaluation case/dataset identity is `evaluation-case-identity/v1` and every
-case/aggregate metric must be a finite value in inclusive `[0,1]`; successful
-cases have exactly faithfulness, answer relevancy, context precision, and
-context recall, and persist `evaluation-case-identity/v1`. The public Expert
-identity is validated before provider/scorer/file work. `SC-009`
-remains the full-suite regression gate, not an evaluation substitute. RG-05P,
-RG-05, and RG-06 remain human gates; hierarchy and display names remain off by
-default.
+A documented provider-processing/data-minimization approval is a required
+human gate before display names may be enabled; this code does not grant or
+imply that approval. A representative paired flat/hierarchical RAGAS
+evaluation on a reviewed query set is the other required human gate. Its
+production and evaluation runs use the same deeply immutable resolved v7
+composition and an invariant plus mode-bound full non-secret fingerprint.
+Comparison fails closed unless invariant fingerprints are equal and both full
+fingerprints are present, recomputable from the invariant plus mode, and
+different for flat versus hierarchical runs. Evaluation case/dataset identity
+is `evaluation-case-identity/v1` and every case/aggregate metric must be a
+finite value in inclusive `[0,1]`; successful cases have exactly
+faithfulness, answer relevancy, context precision, and context recall, and
+persist `evaluation-case-identity/v1`. The public Expert identity is
+validated before provider/scorer/file work. The full test suite remains the
+regression gate, not an evaluation substitute. The provider-processing
+approval and the paired RAGAS evaluation remain human gates; hierarchy and
+display names remain off by default.
 
 `published-unacked` forbids application-managed raw republish and same-callback
 rerun; ambiguous ACK may still broker-redeliver and does not promise exactly
 once. Reject settlement faults log type only. All hierarchy controls remain
-default-off and RG-05P/RG-05/RG-06 stay human gates.
+default-off, gated behind the same required human approvals.
 
-The remediation is evidence for the pending review sequence only: round 05 is
-gated independently and rounds 06–07 are contingent human reviews. It does not
-authorize approval, enablement, deployment, or corpus mutation.
+This remediation evidence does not, by itself, authorize approval,
+enablement, deployment, or corpus mutation.
 
 ## Grounded, citable answers
 
@@ -150,7 +151,7 @@ cue routing is outside this plugin's scope.
 | `EXPERT_MIN_SCORE` | `0.3` | Minimum relevance score threshold |
 | `EXPERT_HIERARCHICAL_RETRIEVAL_ENABLED` | `false` | Enable the opt-in overview/summary route and scoped detail stage |
 | `EXPERT_HIERARCHY_MAX_BRANCHES` | `3` | Route cap; only `2` or `3` are valid settings |
-| `EXPERT_HIERARCHY_DISPLAY_NAMES_ENABLED` | `false` | Separately enable sanitized display-name labels after RG-05P |
+| `EXPERT_HIERARCHY_DISPLAY_NAMES_ENABLED` | `false` | Separately enable sanitized display-name labels after the provider-processing/data-minimization approval |
 | `MAX_CONTEXT_CHARS` | `20000` | Context budget — lowest-scoring chunks dropped first |
 | `EMBEDDINGS_QUERY_MAX_UTF8_BYTES` | `32768` | Startup-logged query byte cap |
 | `QUERY_REWRITE_MAX_UTF8_BYTES` | `4096` | Startup-logged rewrite byte cap |
