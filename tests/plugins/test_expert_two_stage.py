@@ -355,7 +355,7 @@ async def test_graph_observer_equals_retrieve_node_context_and_excludes_sibling(
 
 
 async def test_real_graph_answer_receives_the_exact_observed_final_context() -> None:
-    """C-15: execution reaches the real answer node, not just retrieve parity."""
+    """Execution reaches the real answer node, not just retrieve parity."""
     _CapturingGraphModel.calls = []
     observed: list[list[str]] = []
     store = _store()
@@ -666,7 +666,7 @@ async def test_non_capable_store_preserves_legacy_query_calls() -> None:
 
 
 async def _production_separator_boundary(*, hierarchy: bool, graph: bool) -> None:
-    """C-57 real provider-visible boundary oracle for all four paths."""
+    """Real, provider-visible context-boundary oracle exercised across all four retrieval paths."""
     from core.domain.prompts_shared import (
         inter_block_budget_size,
         join_document_blocks,
@@ -779,6 +779,28 @@ async def test_feature_off_flat_context_excises_identity_bearing_aliases(names_o
         llm, store, hierarchy_display_names_enabled=names_on,
     ).handle(_event())  # type: ignore[arg-type]
     _assert_no_identity_sentinel(llm.calls[-1][0]["content"])
+
+
+async def test_feature_off_flat_context_excises_shape_matching_alias_without_stored_hierarchy_metadata() -> None:
+    """Pre-hierarchy-metadata shape on the real feature-off flat path: a
+    passage carrying no ``spaceId``/``subspaceId`` at all, whose ``source``
+    was nonetheless built as ``f"space:{id}"``, must still be excised — the
+    alias-shape arm does not depend on the passage's own stored hierarchy
+    metadata being present. This is also the missing feature-off oracle: for
+    an identity-bearing value the feature-off output deliberately differs
+    from the pre-feature base (excised instead of rendered raw), while every
+    non-identity value stays byte-identical to the frozen legacy contract."""
+    store = _store()
+    store.collections["c-knowledge"][1]["metadata"] = {
+        "embeddingType": "chunk",
+        "source": "space:5f0d6a3e-1c2b-4a11-9e77-000000000001",
+        "title": "",
+    }
+    llm = MockLLMPort(response="answer")
+    await ExpertPlugin(llm, store).handle(_event())  # type: ignore[arg-type]
+    prompt = llm.calls[-1][0]["content"]
+    assert "5f0d6a3e-1c2b-4a11-9e77-000000000001" not in prompt
+    assert "space:" not in prompt
 
 
 @pytest.mark.parametrize("names_on", [False, True])

@@ -229,13 +229,36 @@ def test_legacy_aliases_without_stable_id_overlap_render_unchanged() -> None:
     )
 
 
-def test_legacy_alias_equal_to_a_different_documents_stable_id_is_unaffected() -> None:
-    """The excision is scoped to the passage's own stored ID, not any ID
-    string in general — a coincidental match against an unrelated ID must
-    not trigger it."""
+def test_legacy_alias_matching_the_ingestion_shape_is_excised_regardless_of_whose_id_it_is() -> None:
+    """The alias-shape excision fires on the ``space:<remainder>`` shape
+    itself, independent of whether it happens to match this passage's own
+    stored ID. ``space:s-2`` is some space's stable identifier even though
+    the rendered passage's own metadata carries a different one — privacy
+    over availability, so it is excised all the same."""
     metadata = {"spaceId": "s-1", "source": "space:s-2"}
     block = render_document_block(1, "passage", metadata)
-    assert "space:s-2" in block
+    assert "space:s-2" not in block
+
+
+@pytest.mark.parametrize("hierarchy", [False, True])
+def test_alias_shape_is_excised_without_any_stored_hierarchy_metadata(
+    hierarchy: bool,
+) -> None:
+    """Pre-hierarchy-metadata shape: a passage with no ``spaceId``/
+    ``subspaceId`` keys at all (the shape that predates hierarchy metadata
+    being stored) whose ``source`` was nonetheless built as
+    ``f"space:{id}"`` must still have that value excised — the shape arm
+    does not depend on ``stable_ids`` being non-empty."""
+    metadata = {
+        "source": "space:5f0d6a3e-1c2b-4a11-9e77-000000000001",
+        "title": "",
+        "uri": None,
+    }
+    block = render_document_block(1, "passage", metadata, hierarchy=hierarchy)
+
+    assert "5f0d6a3e-1c2b-4a11-9e77-000000000001" not in block
+    assert "space:" not in block
+    assert block.startswith("[Document 1 · Untitled]")
 
 
 def test_hierarchy_metadata_is_sanitized_and_bounded() -> None:

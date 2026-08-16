@@ -539,7 +539,7 @@ class BaseConfig(BaseSettings):
     expert_hierarchical_retrieval_enabled: bool = False
     expert_hierarchy_max_branches: int = 3
     # Display names are model-visible private metadata. Retrieval scope may be
-    # enabled independently while this remains off pending RG-05P approval.
+    # enabled independently while this remains off pending the provider-processing approval gate.
     expert_hierarchy_display_names_enabled: bool = False
     guidance_n_results: int = 5
     guidance_min_score: float = 0.3

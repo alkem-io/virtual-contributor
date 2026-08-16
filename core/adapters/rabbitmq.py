@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-from contextvars import ContextVar
 from contextlib import contextmanager
 from collections.abc import Awaitable, Callable
 
@@ -12,59 +11,42 @@ from aio_pika import ExchangeType, Message
 logger = logging.getLogger(__name__)
 
 
-_connection_diagnostic_suppressed: ContextVar[bool] = ContextVar(
-    "rabbitmq_connection_diagnostic_suppressed", default=False,
-)
-
 # Both locked dependencies derive every module/child logger from these two
 # base names (``aio_pika.log.get_logger`` and aiormq's per-module
 # ``getLogger(__name__)`` calls, including dynamic ``.getChild(...)``
-# children such as ``aiormq.connection.marshall``). Matching by dot-boundary
-# prefix at the point every propagated record is actually observed catches
-# all of them, present and future, unlike an enumerated leaf-logger list.
-_SUPPRESSED_DEPENDENCY_LOGGER_PREFIXES = ("aio_pika", "aiormq")
+# children such as ``aiormq.connection.marshall``). A logger with no explicit
+# level of its own resolves its effective level by walking up to the nearest
+# ancestor that has one, so raising the level on just these two base loggers
+# reaches every present and future child without visiting the tree.
+_SUPPRESSED_DEPENDENCY_LOGGER_NAMES = ("aio_pika", "aiormq")
 
-
-def _is_suppressed_dependency_logger(name: str) -> bool:
-    return any(
-        name == prefix or name.startswith(f"{prefix}.")
-        for prefix in _SUPPRESSED_DEPENDENCY_LOGGER_PREFIXES
-    )
-
-
-# Logger-level filters only run for the logger a record was logged through,
-# not for its ancestors — so a filter attached to ``aiormq.connection``
-# never sees a record from its dynamically created ``.marshall`` child.
-# ``Handler.filter`` runs once per handler on every record that reaches it
-# after propagation, regardless of which logger originated it, which is the
-# layer that can actually enforce this boundary completely. Patched once at
-# import time; there is exactly one handler installed for this process
-# (``core.logging.setup_logging``).
-_stdlib_handler_filter = logging.Handler.filter
-
-
-def _connection_diagnostic_handler_filter(
-    self: logging.Handler, record: logging.LogRecord,
-) -> bool:
-    if _connection_diagnostic_suppressed.get() and _is_suppressed_dependency_logger(record.name):
-        return False
-    # logging.Handler.filter always returns a plain bool at runtime; the
-    # typeshed stub widens it via Filterer.filter's overload, so pin the
-    # narrowed type explicitly rather than let the unbound-method call widen it.
-    return bool(_stdlib_handler_filter(self, record))
-
-
-logging.Handler.filter = _connection_diagnostic_handler_filter  # type: ignore[method-assign]
+# One level above CRITICAL: nothing a dependency logs at any standard level
+# passes an effective-level check this high.
+_HANDSHAKE_SUPPRESSION_LEVEL = logging.CRITICAL + 1
 
 
 @contextmanager
 def _suppress_connection_dependency_diagnostics():
-    """Keep connection/reconnect details out of this startup task's logs."""
-    token = _connection_diagnostic_suppressed.set(True)
+    """Keep connection/reconnect details out of this handshake's logs.
+
+    Raises the two locked dependencies' base logger levels for exactly the
+    duration of the wrapped handshake, then restores whatever level each
+    logger had before. This is ordinary, non-inheritable logger state rather
+    than state carried into child tasks: a long-lived task started during the
+    window (aio_pika's reconnection task, spawned from inside
+    ``connect_robust``) is unaffected once the window ends, because by the
+    time it next logs, the level has already been restored on the logger
+    object itself — restoration does not depend on which task performs it.
+    """
+    loggers = [logging.getLogger(name) for name in _SUPPRESSED_DEPENDENCY_LOGGER_NAMES]
+    previous_levels = [dependency_logger.level for dependency_logger in loggers]
     try:
+        for dependency_logger in loggers:
+            dependency_logger.setLevel(_HANDSHAKE_SUPPRESSION_LEVEL)
         yield
     finally:
-        _connection_diagnostic_suppressed.reset(token)
+        for dependency_logger, previous_level in zip(loggers, previous_levels):
+            dependency_logger.setLevel(previous_level)
 
 
 class RabbitMQAdapter:

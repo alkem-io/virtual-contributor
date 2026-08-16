@@ -1,4 +1,4 @@
-"""C-16: Expert composition descriptors are explicit and paired-run safe."""
+"""Expert composition descriptors are explicit and paired-run safe."""
 
 from __future__ import annotations
 

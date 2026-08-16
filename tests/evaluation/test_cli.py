@@ -1,4 +1,4 @@
-"""Frozen CLI authority and evaluation-identity contracts (C-23/C-27)."""
+"""Frozen CLI authority and evaluation-identity contracts."""
 
 from __future__ import annotations
 

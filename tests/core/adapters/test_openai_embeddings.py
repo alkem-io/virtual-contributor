@@ -1,4 +1,4 @@
-"""C-29 standard OpenAI embedding adapter contracts."""
+"""Standard OpenAI embedding adapter contracts: query retries are adapter-owned."""
 from __future__ import annotations
 from unittest.mock import AsyncMock
 

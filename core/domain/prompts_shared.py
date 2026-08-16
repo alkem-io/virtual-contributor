@@ -22,10 +22,6 @@ _METADATA_VALUE_LIMITS = {
     "type": 200,
     "uri": 300,
     "source": 300,
-    "spaceName": 200,
-    "subspaceName": 200,
-    "spaceId": 200,
-    "subspaceId": 200,
 }
 
 GROUNDING_INSTRUCTIONS = """Grounding requirements:
@@ -100,18 +96,27 @@ def _stable_hierarchy_ids(metadata: Mapping[str, object]) -> frozenset[str]:
 def _carries_stable_hierarchy_id(text: str, stable_ids: frozenset[str]) -> bool:
     """True when a rendered legacy alias value discloses a stable identifier.
 
-    Matches both the bare identifier and the ``space:<id>`` ingestion alias
-    shape, so this catches ``source``/``uri`` values built as
-    ``f"space:{space_id}"`` as well as any alias that was given the identifier
-    directly.
+    Two independent checks, either of which is sufficient on its own:
+
+    - **Shape**: any value of the ``space:<remainder>`` ingestion alias form
+      — ``"space:"`` immediately followed by a non-empty remainder — is
+      identity-bearing on its face. It is excised whether or not the current
+      passage's own metadata happens to carry a matching ``spaceId`` or
+      ``subspaceId``, because the value discloses some space's stable
+      identifier regardless of whose passage is being rendered. A
+      human-authored value that merely resembles the shape (for example a
+      title starting with ``"space:"``) is conservatively excised too and
+      falls back along the existing alias chain — a small, deliberate
+      availability cost on the privacy side of this boundary.
+    - **Bare equality**: the value equals one of this passage's own stored
+      stable hierarchy identifiers exactly, with no wrapping shape.
     """
 
-    if not text or not stable_ids:
+    if not text:
         return False
-    for stable_id in stable_ids:
-        if text == stable_id or text == f"space:{stable_id}":
-            return True
-    return False
+    if text.startswith("space:") and len(text) > len("space:"):
+        return True
+    return text in stable_ids
 
 
 def _legacy_alias_text(

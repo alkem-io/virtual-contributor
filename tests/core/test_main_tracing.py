@@ -322,26 +322,6 @@ async def test_refused_broker_startup_omits_complete_configuration_sentinels(
         assert f"{key}={value}" in rendered
 
 
-async def test_broker_connection_log_filter_is_context_local(caplog) -> None:
-    """A connection attempt filters its child diagnostics, not other tasks."""
-    import asyncio
-    from core.adapters.rabbitmq import _suppress_connection_dependency_diagnostics
-
-    dependency_logger = logging.getLogger("aiormq.connection")
-
-    async def emit(message: str) -> None:
-        dependency_logger.error(message)
-
-    caplog.set_level(logging.ERROR)
-    outside = asyncio.create_task(emit("outside startup context"))
-    with _suppress_connection_dependency_diagnostics():
-        await emit("inside startup context")
-        await asyncio.create_task(emit("child startup context"))
-    await outside
-    messages = [record.getMessage() for record in caplog.records]
-    assert messages == ["outside startup context"]
-
-
 async def test_complete_startup_and_one_message_cycle_omit_the_queue_name(
     caplog, monkeypatch,
 ) -> None:

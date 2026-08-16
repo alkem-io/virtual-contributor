@@ -9,12 +9,16 @@ reaches a log record through either path.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 
 import pytest
 
-from core.adapters.rabbitmq import RabbitMQAdapter
+from core.adapters.rabbitmq import (
+    RabbitMQAdapter,
+    _suppress_connection_dependency_diagnostics,
+)
 
 
 #: A value distinctive enough that finding it in a log is unambiguous.
@@ -289,3 +293,66 @@ async def test_consume_with_message_callback_failure_still_omits_the_queue_name(
     assert [(r.msg, r.args, r.exc_info) for r in errors] == [
         ("consume_with_message callback failed: error_type=%s", ("RuntimeError",), False),
     ]
+
+
+async def test_dependency_task_created_during_handshake_is_visible_after_it_returns(
+    caplog,
+) -> None:
+    """A task created inside the handshake window, mirroring aio_pika's
+    long-lived reconnection task spawned from ``connect_robust()``, must not
+    carry the handshake's suppression state with it. Once the window has
+    closed, a dependency record it emits — even though the task itself
+    predates the window's end — reaches operators normally."""
+    dependency_logger = logging.getLogger("aio_pika.connection")
+    caplog.set_level(logging.DEBUG)
+
+    task: asyncio.Task | None = None
+    with _suppress_connection_dependency_diagnostics():
+        task = asyncio.create_task(asyncio.sleep(0))
+
+    await task
+    dependency_logger.error("reconnect attempt after handshake window closed")
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert messages == ["reconnect attempt after handshake window closed"]
+
+
+async def test_aiormq_dependency_task_created_during_handshake_is_visible_after_it_returns(
+    caplog,
+) -> None:
+    """Same control through the ``aiormq`` base logger name, whose reader/
+    writer/heartbeat tasks are the other locked dependency's long-lived
+    background work."""
+    dependency_logger = logging.getLogger("aiormq.connection")
+    caplog.set_level(logging.DEBUG)
+
+    task: asyncio.Task | None = None
+    with _suppress_connection_dependency_diagnostics():
+        task = asyncio.create_task(asyncio.sleep(0))
+
+    await task
+    dependency_logger.error("reconnect attempt after handshake window closed")
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert messages == ["reconnect attempt after handshake window closed"]
+
+
+async def test_dynamic_child_logger_stays_suppressed_inside_the_handshake_window(
+    caplog,
+) -> None:
+    """Coverage the ContextVar mechanism it replaces already had: a
+    dynamically created child logger (``aiormq.connection.marshall``, built
+    per-call via ``getChild``) and the repr-bearing ``aio_pika.connection``
+    DEBUG diagnostic must both stay silent for the duration of the window,
+    not just the two base logger names themselves."""
+    caplog.set_level(logging.DEBUG)
+
+    with _suppress_connection_dependency_diagnostics():
+        logging.getLogger("aio_pika.connection").debug(
+            "Creating AMQP channel for connection: <Connection repr-canary>",
+        )
+        logging.getLogger("aiormq.connection").getChild("marshall").debug(
+            "marshall-frame-canary encoding frame",
+        )
+
+    assert caplog.records == []
