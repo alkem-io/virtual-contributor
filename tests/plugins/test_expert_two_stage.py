@@ -129,12 +129,13 @@ async def _graph_retrieve(plugin: ExpertPlugin) -> dict:
 async def test_simple_scoped_stage_uses_detail_predicate() -> None:
     store = _store()
     response = await _plugin(store).handle(_event())  # type: ignore[arg-type]
-    assert [source.source for source in response.sources] == ["a-1", "a-2"]
+    # The scoped branch's own overview is primary content and stays
+    # answerable inside Stage 2, alongside its chunks.
+    assert [source.source for source in response.sources] == ["", "a-1", "a-2"]
     assert len(store.query_calls) == 2
     predicate = store.query_calls[1][3]
     assert predicate == {
         "$and": [
-            {"embeddingType": {"$ne": "overview"}},
             {"embeddingType": {"$ne": "summary"}},
             {"type": {"$ne": "bodyOfKnowledgeSummary"}},
             {"subspaceId": {"$eq": "a-sub"}},
@@ -172,7 +173,7 @@ async def test_stage_one_roots_do_not_hide_later_specific_subspace_route() -> No
     store.collections["c-knowledge"] = roots + _entries()
     response = await _plugin(store).handle(_event())  # type: ignore[arg-type]
     assert store.query_calls[-1][3]["$and"][-1] == {"subspaceId": {"$eq": "a-sub"}}
-    assert [source.source for source in response.sources] == ["a-1", "a-2"]
+    assert [source.source for source in response.sources] == ["", "a-1", "a-2"]
 
 
 @dataclass
@@ -190,7 +191,7 @@ async def test_hybrid_propagates_scoped_predicate_to_dense_and_lexical_arms() ->
     response = await _plugin(store, hybrid_config=_Hybrid()).handle(_event())  # type: ignore[arg-type]
     assert store.query_calls[-1][3]["$and"][-1] == {"subspaceId": {"$eq": "a-sub"}}
     assert store.lexical_calls and store.lexical_calls[-1][3] == store.query_calls[-1][3]
-    assert [source.source for source in response.sources] == ["a-1", "a-2"]
+    assert [source.source for source in response.sources] == ["", "a-1", "a-2"]
 
 
 @pytest.mark.parametrize("error_type", [
@@ -218,14 +219,14 @@ async def test_pipeline_order_keeps_short_nonempty_scoped_result() -> None:
     store = _store()
     store.collections["c-knowledge"] = [entry for entry in _entries() if entry["id"] != "a-2"]
     response = await _plugin(store).handle(_event())  # type: ignore[arg-type]
-    assert [source.source for source in response.sources] == ["a-1"]
+    assert [source.source for source in response.sources] == ["", "a-1"]
     assert len(store.query_calls) == 2  # no unscoped sibling backfill
 
 
 async def test_pipeline_order_applies_hierarchy_after_detail_selection() -> None:
     store = _store()
     response = await _plugin(store).handle(_event())  # type: ignore[arg-type]
-    assert [source.source for source in response.sources] == ["a-1", "a-2"]
+    assert [source.source for source in response.sources] == ["", "a-1", "a-2"]
 
 
 async def test_hierarchy_context_and_row_alignment() -> None:
@@ -238,7 +239,7 @@ async def test_hierarchy_context_and_row_alignment() -> None:
     response = await plugin.handle(_event())  # type: ignore[arg-type]
     prompt = llm.calls[-1][0]["content"]
     assert "Space: Alpha" in prompt
-    assert "[Document 1" in prompt and [source.source for source in response.sources] == ["a-1", "a-2"]
+    assert "[Document 1" in prompt and [source.source for source in response.sources] == ["", "a-1", "a-2"]
 
 
 async def test_simple_outbound_context_never_contains_raw_hierarchy_ids_without_names() -> None:
@@ -277,7 +278,7 @@ async def test_graph_hierarchy_display_names_are_explicit_and_ids_remain_hidden(
 async def test_row_alignment_preserves_source_order_with_hierarchy() -> None:
     store = _store()
     response = await _plugin(store).handle(_event())  # type: ignore[arg-type]
-    assert [source.source for source in response.sources] == ["a-1", "a-2"]
+    assert [source.source for source in response.sources] == ["", "a-1", "a-2"]
 
 
 async def test_disabled_is_single_flat_call_and_byte_parity() -> None:
@@ -366,9 +367,10 @@ async def test_real_graph_answer_receives_the_exact_observed_final_context() -> 
             "source": "threshold-source",
         },
     })
-    # The first two Stage-2 rows score .9 and .8; the compact budget retains
-    # only the first. The third scores .7 and is independently thresholded.
-    # The overview is orienting-only and the Beta row is scope-excluded.
+    # The scoped branch's own overview is content and now ranks highest
+    # (score .9); a-1 scores .8, a-2 .7, a-threshold .6. score_threshold=0.75
+    # keeps only the overview and a-1, and the compact budget then retains
+    # only the top-ranked overview row.
     plugin = ExpertPlugin(
         LangChainLLMAdapter(_CapturingGraphModel()), store,
         hierarchical_retrieval_enabled=True, score_threshold=0.75,
@@ -383,8 +385,9 @@ async def test_real_graph_answer_receives_the_exact_observed_final_context() -> 
     rendered = "\n\n".join(observed[-1])
     answer_prompt = str(_CapturingGraphModel.calls[-1][0].content)
     assert answer_prompt.encode() == f"FINAL ANSWER CONTEXT:\n{rendered}".encode()
-    assert "Alpha overview" not in answer_prompt  # Stage 1 orienting row
-    assert "Alpha evidence" not in answer_prompt  # rendered-budget dropped
+    assert "Alpha overview" in answer_prompt  # scoped branch's own content
+    assert "Alpha liability detail" not in answer_prompt  # rendered-budget dropped
+    assert "Alpha evidence" not in answer_prompt  # below score threshold
     assert "THRESHOLD DROPPED SENTINEL" not in answer_prompt
     assert "Beta liability noise" not in answer_prompt  # sibling scoped out
 
@@ -453,7 +456,15 @@ async def test_repeated_usable_hierarchy_requests_do_not_cache_capability() -> N
 
 async def test_fallback_empty_scoped_detail_uses_flat_once() -> None:
     store = _store()
-    store.collections["c-knowledge"] = [entry for entry in _entries() if entry["id"] not in {"a-1", "a-2"}]
+    # Route via a "summary" orienting row (Stage-1-only) rather than the
+    # branch's overview, and drop every chunk under that branch, so Stage 2
+    # truly finds zero content rows -- overview is content now and would
+    # otherwise itself satisfy the scoped query.
+    entries = [entry for entry in _entries() if entry["id"] not in {"a-1", "a-2"}]
+    for entry in entries:
+        if entry["id"] == "route-a":
+            entry["metadata"]["embeddingType"] = "summary"
+    store.collections["c-knowledge"] = entries
     response = await _plugin(store).handle(_event())  # type: ignore[arg-type]
     assert response.sources and len(store.query_calls) == 3
 
@@ -563,8 +574,8 @@ async def test_precision_proxy_scoped_results_reduce_off_branch_noise() -> None:
     scoped = await _plugin(scoped_store).handle(_event())  # type: ignore[arg-type]
     flat_ids = {source.source for source in flat.sources}
     scoped_ids = {source.source for source in scoped.sources}
-    relevant = {"a-1", "a-2"}
-    assert scoped_ids == {"a-1", "a-2"}
+    relevant = {"", "a-1", "a-2"}
+    assert scoped_ids == {"", "a-1", "a-2"}
     assert scoped_ids >= flat_ids & relevant
     assert len(scoped_ids & relevant) / len(scoped_ids) > len(flat_ids & relevant) / len(flat_ids)
 
@@ -573,7 +584,7 @@ async def test_graph_scoped_success_returns_aligned_sources_after_filter_topk_an
     response = await _graph_plugin(_store()).handle(make_input(
         message="Alpha liability", bodyOfKnowledgeID="c", promptGraph=REAL_ANSWER_GRAPH,
     ))
-    assert [source.source for source in response.sources] == ["a-1", "a-2"]
+    assert [source.source for source in response.sources] == ["", "a-1", "a-2"]
 
 async def test_graph_feature_off_preserves_empty_sources() -> None:
     response = await ExpertPlugin(LangChainLLMAdapter(_CapturingGraphModel()), _store()).handle(make_input(
@@ -621,9 +632,16 @@ async def test_graph_stage_two_error_fallback_preserves_empty_sources() -> None:
 
 async def test_graph_empty_scoped_fallback_preserves_empty_sources() -> None:
     store = _store()
-    store.collections["c-knowledge"] = [
-        entry for entry in _entries() if entry["id"] not in {"a-1", "a-2"}
-    ]
+    # Route via a "summary" orienting row (Stage-1-only) rather than the
+    # branch's overview, and drop every chunk under that branch, so Stage 2
+    # truly finds zero content rows -- overview is content now and would
+    # otherwise itself satisfy the scoped query and prevent the flat/graph
+    # feature-off empty-sources path this test asserts.
+    entries = [entry for entry in _entries() if entry["id"] not in {"a-1", "a-2"}]
+    for entry in entries:
+        if entry["id"] == "route-a":
+            entry["metadata"]["embeddingType"] = "summary"
+    store.collections["c-knowledge"] = entries
     response = await _graph_plugin(store).handle(make_input(
         message="Alpha liability", bodyOfKnowledgeID="c", promptGraph=REAL_ANSWER_GRAPH,
     ))
@@ -704,9 +722,11 @@ async def _production_separator_boundary(*, hierarchy: bool, graph: bool) -> Non
 
     blocks, _, sources, result = await execute(20_000)
     # Fixed fixture oracle: Stage 1's overview selects a-sub; stage 2 keeps
-    # exactly these two rows in ranking order.  The hierarchy display is part
-    # of what the provider sees, not a post-hoc source decoration.
-    survivor_indices = [1, 2] if hierarchy else [0, 1, 2, 3]
+    # all three a-sub content rows (the overview itself plus its two chunks)
+    # in ranking order, excluding only the sibling b-sub chunk.  The
+    # hierarchy display is part of what the provider sees, not a post-hoc
+    # source decoration.
+    survivor_indices = [0, 1, 2] if hierarchy else [0, 1, 2, 3]
     expected_entries = [_entries()[index] for index in survivor_indices]
     assert result.documents == [[entry["document"] for entry in expected_entries]]
     assert result.ids == [[entry["id"] for entry in expected_entries]]

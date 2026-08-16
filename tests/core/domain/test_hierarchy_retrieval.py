@@ -29,8 +29,13 @@ def test_orienting_excludes_detail_by_not_selecting_chunk() -> None:
 
 
 def test_detail_is_exclusion_shaped_for_legacy_content() -> None:
-    assert {"embeddingType": {"$ne": "overview"}} in DETAIL_WHERE["$and"]
     assert {"embeddingType": {"$ne": "summary"}} in DETAIL_WHERE["$and"]
+
+
+def test_detail_keeps_overview_as_answerable_content() -> None:
+    # Overview rows are primary content (a space/subspace description), not
+    # a derived Stage-1-only artifact, so Stage 2 must not exclude them.
+    assert {"embeddingType": {"$ne": "overview"}} not in DETAIL_WHERE["$and"]
 
 
 def test_detail_excludes_legacy_body_of_knowledge_summary() -> None:
