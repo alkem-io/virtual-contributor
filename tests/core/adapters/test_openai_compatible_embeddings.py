@@ -218,6 +218,23 @@ class TestWrappingBehaviour:
         assert client.post.await_count == 2
         cls.assert_called_with(timeout=60.0)
 
+    @pytest.mark.parametrize("make_exc", [
+        lambda: __import__("httpx").RemoteProtocolError("server disconnected"),
+        lambda: __import__("httpx").ProxyError("proxy refused"),
+        lambda: __import__("json").JSONDecodeError("truncated", "x", 0),
+    ])
+    async def test_query_embedding_retries_mid_stream_and_proxy_and_decode_errors(self, monkeypatch, make_exc):
+        """A dropped connection, a flaky proxy, or a truncated body must spend
+        the configured attempt budget, not fail permanently after one send."""
+        adapter = OpenAICompatibleEmbeddingsAdapter("k", "http://x", "model", max_attempts=3)
+        with patch("httpx.AsyncClient") as client_cls:
+            client = client_cls.return_value.__aenter__.return_value
+            client.post = AsyncMock(side_effect=[make_exc(), make_exc(), _fake_response()])
+            monkeypatch.setattr("core.adapters.openai_compatible_embeddings.asyncio.sleep", AsyncMock())
+            result = await adapter.embed_query(["q"])
+        assert result == [[0.1] * 4]
+        assert client.post.await_count == 3
+
     async def test_document_embed_exhaustion_reraises_original_error(self, monkeypatch):
         import json
         error = json.JSONDecodeError("x", "x", 0)
