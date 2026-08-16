@@ -182,6 +182,30 @@ METRIC_ALIASES = {
 }
 
 
+_UNIT_CLAMP_TOLERANCE = 1e-9
+
+
+def _clamp_unit_float_error(value: object) -> object:
+    """Absorb float round-off at the RAGAS producer boundary.
+
+    RAGAS's un-clamped cosine-mean metrics (e.g. ResponseRelevancy) can
+    legitimately return values a few ULPs outside [0, 1] for a well-answered
+    case. Snap values within a small tolerance back to the boundary so the
+    fail-closed domain check in ``finite_unit_metric`` still rejects NaN/inf
+    and genuine outliers, just not one-ULP float error.
+    """
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        return value
+    numeric = float(value)
+    if not math.isfinite(numeric):
+        return value
+    if 1.0 < numeric <= 1.0 + _UNIT_CLAMP_TOLERANCE:
+        return 1.0
+    if -_UNIT_CLAMP_TOLERANCE <= numeric < 0.0:
+        return 0.0
+    return value
+
+
 def canonical_metric_scores(values: dict[str, object]) -> dict[str, float]:
     """Map real RAGAS names once and require exactly four usable metrics."""
     canonical: dict[str, float] = {}
@@ -189,7 +213,7 @@ def canonical_metric_scores(values: dict[str, object]) -> dict[str, float]:
         mapped = METRIC_ALIASES.get(name)
         if mapped is None or mapped in canonical:
             raise ValueError("Evaluation metrics must use exactly the canonical inventory")
-        canonical[mapped] = finite_unit_metric(value)
+        canonical[mapped] = finite_unit_metric(_clamp_unit_float_error(value))
     if set(canonical) != set(METRIC_NAMES):
         raise ValueError("Evaluation metrics must include every required metric")
     return canonical

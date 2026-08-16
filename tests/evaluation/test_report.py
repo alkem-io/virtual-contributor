@@ -368,6 +368,43 @@ def test_successful_metric_scores_require_exact_non_null_inventory():
         )
 
 
+def test_metric_scores_clamp_one_ulp_float_error_at_the_unit_boundary():
+    """RAGAS's un-clamped cosine-mean metrics legitimately return e.g.
+    1.0000000000000007 for a well-answered case; that must not fail-close
+    the whole case, but a real out-of-domain value still must."""
+    from evaluation.report import canonical_metric_scores
+
+    canonical = canonical_metric_scores(
+        {
+            "faithfulness": 1.0 + 1e-16,
+            "answer_relevancy": -1e-16,
+            "context_precision": 0.5,
+            "context_recall": 1.0,
+        }
+    )
+    assert canonical["faithfulness"] == 1.0
+    assert canonical["answer_relevancy"] == 0.0
+
+    with pytest.raises(ValueError):
+        canonical_metric_scores(
+            {
+                "faithfulness": 1.5,
+                "answer_relevancy": 0,
+                "context_precision": 0,
+                "context_recall": 0,
+            }
+        )
+    with pytest.raises(ValueError):
+        canonical_metric_scores(
+            {
+                "faithfulness": float("nan"),
+                "answer_relevancy": 0,
+                "context_precision": 0,
+                "context_recall": 0,
+            }
+        )
+
+
 def test_comparison_rejects_provider_alias_or_incomplete_metric_inventory():
     baseline, current = _make_run("baseline"), _make_run("current")
     baseline.aggregate.pop("context_recall")
