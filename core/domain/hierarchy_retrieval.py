@@ -26,14 +26,9 @@ ORIENTING_WHERE: dict = {
 
 # These are deliberately exclusions.  A positive "chunk" filter would drop
 # older collection entries whose embeddingType predates that field.
-#
-# "overview" is primary content (a space/subspace description, kept whole),
-# not a derived artifact -- it must stay answerable once Stage 1 has scoped
-# a branch. Only "summary" and the legacy bodyOfKnowledgeSummary type are
-# Stage-1-only orienting artifacts, so this predicate mirrors FACTUAL_WHERE's
-# exclusion set (core/domain/retrieval_filters.py) plus the branch scope.
 DETAIL_WHERE: dict = {
     "$and": [
+        {"embeddingType": {"$ne": "overview"}},
         {"embeddingType": {"$ne": "summary"}},
         {"type": {"$ne": "bodyOfKnowledgeSummary"}},
     ]
