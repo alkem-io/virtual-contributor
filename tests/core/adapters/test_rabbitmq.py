@@ -10,6 +10,7 @@ reaches a log record through either path.
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
 import logging
 
@@ -300,18 +301,25 @@ async def test_dependency_task_created_during_handshake_is_visible_after_it_retu
 ) -> None:
     """A task created inside the handshake window, mirroring aio_pika's
     long-lived reconnection task spawned from ``connect_robust()``, must not
-    carry the handshake's suppression state with it. Once the window has
-    closed, a dependency record it emits — even though the task itself
-    predates the window's end — reaches operators normally."""
+    carry the handshake's suppression state with it. The record is emitted
+    from *inside* that task, after the window has closed — a level-based
+    (non-inheritable) mechanism lets it through because the logger object's
+    own level has already been restored by then; a ContextVar-based
+    mechanism captured at task-creation time would still suppress it here,
+    since the task itself was spawned inside the window."""
     dependency_logger = logging.getLogger("aio_pika.connection")
     caplog.set_level(logging.DEBUG)
+    gate = asyncio.Event()
 
-    task: asyncio.Task | None = None
+    async def emit_after_gate() -> None:
+        await gate.wait()
+        dependency_logger.error("reconnect attempt after handshake window closed")
+
     with _suppress_connection_dependency_diagnostics():
-        task = asyncio.create_task(asyncio.sleep(0))
+        task = asyncio.create_task(emit_after_gate())
 
+    gate.set()
     await task
-    dependency_logger.error("reconnect attempt after handshake window closed")
 
     messages = [r.getMessage() for r in caplog.records]
     assert messages == ["reconnect attempt after handshake window closed"]
@@ -322,19 +330,43 @@ async def test_aiormq_dependency_task_created_during_handshake_is_visible_after_
 ) -> None:
     """Same control through the ``aiormq`` base logger name, whose reader/
     writer/heartbeat tasks are the other locked dependency's long-lived
-    background work."""
+    background work. The record is emitted from *inside* the task, after
+    the window has closed, matching the shape of a real long-lived
+    reconnection task that outlives the handshake it was spawned in."""
     dependency_logger = logging.getLogger("aiormq.connection")
     caplog.set_level(logging.DEBUG)
+    gate = asyncio.Event()
 
-    task: asyncio.Task | None = None
+    async def emit_after_gate() -> None:
+        await gate.wait()
+        dependency_logger.error("reconnect attempt after handshake window closed")
+
     with _suppress_connection_dependency_diagnostics():
-        task = asyncio.create_task(asyncio.sleep(0))
+        task = asyncio.create_task(emit_after_gate())
 
+    gate.set()
     await task
-    dependency_logger.error("reconnect attempt after handshake window closed")
 
     messages = [r.getMessage() for r in caplog.records]
     assert messages == ["reconnect attempt after handshake window closed"]
+
+
+def test_double_import_leaves_handler_filter_as_the_stdlib_function() -> None:
+    """The suppression mechanism must be a `logging.Filter` instance on
+    concrete handlers and/or save/restore of the two base dependency
+    loggers' own levels -- never a process-global rebind of
+    `logging.Handler.filter`. Importing (and reloading) the adapter module
+    twice must leave `logging.Handler.filter` identical to a fresh
+    reference to the stdlib function, with no chained delegate wrapping it
+    up, proving there is nothing here for a second import to double-wrap."""
+    import core.adapters.rabbitmq as rabbitmq_module
+
+    stdlib_filter = logging.Handler.filter
+    importlib.reload(rabbitmq_module)
+    importlib.reload(rabbitmq_module)
+
+    assert logging.Handler.filter is stdlib_filter
+    assert logging.Handler.filter is logging.Filterer.filter
 
 
 async def test_dynamic_child_logger_stays_suppressed_inside_the_handshake_window(
