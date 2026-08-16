@@ -398,3 +398,72 @@ async def test_selected_hybrid_callable_drives_live_plugin_retrieval_and_identit
     direct = ExpertPlugin(_LLM(), _Store())
     from core.domain import hybrid_retrieval
     assert direct._hybrid_retriever is hybrid_retrieval.retrieve
+
+
+def test_expert_wiring_reads_no_config_field_outside_the_resolved_authority() -> None:
+    """`_BEHAVIOR_FIELDS`/`_PLUMBING_FIELDS` is a hand-maintained allowlist:
+    a live Expert knob wired by `main._inject_plugin_config` /
+    `main._inject_answering_config` / `main._compose_expert_dependencies` but
+    left out of it is silently reverted to its class default rather than the
+    resolved authority's value, and is invisible to the composition
+    fingerprint. Derive the expected set from the actual wiring call instead
+    of restating it: instrument every ``BaseConfig`` field access made while
+    composing an Expert plugin's constructor kwargs, and assert each access
+    lands on a field the resolved authority (behavior ∪ plumbing) already
+    carries — the two structural exceptions are ``plugin_type`` (used only to
+    select the expert branch, never fed to a kwarg) and
+    ``expert_hierarchical_retrieval_enabled`` (the composition mode itself,
+    read once to set ``expert_hierarchical_retrieval_enabled`` on the
+    transient view). Any other field reached from the live wiring path means
+    a knob is being read off ``config`` directly instead of off the resolved
+    authority, exactly the omission this test exists to catch.
+    """
+    import core.config as config_module
+    import main as main_module
+    from plugins.expert import composition as composition_module
+    from plugins.expert.plugin import ExpertPlugin
+
+    base_config = _config()
+    wiring = resolve_expert_composition(base_config)
+
+    accessed: set[str] = set()
+    base_cls = config_module.BaseConfig
+
+    class _TrackingConfig(base_cls):
+        def __getattribute__(self, name: str) -> object:
+            value = base_cls.__getattribute__(self, name)
+            if name in base_cls.model_fields:
+                accessed.add(name)
+            return value
+
+    original_runtime_config = composition_module.expert_runtime_config
+
+    def _tracking_runtime_config(authority, plumbing):
+        result = original_runtime_config(authority, plumbing)
+        result.__class__ = _TrackingConfig
+        return result
+
+    composition_module.expert_runtime_config = _tracking_runtime_config
+    main_module.expert_runtime_config = _tracking_runtime_config
+    try:
+        deps: dict = {}
+        main_module._compose_expert_dependencies(
+            wiring.authority, deps, ExpertPlugin,
+            plumbing=wiring.plumbing, selectors=wiring.selectors,
+        )
+    finally:
+        composition_module.expert_runtime_config = original_runtime_config
+        main_module.expert_runtime_config = original_runtime_config
+
+    resolved_fields = (
+        {name for name, _ in wiring.authority.behavior}
+        | {name for name, _ in wiring.plumbing.values}
+    )
+    structural_exceptions = {"plugin_type", "expert_hierarchical_retrieval_enabled"}
+    undeclared = accessed - resolved_fields - structural_exceptions
+    assert not undeclared, (
+        f"Expert wiring reads config field(s) {sorted(undeclared)} that are absent "
+        "from _BEHAVIOR_FIELDS/_PLUMBING_FIELDS: add the field to the allowlist "
+        "in the same change that wires it, or it silently reverts to its class "
+        "default and stays invisible to the composition fingerprint."
+    )
