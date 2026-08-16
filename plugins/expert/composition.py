@@ -99,25 +99,28 @@ def _build_routing_table(
     score_threshold: float,
     max_context_chars: int,
 ) -> dict[object, object]:
-    """Build Expert routing profiles from the already-resolved authority.
+    """Build Expert routing profiles from the already-resolved authority."""
+    from core.domain.routing import RetrievalProfile
+    from core.ports.query_router import RouteClass
 
-    Delegates to the legacy builder (``main._build_routing_table``) so the
-    two profile-construction rules can never fork silently, mirroring how
-    the ``rewrite`` selector delegates to ``main._build_rewrite_policy``.
-    ``ResolvedExpertComposition.__getattr__`` resolves the same
-    ``routing_simple_n_results`` / ``routing_complex_n_results`` /
-    ``routing_complex_context_chars`` attribute reads the legacy builder
-    makes against a ``BaseConfig``, so the resolved authority stands in for
-    it directly.
-    """
-    from main import _build_routing_table as legacy_builder
+    def integer(name: str) -> int:
+        value = composition.value(name)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"Resolved Expert routing value {name} must be an integer")
+        return value
 
-    return legacy_builder(
-        cast("BaseConfig", composition),
-        n_results=n_results,
-        score_threshold=score_threshold,
-        max_context_chars=max_context_chars,
-    )
+    return {
+        RouteClass.CONVERSATIONAL: RetrievalProfile(False, n_results, score_threshold, max_context_chars),
+        RouteClass.SIMPLE: RetrievalProfile(
+            True, min(integer("routing_simple_n_results"), n_results),
+            score_threshold, max_context_chars,
+        ),
+        RouteClass.MODERATE: RetrievalProfile(True, n_results, score_threshold, max_context_chars),
+        RouteClass.COMPLEX: RetrievalProfile(
+            True, max(integer("routing_complex_n_results"), n_results),
+            score_threshold, max(integer("routing_complex_context_chars"), max_context_chars),
+        ),
+    }
 
 
 def _build_rewrite_policy() -> object | None:
