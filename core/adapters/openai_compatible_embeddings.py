@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 
 import httpx
@@ -116,17 +115,7 @@ class OpenAICompatibleEmbeddingsAdapter:
 
     @staticmethod
     def _transient(exc: Exception) -> bool:
-        # RemoteProtocolError (mid-stream disconnect) and ProxyError sit
-        # under httpx.TransportError but outside NetworkError/TimeoutException,
-        # so they need an explicit allow -- a dropped connection or a flaky
-        # proxy is exactly as transient as a connect timeout. JSONDecodeError
-        # means a truncated/non-JSON body on an otherwise-successful response
-        # (mirrors the store adapter's own retry rule for the same error).
-        if isinstance(exc, (
-            TimeoutError, httpx.TimeoutException, httpx.ConnectError,
-            httpx.NetworkError, httpx.RemoteProtocolError, httpx.ProxyError,
-            json.JSONDecodeError,
-        )):
+        if isinstance(exc, (TimeoutError, httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError)):
             return True
         if isinstance(exc, httpx.HTTPStatusError):
             return exc.response.status_code == 408 or exc.response.status_code == 429 or exc.response.status_code >= 500
