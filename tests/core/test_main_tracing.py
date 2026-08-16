@@ -1212,27 +1212,49 @@ async def test_early_ack_failure_span_never_records_content_attribute(traced_exp
     assert "vc.message" not in roots[0].attributes
 
 
-async def test_retry_reject_failure_is_contained_without_sensitive_chain() -> None:
+def _assert_no_sensitive_chain(caplog, *sentinels: str) -> None:
+    """T107: no original or settlement exception value, chain, traceback,
+    or identifier reaches the logs — every error record carries no
+    ``exc_info``, and neither the static message nor its args (which are
+    ``error_type=%s`` markers where present) contain the leaked values."""
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert errors, "expected at least one error record to inspect"
+    for record in errors:
+        assert not record.exc_info
+        for arg in record.args or ():
+            assert arg not in sentinels
+    rendered = "\n".join(record.getMessage() for record in caplog.records)
+    for sentinel in sentinels:
+        assert sentinel not in rendered
+
+
+async def test_retry_reject_failure_is_contained_without_sensitive_chain(caplog) -> None:
+    caplog.set_level(logging.DEBUG)
     async def handle(event): raise RuntimeError("provider-secret")
     class RejectFails(_Message):
         async def reject(self, *, requeue=False): raise RuntimeError("settlement-secret")
     handler, _, _, _ = _wiring(handle, rabbitmq_max_retries=2)
     await handler(_query_body(), RejectFails())
+    _assert_no_sensitive_chain(caplog, "provider-secret", "settlement-secret")
 
 
-async def test_terminal_reject_failure_is_contained_without_sensitive_chain() -> None:
+async def test_terminal_reject_failure_is_contained_without_sensitive_chain(caplog) -> None:
+    caplog.set_level(logging.DEBUG)
     async def handle(event): raise RuntimeError("provider-secret")
     class RejectFails(_Message):
         async def reject(self, *, requeue=False): raise RuntimeError("settlement-secret")
     handler, _, _, _ = _wiring(handle)
     await handler(_query_body(), RejectFails())
+    _assert_no_sensitive_chain(caplog, "provider-secret", "settlement-secret")
 
 
-async def test_parse_reject_failure_is_contained_without_sensitive_chain() -> None:
+async def test_parse_reject_failure_is_contained_without_sensitive_chain(caplog) -> None:
+    caplog.set_level(logging.DEBUG)
     class RejectFails(_Message):
         async def reject(self, *, requeue=False): raise RuntimeError("settlement-secret")
     handler, _, _, _ = _wiring(lambda event: None)
     await handler({"unknown": "member-secret"}, RejectFails())
+    _assert_no_sensitive_chain(caplog, "settlement-secret", "member-secret")
 
 
 def test_rabbit_consumer_wrapper_logs_type_only_without_exception_context() -> None:
