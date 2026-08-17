@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 import json
 import re
+from contextlib import asynccontextmanager
 from typing import Any, Protocol
 
 import chromadb
@@ -46,6 +48,69 @@ class ChromaDBAdapter:
         )
         self._embeddings = embeddings
         self._distance_fn = distance_fn
+        self._query_embedding_cache: contextvars.ContextVar[dict[tuple[str, ...], asyncio.Task[list[list[float]]] | list[list[float]]] | None] = contextvars.ContextVar(
+            "chroma_query_embedding_cache", default=None,
+        )
+
+    @asynccontextmanager
+    async def query_embedding_scope(self):
+        """Reuse successful exact query vectors only inside this task scope."""
+        cache: dict[tuple[str, ...], asyncio.Task[list[list[float]]] | list[list[float]]] = {}
+        token = self._query_embedding_cache.set(cache)
+        try:
+            yield
+        finally:
+            live = [value for value in cache.values() if isinstance(value, asyncio.Task)]
+            for task in live:
+                if not task.done():
+                    task.cancel()
+            if live:
+                # This also retrieves terminal exceptions, including a task
+                # which completed between collection and cancellation.
+                await asyncio.gather(*live, return_exceptions=True)
+            # A provider task owns cache publication while the scope exists;
+            # after every owned task has settled this request owns no state.
+            cache.clear()
+            self._query_embedding_cache.reset(token)
+
+    async def _embed_query(self, query_texts: list[str]) -> list[list[float]]:
+        if self._embeddings is None:
+            raise ValueError("ChromaDBAdapter requires an embeddings provider when embedding_function=None")
+        key = tuple(query_texts)
+        cache_var = getattr(self, "_query_embedding_cache", None)
+        cache = cache_var.get() if cache_var is not None else None
+        if cache is None:
+            return await self._embeddings.embed_query(query_texts)
+        existing = cache.get(key)
+        if isinstance(existing, list):
+            return existing
+        if isinstance(existing, asyncio.Task):
+            return await asyncio.shield(existing)
+
+        # Installing the task happens without an await, making this a genuine
+        # request-local single flight for the concurrently launched hybrid
+        # arms. Shielding prevents one cancelled waiter cancelling the shared
+        # provider submission.
+        task = asyncio.create_task(self._embeddings.embed_query(query_texts))
+        cache[key] = task
+
+        def _complete_provider_task(completed: asyncio.Task[list[list[float]]]) -> None:
+            """Publish success or evict failure; waiters never own either."""
+            if cache.get(key) is task:
+                if completed.cancelled():
+                    cache.pop(key, None)
+                    return
+                try:
+                    vectors = completed.result()
+                except Exception:
+                    # Calling result() consumes a terminal exception even when
+                    # every waiter was cancelled before it finished.
+                    cache.pop(key, None)
+                else:
+                    cache[key] = vectors
+
+        task.add_done_callback(_complete_provider_task)
+        return await asyncio.shield(task)
 
     async def query(
         self,
@@ -54,12 +119,7 @@ class ChromaDBAdapter:
         n_results: int = 10,
         where: dict | None = None,
     ) -> QueryResult:
-        if self._embeddings is None:
-            raise ValueError(
-                "ChromaDBAdapter requires an embeddings provider when "
-                "embedding_function=None"
-            )
-        query_embeddings = await self._embeddings.embed_query(query_texts)
+        query_embeddings = await self._embed_query(query_texts)
 
         def _query():
             col = self._client.get_or_create_collection(
@@ -81,7 +141,7 @@ class ChromaDBAdapter:
                 ids=results.get("ids", []),
             )
 
-        return await self._retry(_query)
+        return await self._retry(_query, redact_errors=where is not None)
 
     @staticmethod
     def _document_predicate(terms: list[str]) -> dict:
@@ -117,15 +177,10 @@ class ChromaDBAdapter:
         if not terms:
             # Nothing to match literally — say so without troubling the store.
             return QueryResult(documents=[[]], metadatas=[[]], distances=[[]], ids=[[]])
-        if self._embeddings is None:
-            raise ValueError(
-                "ChromaDBAdapter requires an embeddings provider when "
-                "embedding_function=None"
-            )
 
         # The store has no text-only query: a vector is still required, and the
         # document predicate narrows the candidates it ranks.
-        query_embeddings = await self._embeddings.embed_query([" ".join(terms)])
+        query_embeddings = await self._embed_query([" ".join(terms)])
         where_document = self._document_predicate(terms)
 
         def _query():
@@ -303,7 +358,8 @@ class ChromaDBAdapter:
                 last_exc = exc
                 if attempt < max_retries - 1:
                     delay = BASE_DELAY * (2 ** attempt)
-                    logger.warning("ChromaDB attempt %d failed, retrying: %s", attempt + 1, exc)
+                    detail = type(exc).__name__ if redact_errors else exc
+                    logger.warning("ChromaDB attempt %d failed, retrying: %s", attempt + 1, detail)
                     await asyncio.sleep(delay)
             except Exception as exc:
                 last_exc = exc

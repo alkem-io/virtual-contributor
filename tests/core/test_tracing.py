@@ -254,3 +254,41 @@ async def test_cancelled_optional_span_stays_unset(traced_exporter) -> None:
     )
     assert span.status.status_code.name == "UNSET"
     assert "vc.failure_mode" not in span.attributes
+
+
+def test_failed_root_span_omits_message_when_content_capture_is_enabled() -> None:
+    from core.tracing import FailureMode, record_failure
+    from opentelemetry import trace
+    span = trace.INVALID_SPAN
+    record_failure(span, RuntimeError("secret"), FailureMode.unknown)
+    assert span is trace.INVALID_SPAN
+
+
+def test_safe_failure_projection_omits_exception_message_and_stacktrace() -> None:
+    from core.tracing import FailureMode, record_failure
+    from opentelemetry import trace
+    span = trace.INVALID_SPAN
+    record_failure(span, RuntimeError("secret"), FailureMode.unknown)
+    assert span is trace.INVALID_SPAN
+
+
+def test_recording_span_failure_projection_redacts_attributes_events_and_status(traced_exporter) -> None:
+    secret = "member@example.test"
+    config = _config(tracing_capture_content=True)
+    with handle_span(config, object(), "expert") as span:
+        record_failure(span, RuntimeError(secret), FailureMode.unknown, config=config)
+    shutdown_tracing()
+    finished = traced_exporter.get_finished_spans()[0]
+    assert finished.status.status_code.name == "ERROR"
+    assert finished.attributes["exception.type"] == "RuntimeError"
+    assert secret not in str(finished.attributes) + str(finished.events) + str(finished.status)
+
+
+def test_recording_span_failure_projection_omits_exception_stacktrace(traced_exporter) -> None:
+    config = _config(tracing_capture_content=True)
+    with handle_span(config, object(), "expert") as span:
+        record_failure(span, RuntimeError("trace secret"), FailureMode.unknown, config=config)
+    shutdown_tracing()
+    finished = traced_exporter.get_finished_spans()[0]
+    assert all(event.name != "exception" for event in finished.events)
+    assert "stacktrace" not in str(finished.attributes) + str(finished.events)

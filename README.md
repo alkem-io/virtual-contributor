@@ -2,6 +2,36 @@
 
 Unified microkernel engine with pluggable handlers for AI-powered virtual contributors. Consolidates 7 formerly standalone services into a single Python 3.12 codebase using a **microkernel + hexagonal (ports and adapters)** architecture.
 
+Expert evaluation resolves one frozen deeply immutable v7 composition before adapter wiring and
+stores invariant plus mode-bound full composition fingerprints. It uses the
+public `evaluation-case-identity/v1` serializer and accepts only finite
+inclusive `[0,1]` case and aggregate metrics. Paired Expert
+comparison is fail-closed: it accepts only a failure-free flat-to-hierarchical
+v7 pair with matching canonical test-set, BoK, corpus-revision, explicit
+`evaluation-case-identity/v1`, and successful
+case identities. Corpus revision is an audit token, not deployment or
+re-ingestion proof; privacy approval, evaluation, enablement, and rollout stay
+human gates.
+
+Query embeddings are bounded to 32768 UTF-8 bytes (rewrites to 4096), with up
+to three adapter-owned attempts under 20-second attempt and 45-second total
+deadlines. Compatible Chroma requests reuse only successful exact inputs within
+one request scope; provider tasks own successful cache publication and terminal
+eviction. Terminal results follow `unpublished` → `published-unacked` →
+`settled`, never raw-retrying after publication. Early-ACK tasks retrieve every
+terminal state with type-only diagnostics. `published-unacked` forbids
+application-managed raw republish or same-callback rerun, but an ambiguous ACK
+may be broker-redelivered and is not an exactly-once promise. Reject settlement
+faults are contained with type-only diagnostics. Expert identity is validated
+before provider/scorer/file work; each successful run has exactly four required
+finite unit metrics. Embedding failures never use flat
+fallback or RabbitMQ redelivery and receive a generic safe response.
+
+This remediation evidence supports only the pending review sequence: review
+round 05 may begin after its independent gate, while rounds 06–07 remain
+contingent human reviews. It does not authorize enablement, deployment, or data
+mutation.
+
 ## Table of Contents
 
 - [Features](#features)
@@ -294,9 +324,40 @@ A separate LLM can be configured for ingest pipeline summarization. All three fi
 |----------|---------|-------------|
 | `EXPERT_N_RESULTS` | `5` | Number of chunks to retrieve (expert plugin) |
 | `EXPERT_MIN_SCORE` | `0.3` | Minimum relevance score (expert plugin) |
+| `EXPERT_HIERARCHICAL_RETRIEVAL_ENABLED` | `false` | Opt-in expert overview/summary route then branch-scoped detail retrieval |
+| `EXPERT_HIERARCHY_MAX_BRANCHES` | `3` | Maximum relevant nearest branches selected (must be 2 or 3) |
+| `EXPERT_HIERARCHY_DISPLAY_NAMES_ENABLED` | `false` | Separately opt-in, sanitized hierarchy display names in generation context |
 | `GUIDANCE_N_RESULTS` | `5` | Number of chunks per collection (guidance plugin) |
 | `GUIDANCE_MIN_SCORE` | `0.3` | Minimum relevance score (guidance plugin) |
 | `MAX_CONTEXT_CHARS` | `20000` | Context budget — lowest-scoring chunks dropped first |
+
+### Hierarchical expert retrieval
+
+This expert-only enhancement is **off by default**. Each eligible request runs
+one dense Stage-1 query over overview/summary entries and uses no permanent
+collection-capability cache. Specific subspace routes dominate any root route;
+a root-only or unusable route takes the established flat path. A safe route runs
+the existing hybrid/re-rank/threshold/top-K pipeline over scoped detail.
+
+A nonempty scoped result remains scoped even when short: there is no unscoped
+backfill. An empty scoped result or hierarchy-stage failure exits the hierarchy
+handler before exactly one flat attempt; an error from that flat attempt remains
+visible. Hierarchy labels, when disclosure is enabled, are sanitized and
+rendered before the context budget, so all model-visible label bytes are
+charged before eviction. Both hierarchy retrieval and display-name disclosure
+are independently controlled: setting hierarchy retrieval to `false` restores
+flat retrieval, while setting display names to `false` omits model-visible
+hierarchy names without disabling scoped retrieval.
+
+Enable only after deployment with both controls off, re-ingestion of selected
+spaces, and the required human gates. `RG-05` is the representative paired
+flat/on RAGAS evaluation on one reviewed query set; its runs require equal
+invariant fingerprints and present, recomputable mode-bound full fingerprints
+that differ between flat and hierarchical modes. Comparison fails closed when
+those conditions are not met. `RG-05P` is the separate
+provider-processing gate required before display names may be enabled. The
+repository's deterministic proxy is structural evidence only, while `SC-009`
+is the full-suite regression gate. `SUMMARIZE_ENABLED` remains unchanged.
 
 ### Re-ranking
 
@@ -401,6 +462,11 @@ verdict, not for fetching it.
 | `EMBEDDINGS_API_KEY` | _(required for ingest)_ | API key for embedding service |
 | `EMBEDDINGS_ENDPOINT` | `https://api.scaleway.ai/v1` | Embedding API endpoint |
 | `EMBEDDINGS_MODEL_NAME` | `qwen3-embedding-8b` | Embedding model |
+| `EMBEDDINGS_QUERY_MAX_UTF8_BYTES` | `32768` | Logged query-input byte cap |
+| `QUERY_REWRITE_MAX_UTF8_BYTES` | `4096` | Logged rewrite-input byte cap |
+| `EMBEDDINGS_MAX_ATTEMPTS` | `3` | Logged outer query-attempt cap |
+| `EMBEDDINGS_ATTEMPT_TIMEOUT_SECONDS` | `20` | Logged per-attempt query timeout |
+| `EMBEDDINGS_TOTAL_DEADLINE_SECONDS` | `45` | Logged total query deadline |
 
 ### Ingest Pipeline
 
@@ -582,9 +648,15 @@ poetry run python -m evaluation.cli list
 ### How it Works
 
 1. **Golden test set**: JSONL file with `question`, `expected_answer`, and `relevant_documents` fields
-2. **Pipeline invoker**: Instantiates the plugin directly (bypassing RabbitMQ) with a `TracingKnowledgeStore` that captures retrieved contexts
+2. **Pipeline invoker**: Instantiates the plugin directly (bypassing RabbitMQ); for Expert, it shares production composition and captures the exact final rendered generation contexts after retrieval, ranking, filtering, and budget processing
 3. **Scorer**: Wraps RAGAS metrics, uses the pipeline's own LLM as judge via `LangchainLLMWrapper`
 4. **Runner**: Executes the test suite, computes per-metric aggregates, persists results to `evaluations/{id}.json`
+
+Paired Expert comparisons require equal non-secret invariant-composition
+fingerprints. Both full fingerprints must be present, recomputable from the
+invariant identity and their explicit modes, and different for flat versus
+hierarchical runs; otherwise comparison fails closed rather than treating a
+configuration change as a hierarchy-only experiment.
 
 ## Testing
 
@@ -603,6 +675,10 @@ poetry run pytest tests/plugins/test_expert.py
 # Single test
 poetry run pytest tests/plugins/test_expert.py::test_handle
 ```
+
+For this hierarchy feature, the full suite is the `SC-009` regression gate;
+focused tests and the deterministic precision proxy do not replace the
+representative paired RAGAS gate (`RG-05`).
 
 ### Test Infrastructure
 

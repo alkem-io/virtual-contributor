@@ -6,7 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from evaluation.dataset import TestCase, load_test_set, validate_test_set, write_test_cases
+from evaluation.dataset import TestCase, canonical_test_set_digest, load_test_set, validate_test_set, write_test_cases
+from evaluation.case_identity import CASE_IDENTITY_VERSION, evaluation_case_identity_payload
 
 
 # ---------------------------------------------------------------------------
@@ -34,6 +35,32 @@ class TestTestCaseModel:
     def test_empty_documents_rejected(self):
         with pytest.raises(Exception):
             TestCase(question="q", expected_answer="a", relevant_documents=[])
+
+
+def test_ordered_test_set_digest_is_path_independent_and_content_stable():
+    first = [TestCase(question="Q", expected_answer="A", relevant_documents=["d"])]
+    # Independently constructed, equal content — not the same objects.
+    second = [TestCase(question="Q", expected_answer="A", relevant_documents=["d"])]
+    assert canonical_test_set_digest(first) == canonical_test_set_digest(second)
+
+
+def test_ordered_test_set_digest_changes_for_reorder_or_field_change():
+    first = TestCase(question="Q1", expected_answer="A", relevant_documents=["d"])
+    second = TestCase(question="Q2", expected_answer="A", relevant_documents=["d"])
+    assert canonical_test_set_digest([first, second]) != canonical_test_set_digest([second, first])
+
+
+def test_case_identity_v1_is_shared_and_versioned():
+    case = TestCase(question="Q", expected_answer="A", relevant_documents=["d"])
+    assert evaluation_case_identity_payload(case)["schema"] == CASE_IDENTITY_VERSION
+    assert canonical_test_set_digest([case])
+
+
+def test_case_identity_v1_changes_for_each_declared_field():
+    base = TestCase(question="Q", expected_answer="A", relevant_documents=["d"])
+    assert canonical_test_set_digest([base]) != canonical_test_set_digest([TestCase(question="R", expected_answer="A", relevant_documents=["d"])])
+    assert canonical_test_set_digest([base]) != canonical_test_set_digest([TestCase(question="Q", expected_answer="B", relevant_documents=["d"])])
+    assert canonical_test_set_digest([base]) != canonical_test_set_digest([TestCase(question="Q", expected_answer="A", relevant_documents=["e"])])
 
 
 # ---------------------------------------------------------------------------

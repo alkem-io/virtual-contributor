@@ -7,6 +7,7 @@ from drifting while leaving the platform-facing response envelope untouched.
 
 from __future__ import annotations
 
+import unicodedata
 from enum import Enum
 from typing import Mapping, Sequence
 
@@ -54,8 +55,8 @@ that addresses every part. Do not reveal intermediate reasoning, scratch work,
 or chain-of-thought in the reply."""
 
 
-def _metadata_text(metadata: Mapping[str, object], key: str) -> str:
-    """Return a bounded, single-line metadata value without inventing one."""
+def _legacy_metadata_text(metadata: Mapping[str, object], key: str) -> str:
+    """Preserve the frozen legacy label contract exactly (codepoint caps)."""
 
     value = metadata.get(key)
     if value is None:
@@ -70,8 +71,109 @@ def _metadata_text(metadata: Mapping[str, object], key: str) -> str:
     return text[:limit] if limit is not None else text
 
 
+def _stable_hierarchy_ids(metadata: Mapping[str, object]) -> frozenset[str]:
+    """Return the passage's own stored stable hierarchy identifiers.
+
+    These are retrieval-only identifiers. A legacy alias that merely repeats
+    one of them — bare, or wrapped in the ``space:<id>`` ingestion alias
+    shape — carries no independent identity information and must never reach
+    a provider-visible label.
+    """
+
+    ids: set[str] = set()
+    for key in ("spaceId", "subspaceId"):
+        value = metadata.get(key)
+        if value is None:
+            continue
+        if isinstance(value, Enum):
+            value = value.value
+        text = str(value).strip()
+        if text:
+            ids.add(text)
+    return frozenset(ids)
+
+
+def _carries_stable_hierarchy_id(text: str, stable_ids: frozenset[str]) -> bool:
+    """True when a rendered legacy alias value discloses a stable identifier.
+
+    Two independent checks, either of which is sufficient on its own:
+
+    - **Shape**: any value of the ``space:<remainder>`` ingestion alias form
+      — ``"space:"`` immediately followed by a non-empty remainder — is
+      identity-bearing on its face. It is excised whether or not the current
+      passage's own metadata happens to carry a matching ``spaceId`` or
+      ``subspaceId``, because the value discloses some space's stable
+      identifier regardless of whose passage is being rendered. A
+      human-authored value that merely resembles the shape (for example a
+      title starting with ``"space:"``) is conservatively excised too and
+      falls back along the existing alias chain — a small, deliberate
+      availability cost on the privacy side of this boundary.
+    - **Bare equality**: the value equals one of this passage's own stored
+      stable hierarchy identifiers exactly, with no wrapping shape.
+    """
+
+    if not text:
+        return False
+    if text.startswith("space:") and len(text) > len("space:"):
+        return True
+    return text in stable_ids
+
+
+def _legacy_alias_text(
+    metadata: Mapping[str, object], key: str, stable_ids: frozenset[str],
+) -> str:
+    """Legacy alias text, with raw stable hierarchy identity excised.
+
+    A value that discloses a stable hierarchy identifier is treated as
+    absent so it falls through the existing fallback chain, exactly as if
+    the alias had never been supplied.
+    """
+
+    text = _legacy_metadata_text(metadata, key)
+    if _carries_stable_hierarchy_id(text, stable_ids):
+        return ""
+    return text
+
+
+def _hierarchy_name(metadata: Mapping[str, object], key: str) -> str:
+    """Return hardened, UTF-8 bounded hierarchy display metadata only."""
+    value = metadata.get(key)
+    if value is None:
+        return ""
+    if isinstance(value, Enum):
+        value = value.value
+    characters: list[str] = []
+    for character in str(value):
+        category = unicodedata.category(character)
+        if category == "Cf":
+            continue
+        if category == "Cc":
+            if character.isspace():
+                characters.append(" ")
+            continue
+        characters.append(character)
+    text = "".join(characters)
+    text = " ".join(text.split())
+    text = " ".join(text.translate(_LABEL_UNSAFE_CHARACTERS).split())
+    if text.casefold() == "none":
+        return ""
+    limit = 200
+    # Limits are protocol byte limits, not Python codepoint counts. Iterating
+    # codepoints gives a deterministic UTF-8 prefix without splitting one.
+    kept: list[str] = []
+    used = 0
+    for character in text:
+        size = len(character.encode("utf-8"))
+        if used + size > limit:
+            break
+        kept.append(character)
+        used += size
+    return "".join(kept)
+
+
 def render_document_block(
-    number: int, content: str, metadata: Mapping[str, object] | None = None
+    number: int, content: str, metadata: Mapping[str, object] | None = None,
+    *, hierarchy: bool = False,
 ) -> str:
     """Render one retrieved passage as a labelled, verbatim document block.
 
@@ -83,19 +185,38 @@ def render_document_block(
         raise ValueError("Document numbers must be 1-based")
 
     metadata = metadata or {}
-    title = _metadata_text(metadata, "title")
-    uri = _metadata_text(metadata, "uri")
-    source = _metadata_text(metadata, "source")
-    kind = _metadata_text(metadata, "type")
+    stable_ids = _stable_hierarchy_ids(metadata)
+    title = _legacy_alias_text(metadata, "title", stable_ids)
+    uri = _legacy_alias_text(metadata, "uri", stable_ids)
+    source = _legacy_alias_text(metadata, "source", stable_ids)
+    kind = _legacy_alias_text(metadata, "type", stable_ids)
     origin = uri or source
     identity = title or uri or source or "Untitled"
 
-    label_parts = [f"Document {number}", identity]
+    label_parts = [f"Document {number}"]
+    if hierarchy:
+        # Stable hierarchy IDs are retrieval-only identifiers. Never disclose
+        # them to an answering provider when a display name is absent.
+        space = _hierarchy_name(metadata, "spaceName")
+        subspace = _hierarchy_name(metadata, "subspaceName")
+        if space:
+            label_parts.append(f"Space: {space}")
+        if subspace:
+            label_parts.append(f"Subspace: {subspace}")
+    label_parts.append(identity)
     if kind:
         label_parts.append(kind)
     if origin:
         label_parts.append(f"origin: {origin}")
     return f"[{' · '.join(label_parts)}]\n{content}"
+
+
+INTER_BLOCK_SEPARATOR = "\n\n"
+
+
+def inter_block_budget_size(block_count: int) -> int:
+    """Return the exact UTF-8 cost of joins between ``block_count`` blocks."""
+    return max(block_count - 1, 0) * len(INTER_BLOCK_SEPARATOR.encode("utf-8"))
 
 
 def rendered_document_budget_size(rendered_block: str, content: str) -> int:
@@ -147,4 +268,4 @@ def empty_context_instruction(has_context: bool) -> str:
 def join_document_blocks(blocks: Sequence[str]) -> str:
     """Join rendered blocks, or use the explicit no-material sentinel."""
 
-    return "\n\n".join(blocks) if blocks else EMPTY_CONTEXT_SENTINEL
+    return INTER_BLOCK_SEPARATOR.join(blocks) if blocks else EMPTY_CONTEXT_SENTINEL

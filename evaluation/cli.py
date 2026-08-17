@@ -5,17 +5,20 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
+import numbers
 import sys
 from pathlib import Path
+from typing import cast
 
 import click
 
 from evaluation.dataset import load_test_set
 from evaluation.report import (
-    EvaluationRun,
     format_run_summary,
     compute_comparison,
     format_comparison,
+    load_comparison_run,
 )
 
 
@@ -47,9 +50,13 @@ def cli():
     default=None,
     help="Body of knowledge ID (for expert plugin)",
 )
-def run(plugin: str, label: str | None, test_set: str, body_of_knowledge_id: str | None):
+@click.option("--corpus-revision", default=None, help="Immutable operator corpus/re-ingestion revision (required for Expert)")
+def run(plugin: str, label: str | None, test_set: str, body_of_knowledge_id: str | None, corpus_revision: str | None):
     """Run the evaluation suite against the pipeline."""
-    asyncio.run(_run_evaluation(plugin, label, Path(test_set), body_of_knowledge_id))
+    plugin = plugin.lower().replace("-", "_")
+    if plugin == "expert" and not corpus_revision:
+        raise click.UsageError("Expert evaluation requires --corpus-revision")
+    asyncio.run(_run_evaluation(plugin, label, Path(test_set), body_of_knowledge_id, corpus_revision))
 
 
 async def _run_evaluation(
@@ -57,6 +64,7 @@ async def _run_evaluation(
     label: str | None,
     test_set_path: Path,
     body_of_knowledge_id: str | None,
+    corpus_revision: str | None,
 ) -> None:
     from core.config import BaseConfig
     from evaluation.metrics import create_metrics
@@ -73,7 +81,9 @@ async def _run_evaluation(
     click.echo(f"Loaded {len(test_cases)} test cases from {test_set_path}")
 
     # Initialize pipeline
-    config = BaseConfig()
+    # The explicit CLI selection wins over blank, generic, or conflicting env.
+    plugin_type = plugin_type.lower().replace("-", "_")
+    config = BaseConfig(plugin_type=plugin_type)
     invoker = PipelineInvoker(
         plugin_type=plugin_type,
         config=config,
@@ -117,6 +127,8 @@ async def _run_evaluation(
             plugin_type=plugin_type,
             label=label,
             test_set_path=str(test_set_path),
+            body_of_knowledge_id=body_of_knowledge_id,
+            corpus_revision=corpus_revision,
         )
         click.echo("")
         click.echo(format_run_summary(evaluation_run))
@@ -142,8 +154,8 @@ def compare(baseline_id: str, current_id: str):
         sys.exit(1)
 
     try:
-        baseline = EvaluationRun.model_validate_json(baseline_path.read_text())
-        current = EvaluationRun.model_validate_json(current_path.read_text())
+        baseline = load_comparison_run(baseline_path.read_text())
+        current = load_comparison_run(current_path.read_text())
     except (ValueError, OSError) as exc:
         click.echo(f"Failed to load run files: {exc}", err=True)
         sys.exit(1)
@@ -187,26 +199,68 @@ def list_runs():
         return
 
     click.echo("Evaluation Runs:")
-    header = f"  {'ID':<36}{'Plugin':<12}{'Cases':>6}{'Faith.':>8}{'Relev.':>8}{'Prec.':>8}{'Recall':>8}"
+    header = f"  {'ID':<36}{'Plugin':<12}{'Cases':>6}{'State':<12}{'Faith.':>8}{'Relev.':>8}{'Prec.':>8}{'Recall':>8}"
     click.echo(header)
 
     for f in run_files:
         try:
             data = json.loads(f.read_text())
-            run_id = data.get("id", f.stem)
-            plugin = data.get("plugin_type", "?")
-            cases = data.get("test_case_count", 0)
-            agg = data.get("aggregate", {})
-
-            faith = agg.get("faithfulness", {}).get("mean", 0)
-            relev = agg.get("answer_relevancy", {}).get("mean", 0)
-            prec = agg.get("context_precision", {}).get("mean", 0)
-            recall = agg.get("context_recall", {}).get("mean", 0)
-
+            run_id = str(data.get("id", f.stem))
+            plugin = str(data.get("plugin_type", "?"))
+            cases = data.get("test_case_count", "?")
+            state, metrics = _list_run_state(data)
             click.echo(
-                f"  {run_id:<36}{plugin:<12}{cases:>6}{faith:>8.3f}{relev:>8.3f}{prec:>8.3f}{recall:>8.3f}"
+                f"  {run_id:<36}{plugin:<12}{str(cases):>6}{state:<12}"
+                f"{metrics[0]:>8}{metrics[1]:>8}{metrics[2]:>8}{metrics[3]:>8}"
             )
-        except (json.JSONDecodeError, Exception) as exc:
+        except json.JSONDecodeError:
+            click.echo(f"  {f.stem:<36}{'?':<12}{'?':>6}{'invalid':<12}{'N/A':>8}{'N/A':>8}{'N/A':>8}{'N/A':>8}")
+        except Exception as exc:
             click.echo(f"  {f.stem:<36} — error reading: {exc}")
 
     click.echo(f"\n{len(run_files)} runs found in evaluations/")
+
+
+def _list_run_state(data: object) -> tuple[str, tuple[str, str, str, str]]:
+    """Classify display-only artifacts without inventing absent scores."""
+    unavailable = ("N/A", "N/A", "N/A", "N/A")
+    if not isinstance(data, dict):
+        return "invalid", unavailable
+    counts = (data.get("test_case_count"), data.get("success_count"), data.get("failure_count"))
+    if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in counts):
+        return "invalid", unavailable
+    total, successful, failed = cast(tuple[int, int, int], counts)
+    if successful + failed != total:
+        return "invalid", unavailable
+    aggregate = data.get("aggregate")
+    # Aggregate statistics are evidence from successful cases. A failed-only
+    # run is useful inventory, but has no metric evidence to display.
+    if successful == 0:
+        if aggregate == {}:
+            return "N/A", unavailable
+        return "invalid", unavailable
+    if not isinstance(aggregate, dict):
+        return "invalid", unavailable
+    names = ("faithfulness", "answer_relevancy", "context_precision", "context_recall")
+    if set(aggregate) != set(names):
+        return "incomplete", unavailable
+    required_statistics = {"mean", "median", "min", "max"}
+    values: list[str] = []
+    for name in names:
+        value = aggregate[name]
+        if not isinstance(value, dict) or set(value) != required_statistics:
+            return "incomplete", unavailable
+        statistics = tuple(value[statistic] for statistic in ("mean", "median", "min", "max"))
+        converted: list[float] = []
+        for statistic in statistics:
+            if isinstance(statistic, bool) or not isinstance(statistic, numbers.Real):
+                return "invalid", unavailable
+            try:
+                numeric = float(statistic)
+            except (OverflowError, TypeError, ValueError):
+                return "invalid", unavailable
+            if not math.isfinite(numeric) or not 0 <= numeric <= 1:
+                return "invalid", unavailable
+            converted.append(numeric)
+        values.append(f"{converted[0]:.3f}")
+    return "complete", tuple(values)  # type: ignore[return-value]

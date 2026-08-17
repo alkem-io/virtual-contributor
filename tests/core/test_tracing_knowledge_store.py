@@ -68,7 +68,9 @@ async def test_reused_retrieval_span_records_failure_exactly_once(
     assert retrieval, "no retrieval span was exported"
     for span in retrieval:
         assert span.status.status_code.name == "ERROR"
-        assert len([e for e in span.events if e.name == "exception"]) == 1
+        # Sensitive failure projection records safe type/mode diagnostics, not
+        # an SDK exception event (which serializes the message and stack).
+        assert len([e for e in span.events if e.name == "exception"]) == 0
 
 
 async def test_store_operation_span_is_emitted(traced_exporter) -> None:
@@ -173,3 +175,68 @@ async def test_lexical_none_distances_do_not_crash_the_span_stats() -> None:
     store = TracedKnowledgeStore(_MixedStore())
     result = await store.query("c", ["q"], 5)
     assert result.documents == [["semantic hit", "literal hit"]]
+
+
+async def test_tracing_store_forwards_query_embedding_scope() -> None:
+    from contextlib import asynccontextmanager
+    class Store:
+        events: list[str] = []
+        @asynccontextmanager
+        async def query_embedding_scope(self):
+            self.events.append("enter")
+            try:
+                yield
+            except RuntimeError:
+                self.events.append("exit:RuntimeError")
+                raise
+        async def query(self, *args, **kwargs):
+            self.events.append("query")
+            raise RuntimeError("delegate failure")
+    delegate = Store()
+    with pytest.raises(RuntimeError, match="delegate failure"):
+        async with TracedKnowledgeStore(delegate).query_embedding_scope():
+            await TracedKnowledgeStore(delegate).query("c", ["q"])
+    assert delegate.events == ["enter", "query", "exit:RuntimeError"]
+
+
+async def test_tracing_store_clears_embedding_scope_after_failure() -> None:
+    from contextlib import asynccontextmanager
+    class Store:
+        exits = 0
+        @asynccontextmanager
+        async def query_embedding_scope(self):
+            try:
+                yield
+            except RuntimeError:
+                self.exits += 1
+                raise
+        async def query(self, *args, **kwargs):
+            raise RuntimeError("delegate failure")
+    delegate, store = Store(), None
+    store = TracedKnowledgeStore(delegate)
+    with pytest.raises(RuntimeError):
+        async with store.query_embedding_scope():
+            await store.query("c", ["q"])
+    assert delegate.exits == 1
+
+
+async def test_tracing_store_preserves_capture_inside_embedding_scope() -> None:
+    from contextlib import asynccontextmanager
+    class Store:
+        calls = 0
+        @asynccontextmanager
+        async def query_embedding_scope(self):
+            try:
+                yield
+            except RuntimeError:
+                self.calls += 1
+                raise
+        async def query(self, *args, **kwargs):
+            self.calls += 1
+            raise RuntimeError("delegate failure")
+    delegate = Store()
+    store = TracedKnowledgeStore(delegate)
+    with pytest.raises(RuntimeError):
+        async with store.query_embedding_scope():
+            await store.query("c", ["q"])
+    assert delegate.calls == 2

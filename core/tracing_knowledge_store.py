@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from typing import Any
 
 from opentelemetry import trace
@@ -99,6 +100,16 @@ class TracedKnowledgeStore:
 
     async def delete(self, collection: str, ids: list[str] | None = None, where: dict | None = None) -> None:
         await self._operation("delete", collection, len(ids) if ids else None, self._delegate.delete(collection, ids, where))
+
+    @asynccontextmanager
+    async def query_embedding_scope(self):
+        """Keep the optional scope capability through production tracing."""
+        scope = getattr(self._delegate, "query_embedding_scope", None)
+        if not callable(scope):
+            yield
+            return
+        async with scope():
+            yield
 
     async def _operation(self, operation: str, collection: str, count: int | None, awaitable: Any) -> Any:
         with get_tracer().start_as_current_span(

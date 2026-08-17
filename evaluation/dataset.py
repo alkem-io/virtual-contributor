@@ -8,6 +8,8 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
+from evaluation.case_identity import evaluation_case_digest, ordered_evaluation_case_digest
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_TEST_SET_PATH = Path("evaluation/golden/test_set.jsonl")
@@ -19,6 +21,16 @@ class TestCase(BaseModel):
     question: str = Field(min_length=1)
     expected_answer: str = Field(min_length=1)
     relevant_documents: list[str] = Field(min_length=1)
+
+
+def canonical_test_set_digest(cases: list[TestCase]) -> str:
+    """Hash ordered canonical case JSON, independent of its source path."""
+    return ordered_evaluation_case_digest(cases)
+
+
+def successful_case_digest(case: TestCase) -> str:
+    """Stable identity for the successful input case, excluding model output."""
+    return evaluation_case_digest(case)
 
 
 def load_test_set(path: Path = DEFAULT_TEST_SET_PATH) -> list[TestCase]:

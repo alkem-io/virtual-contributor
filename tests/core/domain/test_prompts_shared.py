@@ -13,7 +13,15 @@ from core.domain.prompts_shared import (
     join_document_blocks,
     render_document_block,
     rendered_document_budget_size,
+    inter_block_budget_size,
 )
+
+
+def test_context_budget_charges_exact_inter_block_separator_at_equality() -> None:
+    assert inter_block_budget_size(0) == 0
+    assert inter_block_budget_size(1) == 0
+    assert inter_block_budget_size(2) == 2
+    assert inter_block_budget_size(3) == 4
 
 
 def test_document_blocks_are_dense_one_based_and_visually_separated() -> None:
@@ -62,7 +70,6 @@ def test_document_label_includes_available_kind_and_origin() -> None:
             "source": "legacy-source",
         },
     )
-
     assert "[Document 1 · Welcome · callout · origin: https://welcome.alkem.io]" in block
 
 
@@ -96,11 +103,42 @@ def test_metadata_label_values_are_bounded() -> None:
             "uri": "u" * 301,
         },
     )
-
     assert block == (
         f"[Document 1 · {'t' * 200} · {'k' * 200} · origin: {'u' * 300}]\n"
         "passage"
     )
+
+
+def test_legacy_metadata_multibyte_values_keep_frozen_codepoint_caps() -> None:
+    block = render_document_block(1, "passage", {"title": "é" * 101})
+
+    title = block.split(" · ", 1)[1].split("]", 1)[0]
+    assert title == "é" * 101
+    assert len(title.encode("utf-8")) == 202
+
+
+def test_legacy_metadata_controls_keep_frozen_base_semantics() -> None:
+    block = render_document_block(
+        1, "passage", {"title": "safe\x00\u202e\u200b name"},
+    )
+
+    assert block == "[Document 1 · safe\x00\u202e\u200b name]\npassage"
+    assert "\x00" in block and "\u202e" in block and "\u200b" in block
+
+
+def test_hierarchy_names_keep_hardened_utf8_and_control_semantics() -> None:
+    block = render_document_block(
+        1, "body", {"spaceName": "é" * 101 + "\x00x", "source": "raw\x00source"}, hierarchy=True,
+    )
+    assert "Space: " + "é" * 100 in block and "\x00" not in block.split(" · ")[1]
+    assert "raw\x00source" in block
+
+
+def test_flat_near_budget_legacy_metadata_matches_frozen_oracle() -> None:
+    content = "x" * 10
+    block = render_document_block(1, content, {"title": "é" * 200})
+    assert rendered_document_budget_size(block, content) == len(content) + len(block.removesuffix(content).encode())
+
 
 
 def test_context_budget_charges_rendered_label_utf8_bytes() -> None:
@@ -111,6 +149,138 @@ def test_context_budget_charges_rendered_label_utf8_bytes() -> None:
     assert rendered_document_budget_size(block, content) == (
         len(content) + len(label_and_separator.encode("utf-8"))
     )
+
+
+def test_hierarchy_renders_space_then_nearest_subspace() -> None:
+    block = render_document_block(
+        1, "passage", {"spaceName": "Root", "subspaceName": "Near", "title": "Post"}, hierarchy=True,
+    )
+    assert block.startswith("[Document 1 · Space: Root · Subspace: Near · Post]")
+
+
+def test_hierarchy_never_falls_back_to_stored_identifiers() -> None:
+    block = render_document_block(
+        1, "passage", {"spaceId": "s-1", "subspaceId": "ss-2"}, hierarchy=True,
+    )
+    assert "s-1" not in block and "ss-2" not in block
+
+
+@pytest.mark.parametrize("hierarchy", [False, True])
+def test_legacy_aliases_never_disclose_the_passage_stable_hierarchy_id(
+    hierarchy: bool,
+) -> None:
+    """A space/subspace description document with no profile URL renders
+    ``source=space:<id>`` and an empty title; the raw stable ID must never
+    reach the identity or origin label segments, in either display mode."""
+    metadata = {
+        "spaceId": "sentinel-space-id",
+        "title": "",
+        "uri": None,
+        "source": "space:sentinel-space-id",
+    }
+    block = render_document_block(1, "passage", metadata, hierarchy=hierarchy)
+
+    assert "sentinel-space-id" not in block
+    assert block.startswith("[Document 1 · Untitled]")
+
+
+@pytest.mark.parametrize("hierarchy", [False, True])
+@pytest.mark.parametrize("alias_key", ["title", "type", "uri", "source"])
+def test_every_legacy_alias_is_excised_when_it_carries_a_stable_id(
+    alias_key: str, hierarchy: bool,
+) -> None:
+    """Each of the four legacy aliases individually carrying either the bare
+    stable ID or the ``space:<id>`` shape must be excluded from the label,
+    falling through to the next alias rather than leaking the identifier."""
+    for candidate in ("sentinel-id-value", "space:sentinel-id-value"):
+        metadata = {"spaceId": "sentinel-id-value", alias_key: candidate}
+        block = render_document_block(1, "passage", metadata, hierarchy=hierarchy)
+        assert "sentinel-id-value" not in block
+
+
+@pytest.mark.parametrize("hierarchy", [False, True])
+def test_subspace_stable_id_is_also_excised_from_legacy_aliases(
+    hierarchy: bool,
+) -> None:
+    metadata = {
+        "subspaceId": "sentinel-subspace-id",
+        "title": "",
+        "source": "space:sentinel-subspace-id",
+    }
+    block = render_document_block(1, "passage", metadata, hierarchy=hierarchy)
+    assert "sentinel-subspace-id" not in block
+
+
+def test_legacy_aliases_without_stable_id_overlap_render_unchanged() -> None:
+    """Control: values that do not carry the passage's own stable hierarchy
+    identity are unaffected by the excision — the frozen legacy contract is
+    preserved byte-for-byte when there is nothing to excise."""
+    metadata = {
+        "spaceId": "s-1",
+        "title": "Welcome",
+        "type": "callout",
+        "uri": "https://welcome.alkem.io",
+        "source": "legacy-source",
+    }
+    block = render_document_block(1, "passage", metadata)
+    assert block == (
+        "[Document 1 · Welcome · callout · origin: https://welcome.alkem.io]\n"
+        "passage"
+    )
+
+
+def test_legacy_alias_matching_the_ingestion_shape_is_excised_regardless_of_whose_id_it_is() -> None:
+    """The alias-shape excision fires on the ``space:<remainder>`` shape
+    itself, independent of whether it happens to match this passage's own
+    stored ID. ``space:s-2`` is some space's stable identifier even though
+    the rendered passage's own metadata carries a different one — privacy
+    over availability, so it is excised all the same."""
+    metadata = {"spaceId": "s-1", "source": "space:s-2"}
+    block = render_document_block(1, "passage", metadata)
+    assert "space:s-2" not in block
+
+
+@pytest.mark.parametrize("hierarchy", [False, True])
+def test_alias_shape_is_excised_without_any_stored_hierarchy_metadata(
+    hierarchy: bool,
+) -> None:
+    """Pre-hierarchy-metadata shape: a passage with no ``spaceId``/
+    ``subspaceId`` keys at all (the shape that predates hierarchy metadata
+    being stored) whose ``source`` was nonetheless built as
+    ``f"space:{id}"`` must still have that value excised — the shape arm
+    does not depend on ``stable_ids`` being non-empty."""
+    metadata = {
+        "source": "space:5f0d6a3e-1c2b-4a11-9e77-000000000001",
+        "title": "",
+        "uri": None,
+    }
+    block = render_document_block(1, "passage", metadata, hierarchy=hierarchy)
+
+    assert "5f0d6a3e-1c2b-4a11-9e77-000000000001" not in block
+    assert "space:" not in block
+    assert block.startswith("[Document 1 · Untitled]")
+
+
+def test_hierarchy_metadata_is_sanitized_and_bounded() -> None:
+    block = render_document_block(
+        1, "passage", {"spaceName": "[evil]\n" + "x" * 300}, hierarchy=True,
+    )
+    assert "[evil]" not in block and block.count("\n") == 1
+    label = block.split("\n", 1)[0]
+    assert len(label) < 260 and "x" * 201 not in block
+
+
+def test_hierarchy_keeps_document_number_and_verbatim_content() -> None:
+    content = "exact\n body"
+    block = render_document_block(2, content, {"spaceName": "A"}, hierarchy=True)
+    assert block.startswith("[Document 2") and block.endswith(content)
+
+
+def test_hierarchy_changes_budget_by_its_rendered_utf8_label() -> None:
+    content = "x"
+    flat = render_document_block(1, content, {"title": "café"})
+    hierarchy = render_document_block(1, content, {"title": "café", "spaceName": "é"}, hierarchy=True)
+    assert rendered_document_budget_size(hierarchy, content) > rendered_document_budget_size(flat, content)
 
 
 def test_citation_instruction_uses_the_same_document_number_scheme() -> None:
