@@ -1213,7 +1213,7 @@ async def test_early_ack_failure_span_never_records_content_attribute(traced_exp
 
 
 def _assert_no_sensitive_chain(caplog, *sentinels: str) -> None:
-    """T107: no original or settlement exception value, chain, traceback,
+    """Assert no original or settlement exception value, chain, traceback,
     or identifier reaches the logs — every error record carries no
     ``exc_info``, and neither the static message nor its args (which are
     ``error_type=%s`` markers where present) contain the leaked values."""

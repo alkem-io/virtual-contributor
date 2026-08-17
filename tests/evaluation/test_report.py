@@ -376,7 +376,7 @@ def test_metric_scores_clamp_one_ulp_float_error_at_the_unit_boundary():
 
     canonical = canonical_metric_scores(
         {
-            "faithfulness": 1.0 + 1e-16,
+            "faithfulness": 1.0000000000000007,
             "answer_relevancy": -1e-16,
             "context_precision": 0.5,
             "context_recall": 1.0,
@@ -385,6 +385,15 @@ def test_metric_scores_clamp_one_ulp_float_error_at_the_unit_boundary():
     assert canonical["faithfulness"] == 1.0
     assert canonical["answer_relevancy"] == 0.0
 
+    with pytest.raises(ValueError):
+        canonical_metric_scores(
+            {
+                "faithfulness": 1.0 + 1e-8,
+                "answer_relevancy": 0,
+                "context_precision": 0,
+                "context_recall": 0,
+            }
+        )
     with pytest.raises(ValueError):
         canonical_metric_scores(
             {
