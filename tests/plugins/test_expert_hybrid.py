@@ -164,7 +164,7 @@ async def test_traced_concurrent_hybrid_arms_share_one_retry_ladder() -> None:
     release_retry = __import__("asyncio").Event()
     class Embeddings:
         async def embed_query(self, texts):
-            nonlocal outer_calls, provider_attempts
+            nonlocal outer_calls
             outer_calls += 1
             async def provider():
                 nonlocal provider_attempts

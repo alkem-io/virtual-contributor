@@ -38,7 +38,13 @@ async def test_final_detail_context_excludes_hierarchy_routing_context() -> None
     await tracing_store.query("knowledge", ["question"], where={"embeddingType": {"$eq": "overview"}})
     await tracing_store.query("knowledge", ["question"], where={"spaceId": "s"})
     tracing_store.capture_generation_context(["[Document 1]\ndetail"])
+    # Both raw captures are visible as retrieval state, while the final
+    # detail contexts hold only the published generation blocks — neither
+    # raw captured document leaks through the boundary.
+    assert tracing_store.get_retrieved_contexts() == ["overview", "detail"]
     assert tracing_store.get_final_detail_contexts() == ["[Document 1]\ndetail"]
+    assert "overview" not in tracing_store.get_final_detail_contexts()
+    assert "detail" not in tracing_store.get_final_detail_contexts()
 
 
 async def test_final_detail_context_is_flat_result_when_only_one_query() -> None:
@@ -47,7 +53,9 @@ async def test_final_detail_context_is_flat_result_when_only_one_query() -> None
     tracing_store = TracingKnowledgeStore(delegate)
     await tracing_store.query("knowledge", ["question"])
     tracing_store.capture_generation_context(["[Document 1]\ndetail"])
+    assert tracing_store.get_retrieved_contexts() == ["detail"]
     assert tracing_store.get_final_detail_contexts() == ["[Document 1]\ndetail"]
+    assert "detail" not in tracing_store.get_final_detail_contexts()
 
 
 async def test_transparent_wrapper_forwards_hybrid_lexical_and_store_operations() -> None:

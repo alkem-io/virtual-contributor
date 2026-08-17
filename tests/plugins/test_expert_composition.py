@@ -197,7 +197,7 @@ def test_credentials_endpoints_and_prompt_data_never_enter_descriptor() -> None:
     assert "secret" not in rendered and "private.invalid" not in rendered
 
 
-def test_dormant_embeddings_do_not_affect_the_fingerprint() -> None:
+def test_configured_embeddings_model_affects_the_fingerprint() -> None:
     assert expert_composition_fingerprint(
         _config(embeddings_model_name="dormant-a"), _dependencies(),
     ) != expert_composition_fingerprint(

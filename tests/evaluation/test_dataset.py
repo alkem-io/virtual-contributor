@@ -38,8 +38,10 @@ class TestTestCaseModel:
 
 
 def test_ordered_test_set_digest_is_path_independent_and_content_stable():
-    cases = [TestCase(question="Q", expected_answer="A", relevant_documents=["d"])]
-    assert canonical_test_set_digest(cases) == canonical_test_set_digest(list(cases))
+    first = [TestCase(question="Q", expected_answer="A", relevant_documents=["d"])]
+    # Independently constructed, equal content — not the same objects.
+    second = [TestCase(question="Q", expected_answer="A", relevant_documents=["d"])]
+    assert canonical_test_set_digest(first) == canonical_test_set_digest(second)
 
 
 def test_ordered_test_set_digest_changes_for_reorder_or_field_change():

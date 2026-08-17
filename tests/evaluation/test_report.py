@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from evaluation.dataset import (
     TestCase,
@@ -595,12 +597,46 @@ def test_comparison_rejects_legacy_reports_without_v4_identity():
 
 
 @pytest.mark.parametrize(
-    "field", ["query_cap", "rewrite_cap", "attempts", "attempt_timeout", "deadline"]
+    "field, varied",
+    [
+        ("embeddings_query_max_utf8_bytes", 16384),
+        ("query_rewrite_max_utf8_bytes", 2048),
+        ("embeddings_max_attempts", 2),
+        ("embeddings_attempt_timeout_seconds", 10),
+        ("embeddings_total_deadline_seconds", 60),
+    ],
 )
-def test_comparison_rejects_each_embedding_safety_control_mismatch(field):
+def test_comparison_rejects_each_embedding_safety_control_mismatch(field, varied):
+    from core.config import BaseConfig
+    from plugins.expert.composition import (
+        expert_composition_fingerprint,
+        resolve_expert_composition,
+    )
+
+    def _invariant(**changes) -> str:
+        config = BaseConfig(
+            plugin_type="expert", llm_model="model-a",
+            llm_base_url="http://local", **changes,
+        )
+        return expert_composition_fingerprint(
+            resolve_expert_composition(config).authority
+        )
+
+    base_invariant = _invariant()
+    varied_invariant = _invariant(**{field: varied})
+    # Each safety control is part of the invariant composition identity.
+    assert base_invariant != varied_invariant
+
     baseline, current = _make_run("baseline"), _make_run("current")
-    current.invariant_composition_fingerprint = "e" * 64
-    with pytest.raises(ValueError):
+    baseline.invariant_composition_fingerprint = base_invariant
+    baseline.full_composition_fingerprint = expert_full_composition_fingerprint(
+        base_invariant, baseline.hierarchy_mode
+    )
+    current.invariant_composition_fingerprint = varied_invariant
+    current.full_composition_fingerprint = expert_full_composition_fingerprint(
+        varied_invariant, current.hierarchy_mode
+    )
+    with pytest.raises(ValueError, match="invariant_composition_fingerprint differs"):
         compute_comparison(baseline, current)
 
 
@@ -647,8 +683,11 @@ def test_comparison_recomputes_ordered_case_digests_and_metric_means():
         compute_comparison(baseline, current)
 
 
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
 def test_root_readme_documents_equal_invariant_and_distinct_full_fingerprints():
-    text = open("README.md", encoding="utf-8").read()
+    text = (_REPO_ROOT / "README.md").read_text(encoding="utf-8")
     normalized = " ".join(text.lower().split())
     assert "equal invariant fingerprints" in normalized
     assert "full fingerprints must be present, recomputable" in normalized
@@ -657,7 +696,7 @@ def test_root_readme_documents_equal_invariant_and_distinct_full_fingerprints():
 
 
 def test_expert_readme_documents_equal_invariant_and_distinct_full_fingerprints():
-    text = open("plugins/expert/README.md", encoding="utf-8").read()
+    text = (_REPO_ROOT / "plugins" / "expert" / "README.md").read_text(encoding="utf-8")
     normalized = " ".join(text.lower().split())
     assert "invariant fingerprints are equal" in normalized
     assert (

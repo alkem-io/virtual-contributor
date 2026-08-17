@@ -865,8 +865,8 @@ def build_message_handler(
                 )
         else:
             logger.error(
-                "Message failed after %d attempts, discarding",
-                max_retries,
+                "Message terminal after %d/%d attempts (forced=%s), discarding",
+                retry_count + 1, max_retries, force_terminal,
             )
             terminal_published = False
             if event is not None and error_text:

@@ -26,7 +26,10 @@ def finite_unit_metric(value: object) -> float:
     """Validate the public metric domain before it can become evidence."""
     if isinstance(value, bool) or not isinstance(value, numbers.Real):
         raise ValueError("Evaluation metric must be a finite real number")
-    numeric = float(value)
+    try:
+        numeric = float(value)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise ValueError("Evaluation metric must be a finite real number") from exc
     if not math.isfinite(numeric) or not 0 <= numeric <= 1:
         raise ValueError("Evaluation metric must be within inclusive [0, 1]")
     return numeric
