@@ -35,7 +35,7 @@ services:
 
   generic:
     build: .
-    depends_on: [rabbitmq]
+    depends_on: [rabbitmq, chromadb]
     environment:
       PLUGIN_TYPE: generic
       RABBITMQ_HOST: rabbitmq
@@ -43,8 +43,15 @@ services:
       RABBITMQ_RESULT_QUEUE: virtual-contributor-invoke-engine-result
       RABBITMQ_RESULT_ROUTING_KEY: invoke-engine-result
       RABBITMQ_EVENT_BUS_EXCHANGE: event-bus
+      # Enables `retrieve` prompt-graph nodes (e.g. the shipped
+      # docs/prompt-graphs/workshop-design.json) — optional otherwise.
+      VECTOR_DB_HOST: chromadb
+      VECTOR_DB_PORT: 8000
       MISTRAL_API_KEY: ${MISTRAL_API_KEY:-}
       MISTRAL_SMALL_MODEL_NAME: mistral-small-latest
+      EMBEDDINGS_API_KEY: ${EMBEDDINGS_API_KEY:-}
+      EMBEDDINGS_ENDPOINT: ${EMBEDDINGS_ENDPOINT:-}
+      EMBEDDINGS_MODEL_NAME: ${EMBEDDINGS_MODEL_NAME:-}
 
   guidance:
     build: .
