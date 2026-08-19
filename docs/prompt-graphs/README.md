@@ -205,6 +205,7 @@ Send an `Input` message to the deployment's generic-engine queue with:
 | Field | Value |
 |---|---|
 | `engine` | the deployment's generic engine id |
+| `userID` | required, no default — the platform always supplies this ahead of any configurator-authored payload; it is never something a configurator constructs by hand |
 | `message` / `history` | the member conversation |
 | `promptGraph` | the JSON payload (e.g. the contents of `workshop-design.json`) |
 | `bodyOfKnowledgeID` | required for any payload using a `retrieve` node |
