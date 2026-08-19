@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import logging
+import string
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Callable
+from typing import Any, Awaitable, AsyncIterator, Callable
 
 from json_schema_to_pydantic import create_model
 from langchain_core.output_parsers import PydanticOutputParser
@@ -12,15 +13,62 @@ from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 
+#: Value form bound in raised errors and log lines. A routing value can
+#: originate in member-typed chat text (a structured field a node extracted
+#: from the conversation); a runaway value must never blow up an error
+#: message or land verbatim, unbounded, in a log line (FR-009 — construct
+#: names and error types only, never member content).
+_MAX_LOGGED_VALUE_CHARS = 64
+
+
+class PromptGraphConfigError(ValueError):
+    """A prompt-graph JSON definition is malformed or unsatisfiable.
+
+    Raised at parse time (unknown node type, out-of-range ``n_results``,
+    an edge or node type naming an undeclared node) or at compile/run time
+    (a conditional edge with no matching branch and no default; a retrieve
+    node with no retriever configured; a retrieve template variable with no
+    state value). Always names the offending node/field so the caller's
+    standard error response is diagnosable without exposing member content.
+    """
+
+
+def _bounded_value_repr(value: Any) -> str:
+    """A safe, length-capped string form of a routing value for error text.
+
+    Routing values can be model output derived from a member's own chat
+    (e.g. a structured field extracted from the conversation) — see FR-009.
+    This never appears in a log line; it only appears in a raised exception
+    message that the caller's error handler reduces to an error type before
+    logging.
+    """
+    text = str(value)
+    if len(text) > _MAX_LOGGED_VALUE_CHARS:
+        return text[:_MAX_LOGGED_VALUE_CHARS] + "…"
+    return text
+
 
 @dataclass
 class Node:
-    """A single node in the prompt graph."""
+    """A single node in the prompt graph.
+
+    ``type`` discriminates the node kind: ``"llm"`` (default, existing
+    behaviour — prompt template + optional structured output), ``"retrieve"``
+    (declarative knowledge-store query), or ``"echo"`` (verbatim state-field
+    passthrough, no LLM call). The retrieve/echo-only fields are ignored for
+    ``"llm"`` nodes and vice versa.
+    """
     name: str
     input_variables: list[str]
     prompt: str
     output_schema: dict = field(default_factory=dict)
     output_model: type[BaseModel] | None = None
+    type: str = "llm"
+    collection_template: str = ""
+    query_template: str = ""
+    n_results: int = 10
+    output_key: str = "knowledge_docs"
+    source: str = ""
 
 
 @dataclass
@@ -28,6 +76,21 @@ class Edge:
     """A directed edge between two nodes."""
     from_node: str
     to_node: str
+
+
+@dataclass
+class ConditionalEdge:
+    """A declarative conditional edge (FR-001).
+
+    At runtime, ``on_field`` is read from state and matched — as a
+    case-insensitive string — against ``path_map``'s (already lower-cased)
+    keys. A miss routes to ``default`` when declared, else raises
+    :class:`PromptGraphConfigError`.
+    """
+    from_node: str
+    on_field: str
+    path_map: dict[str, str]
+    default: str | None = None
 
 
 class PromptGraph:
@@ -44,11 +107,13 @@ class PromptGraph:
         state_schema: dict | None = None,
         start_node: str = "START",
         end_node: str = "END",
+        conditional_edges: list[ConditionalEdge] | None = None,
     ) -> None:
         self.nodes = nodes
         self.edges = edges
         self.start_node = start_node
         self.end_node = end_node
+        self.conditional_edges = conditional_edges or []
         self._state_model = self._build_state_model(state_schema) if state_schema else None
         self._compiled = None
 
@@ -269,8 +334,17 @@ class PromptGraph:
         self,
         llm: Any,
         special_nodes: dict[str, Callable] | None = None,
+        retriever: Callable[[str, str, int], Awaitable[list[str]]] | None = None,
     ) -> PromptGraph:
-        """Compile the graph into a runnable LangGraph StateGraph."""
+        """Compile the graph into a runnable LangGraph StateGraph.
+
+        ``retriever`` is an optional host-supplied async callable
+        ``(collection, query, n_results) -> list[str]`` that ``"retrieve"``
+        typed nodes are compiled onto (FR-002). The graph domain object never
+        imports a knowledge-store port — the plugin owns that and passes the
+        callback in, the same injection seam already used for expert's
+        name-keyed special nodes.
+        """
         special_nodes = special_nodes or {}
 
         if self._state_model is None:
@@ -278,28 +352,157 @@ class PromptGraph:
 
         graph = StateGraph(self._state_model)
 
+        conditional_sources = {edge.from_node for edge in self.conditional_edges}
+
         for node_name, node in self.nodes.items():
             if node_name in special_nodes:
-                # Inject special node as a raw callable
+                # Inject special node as a raw callable — expert's existing
+                # name-keyed seam. Checked FIRST so a declarative `type` field
+                # can never hijack it (FR-006): the two mechanisms key on
+                # different fields (name vs type) and this order keeps that
+                # true even for a node named e.g. "retrieve" with no `type`.
                 graph.add_node(
                     node_name,
                     self._wrap_special_node(special_nodes[node_name]),
                 )
-            else:
-                # Build LLM chain node
+            elif node.type == "retrieve":
+                if retriever is None:
+                    raise PromptGraphConfigError(
+                        f"retrieve node '{node_name}' requires a knowledge "
+                        "store, but none is configured for this engine "
+                        "instance"
+                    )
+                graph.add_node(node_name, self._make_retrieve_node(node, retriever))
+            elif node.type == "echo":
+                graph.add_node(node_name, self._make_echo_node(node))
+            elif node.type == "llm":
+                # Build LLM chain node (existing, default behaviour).
                 output_model = self._build_output_model(node)
                 node.output_model = output_model
                 chain_fn = self._make_chain_node(node, llm, output_model)
                 graph.add_node(node_name, chain_fn)
+            else:
+                raise PromptGraphConfigError(
+                    f"node '{node_name}' declares unknown type '{node.type}'"
+                )
 
-        # Add edges
+        # Plain edges — skip any whose source is also a conditional source
+        # (conditional wins; matches the 031-branch prior-art semantics).
         for edge in self.edges:
+            if edge.from_node in conditional_sources:
+                continue
             from_node = START if edge.from_node == "START" else edge.from_node
             to_node = END if edge.to_node == "END" else edge.to_node
             graph.add_edge(from_node, to_node)
 
+        # Conditional edges (FR-001). LangGraph's `add_conditional_edges`
+        # calls `router(state)` and looks up its return value in `ends` to
+        # find the real destination — so `router` returns the RAW target
+        # name (from `path_map`/`default`, pre-"END"-translation) and `ends`
+        # maps every possible raw target name to its translated destination.
+        for cond in self.conditional_edges:
+            router = self._make_router(cond)
+            targets = set(cond.path_map.values())
+            if cond.default is not None:
+                targets.add(cond.default)
+            ends = {t: (END if t == "END" else t) for t in targets}
+            source = START if cond.from_node == "START" else cond.from_node
+            graph.add_conditional_edges(source, router, ends)
+
         self._compiled = graph.compile()
         return self
+
+    @staticmethod
+    def _read(state, key: str, default: Any = None) -> Any:
+        """Read a field from state, whether it is a dict or a Pydantic model."""
+        if isinstance(state, dict):
+            return state.get(key, default)
+        return getattr(state, key, default)
+
+    @classmethod
+    def _make_router(cls, cond: ConditionalEdge) -> Callable[[Any], str]:
+        """Build the router closure LangGraph calls for one conditional edge."""
+
+        def router(state) -> str:
+            value = cls._read(state, cond.on_field, None)
+            # `None`/absent takes the no-match path directly — never
+            # stringified — so a literal `"none"` map key can never match an
+            # absent/undeclared field (spec edge case).
+            key = None if value is None else str(value).lower()
+            if key is not None and key in cond.path_map:
+                return cond.path_map[key]
+            if cond.default is not None:
+                return cond.default
+            raise PromptGraphConfigError(
+                f"conditional edge from '{cond.from_node}' on '{cond.on_field}': "
+                f"unmatched value '{_bounded_value_repr(value)}' and no default"
+            )
+
+        return router
+
+    @staticmethod
+    def _make_retrieve_node(node: Node, retriever: Callable) -> Callable:
+        """Build a LangGraph node function for a declarative retrieve node.
+
+        Template variables are parsed from the two templates themselves
+        (`input_variables` is documentation only, never load-bearing). Both
+        templates are filled in a SINGLE pass over literal state values —
+        member-derived text (e.g. a value a node extracted from the
+        conversation) is inserted as data and is never re-interpreted as
+        template syntax, whatever characters it contains (FR-011). This is
+        the injection-hardening this node exists to get right; do not switch
+        to a two-pass or `.format(**state)`-on-member-text implementation.
+        """
+        formatter = string.Formatter()
+        collection_vars = {
+            name for _, name, _, _ in formatter.parse(node.collection_template)
+            if name
+        }
+        query_vars = {
+            name for _, name, _, _ in formatter.parse(node.query_template)
+            if name
+        }
+        all_vars = collection_vars | query_vars
+
+        async def node_fn(state) -> dict:
+            values: dict[str, str] = {}
+            for var in all_vars:
+                value = PromptGraph._read(state, var, None)
+                if value is None:
+                    raise PromptGraphConfigError(
+                        f"retrieve node '{node.name}': template variable "
+                        f"'{var}' has no value in state"
+                    )
+                values[var] = str(value)
+
+            # Literal single-pass fill: `values` are pre-stringified data,
+            # never re-parsed. `str.format_map` performs exactly one
+            # substitution pass over the template text — it does not
+            # recursively interpret braces inside the substituted values.
+            collection = node.collection_template.format_map(values)
+            query = node.query_template.format_map(values)
+
+            docs = await retriever(collection, query, node.n_results)
+            combined = "\n\n".join(docs) if docs else ""
+            return {node.output_key: combined}
+
+        return node_fn
+
+    @staticmethod
+    def _make_echo_node(node: Node) -> Callable:
+        """Build a LangGraph node function for a declarative echo node.
+
+        Copies the current value of ``node.source`` verbatim into the
+        flow's result field, with no LLM call. Absent/``None`` echoes as the
+        empty string; other falsy values (``0``, ``False``, ``""``) echo as
+        their exact string form — no falsy-collapse.
+        """
+
+        async def node_fn(state) -> dict:
+            value = PromptGraph._read(state, node.source, None)
+            return {"result": "" if value is None else str(value)}
+
+        return node_fn
 
     @staticmethod
     def _make_chain_node(
@@ -403,28 +606,84 @@ class PromptGraph:
         Expected format:
         {
             "nodes": [{"name": "...", "input_variables": [...], "prompt": "...", "output": {...}}],
-            "edges": [{"from": "...", "to": "..."}],
+            "edges": [
+                {"from": "...", "to": "..."},
+                {"from": "...", "on": "...", "map": {"value": "target"}, "default": "target"}
+            ],
             "state": {JSON schema},
             "start": "START",
             "end": "END"
         }
+
+        A node's ``type`` (default ``"llm"``) selects ``"retrieve"`` or
+        ``"echo"`` fields; edges are split into plain (``from``/``to``) and
+        conditional (``from``/``on``/``map``) forms. Every construct is
+        validated here at build time — before any LLM call — raising
+        :class:`PromptGraphConfigError` naming the offending construct
+        (FR-001/FR-002/FR-003 parse side; spec edge cases).
         """
-        nodes = {}
+        nodes: dict[str, Node] = {}
         for node_def in definition.get("nodes", []):
+            node_type = node_def.get("type", "llm")
+            if node_type not in ("llm", "retrieve", "echo"):
+                raise PromptGraphConfigError(
+                    f"node '{node_def.get('name', '?')}' declares unknown "
+                    f"type '{node_type}'"
+                )
+            n_results = node_def.get("n_results", 10)
+            if node_type == "retrieve" and not (1 <= n_results <= 50):
+                raise PromptGraphConfigError(
+                    f"retrieve node '{node_def.get('name', '?')}': "
+                    f"n_results {n_results!r} is out of range [1, 50]"
+                )
             node = Node(
                 name=node_def["name"],
                 input_variables=node_def.get("input_variables", []),
                 prompt=node_def.get("prompt", ""),
                 output_schema=node_def.get("output", {}),
+                type=node_type,
+                collection_template=node_def.get("collection_template", ""),
+                query_template=node_def.get("query_template", ""),
+                n_results=n_results,
+                output_key=node_def.get("output_key", "knowledge_docs"),
+                source=node_def.get("source", ""),
             )
             nodes[node.name] = node
 
-        edges = []
+        known_nodes = set(nodes.keys())
+
+        def _validate_endpoint(name: str, construct: str) -> None:
+            if name not in known_nodes and name not in ("START", "END"):
+                raise PromptGraphConfigError(
+                    f"{construct} names unknown node '{name}'"
+                )
+
+        edges: list[Edge] = []
+        conditional_edges: list[ConditionalEdge] = []
         for edge_def in definition.get("edges", []):
-            edges.append(Edge(
-                from_node=edge_def.get("from", "START"),
-                to_node=edge_def.get("to", "END"),
-            ))
+            if "on" in edge_def or "map" in edge_def:
+                from_node = edge_def.get("from", "START")
+                on_field = edge_def["on"]
+                raw_map = edge_def.get("map", {})
+                path_map = {str(k).lower(): v for k, v in raw_map.items()}
+                default = edge_def.get("default")
+                _validate_endpoint(from_node, "conditional edge 'from'")
+                for target in path_map.values():
+                    _validate_endpoint(target, "conditional edge 'map' target")
+                if default is not None:
+                    _validate_endpoint(default, "conditional edge 'default'")
+                conditional_edges.append(ConditionalEdge(
+                    from_node=from_node,
+                    on_field=on_field,
+                    path_map=path_map,
+                    default=default,
+                ))
+            else:
+                from_node = edge_def.get("from", "START")
+                to_node = edge_def.get("to", "END")
+                _validate_endpoint(from_node, "edge 'from'")
+                _validate_endpoint(to_node, "edge 'to'")
+                edges.append(Edge(from_node=from_node, to_node=to_node))
 
         return cls(
             nodes=nodes,
@@ -432,4 +691,5 @@ class PromptGraph:
             state_schema=definition.get("state"),
             start_node=definition.get("start", "START"),
             end_node=definition.get("end", "END"),
+            conditional_edges=conditional_edges,
         )
