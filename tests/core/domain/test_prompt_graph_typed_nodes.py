@@ -220,6 +220,38 @@ class TestRetrieveNode:
         with pytest.raises(PromptGraphConfigError, match="positional"):
             PromptGraph.from_definition(definition)
 
+    def test_query_template_explicit_index_field_rejected_at_parse_time(self):
+        """An explicit-index field (`{0}`) parses to field_name `"0"` —
+        truthy, so a naive `if name` filter (or a check that only rejects the
+        empty string) lets it through. `query_template` has no allowlist, so
+        this is reachable at runtime whenever an upstream node's state
+        happens to declare a property literally named `"0"` (e.g. a
+        retrieve/echo node with `output_key: "0"`), producing the exact raw
+        `ValueError: Format string contains positional fields` this guard
+        exists to eliminate. Must be rejected here, by name, at parse time."""
+        definition = _retrieve_definition(query_template="q {0}")
+        with pytest.raises(PromptGraphConfigError, match="positional"):
+            PromptGraph.from_definition(definition)
+
+    def test_collection_template_explicit_index_field_rejected_at_parse_time(self):
+        """Same defect, collection_template side."""
+        definition = _retrieve_definition(collection_template="{0}-knowledge")
+        with pytest.raises(PromptGraphConfigError, match="positional"):
+            PromptGraph.from_definition(definition)
+
+    def test_escaped_braces_and_named_vars_still_parse(self):
+        """Regression guard: `{{}}` is an escaped literal brace pair (no
+        replacement field at all — `string.Formatter().parse` reports its
+        field_name as `None`, not `""`), and must remain accepted alongside
+        ordinary named-variable references."""
+        graph = PromptGraph.from_definition(
+            _retrieve_definition(
+                collection_template="{bok_id}-knowledge",
+                query_template="info about {topic} {{literal braces}}",
+            )
+        )
+        graph.compile(llm=ScriptedLLM(), retriever=FakeRetriever())
+
     async def test_retrieve_node_enforces_context_budget_on_oversized_docs(self):
         """Unlike every other retrieval path, the retrieve node previously
         joined documents with no context budget. Oversized results must be

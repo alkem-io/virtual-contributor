@@ -834,13 +834,21 @@ class PromptGraph:
                         "'query_template'"
                     )
                 # An auto-numbered positional field (a bare `{}`) parses to
-                # field_name `""` — falsy, so a naive `if name` filter drops
-                # it from the discovered-variables set entirely. That let it
-                # slide past both the collection_template allowlist below
-                # and query_template's variable discovery, then blow up as a
-                # raw IndexError/ValueError at `str.format_map` time instead
-                # of a named configuration error. Rejected here, for both
-                # templates, before any store query is possible.
+                # field_name `""`, and an explicit-index field (`{0}`) parses
+                # to field_name `"0"` — a naive `if name` filter treats only
+                # the first as absent and lets the second slide past both the
+                # collection_template allowlist below and query_template's
+                # variable discovery, since `"0"` is a non-empty string that
+                # can still collide with a state key an upstream node
+                # happens to produce (e.g. `output_key: "0"`). Either form
+                # then blows up as a raw IndexError/ValueError at
+                # `str.format_map` time instead of a named configuration
+                # error. Reject both here, for both templates, before any
+                # store query is possible: a field is only valid when its
+                # name is empty (the escaped-literal `{{}}` case, which
+                # `string.Formatter().parse` reports as no field at all —
+                # see below) or a legitimate Python identifier, which rules
+                # out digit-only indices and any other non-identifier form.
                 for template_field, template_text in (
                     ("collection_template", collection_template),
                     ("query_template", query_template_raw),
@@ -848,13 +856,17 @@ class PromptGraph:
                     for _, field_name, _, _ in string.Formatter().parse(
                         template_text
                     ):
-                        if field_name == "":
+                        if field_name is None:
+                            # No replacement field in this literal chunk —
+                            # covers the `{{}}` escaped-literal case too.
+                            continue
+                        if not field_name.isidentifier():
                             raise PromptGraphConfigError(
                                 f"retrieve node '{node_name}': "
-                                f"{template_field} contains an auto-numbered "
-                                "positional field '{}', which is not "
-                                "supported — reference a named variable "
-                                "instead"
+                                f"{template_field} contains a positional or "
+                                f"non-identifier field '{{{field_name}}}', "
+                                "which is not supported — reference a named "
+                                "variable instead"
                             )
                 # Collection scoping is a tenancy boundary, not a formatting
                 # concern: a payload naming any variable other than the
