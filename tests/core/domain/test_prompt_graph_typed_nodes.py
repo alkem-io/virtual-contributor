@@ -130,6 +130,16 @@ class TestRetrieveNode:
         with pytest.raises(PromptGraphConfigError, match="n_results"):
             PromptGraph.from_definition(_retrieve_definition(n_results=51))
 
+    def test_n_results_wrong_type_rejected_at_parse_time(self):
+        """A JSON string, float, or bool must be rejected — not silently
+        coerced or, for bool, accepted because Python bools are ints."""
+        with pytest.raises(PromptGraphConfigError, match="n_results"):
+            PromptGraph.from_definition(_retrieve_definition(n_results="10"))
+        with pytest.raises(PromptGraphConfigError, match="n_results"):
+            PromptGraph.from_definition(_retrieve_definition(n_results=10.7))
+        with pytest.raises(PromptGraphConfigError, match="n_results"):
+            PromptGraph.from_definition(_retrieve_definition(n_results=True))
+
     def test_retrieve_without_retriever_raises_at_compile_time(self):
         graph = PromptGraph.from_definition(_retrieve_definition())
         with pytest.raises(PromptGraphConfigError, match="knowledge store"):

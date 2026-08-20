@@ -42,6 +42,18 @@ _ALLOWED_COLLECTION_TEMPLATE_VARS = frozenset({"bok_id"})
 #: `compile()`/`from_definition()` for a single declarative node type.
 _RETRIEVE_MAX_CONTEXT_CHARS = 20_000
 
+#: Recursion ceiling passed to every graph run. A declarative conditional
+#: edge whose ``map``/``default`` routes back to an already-visited node
+#: forms a cycle that neither ``from_definition`` nor ``compile()`` detects
+#: (detecting it statically would require analyzing runtime-only routing
+#: values). Left at LangGraph's own default of 10007, a cyclic payload with
+#: an LLM node inside the cycle would run until the pipeline's own multi-hour
+#: timeout, burning provider budget the whole time and — since the RabbitMQ
+#: consumer processes one message at a time — blocking every other message
+#: behind it. A small ceiling instead fails a mis-authored cyclic graph in
+#: well under a second.
+_GRAPH_RECURSION_LIMIT = 50
+
 
 class PromptGraphConfigError(ValueError):
     """A prompt-graph JSON definition is malformed or unsatisfiable.
@@ -672,7 +684,11 @@ class PromptGraph:
         if self._compiled is None:
             raise RuntimeError("Graph not compiled — call compile() first")
 
-        async for event in self._compiled.astream(initial_state, stream_mode=stream_mode):
+        async for event in self._compiled.astream(
+            initial_state,
+            stream_mode=stream_mode,
+            config={"recursion_limit": _GRAPH_RECURSION_LIMIT},
+        ):
             yield event
 
     async def invoke(self, initial_state: dict) -> dict:
@@ -680,7 +696,9 @@ class PromptGraph:
         if self._compiled is None:
             raise RuntimeError("Graph not compiled — call compile() first")
 
-        result = await self._compiled.ainvoke(initial_state)
+        result = await self._compiled.ainvoke(
+            initial_state, config={"recursion_limit": _GRAPH_RECURSION_LIMIT}
+        )
         return self._state_to_dict(result)
 
     @classmethod
@@ -720,11 +738,18 @@ class PromptGraph:
                     f"node '{node_name}' declares unknown type '{node_type}'"
                 )
             n_results = node_def.get("n_results", 10)
-            if node_type == "retrieve" and not (1 <= n_results <= 50):
-                raise PromptGraphConfigError(
-                    f"retrieve node '{node_name}': "
-                    f"n_results {n_results!r} is out of range [1, 50]"
-                )
+            if node_type == "retrieve":
+                if not isinstance(n_results, int) or isinstance(n_results, bool):
+                    raise PromptGraphConfigError(
+                        f"retrieve node '{node_name}': n_results "
+                        f"{n_results!r} must be an integer, got "
+                        f"{type(n_results).__name__}"
+                    )
+                if not (1 <= n_results <= 50):
+                    raise PromptGraphConfigError(
+                        f"retrieve node '{node_name}': "
+                        f"n_results {n_results!r} is out of range [1, 50]"
+                    )
             collection_template = node_def.get("collection_template", "")
             if node_type == "retrieve":
                 if not node_def.get("collection_template"):
@@ -800,6 +825,11 @@ class PromptGraph:
                     )
                 on_field = edge_def["on"]
                 raw_map = edge_def.get("map", {})
+                if not isinstance(raw_map, dict):
+                    raise PromptGraphConfigError(
+                        f"conditional edge from '{from_node}': 'map' must "
+                        f"be an object, got {type(raw_map).__name__}"
+                    )
                 for key in raw_map.keys():
                     if not isinstance(key, str):
                         raise PromptGraphConfigError(

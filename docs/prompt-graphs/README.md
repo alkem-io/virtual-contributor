@@ -233,9 +233,14 @@ loudly at compile time, per the table above. See `docker-compose.yaml`'s
   across several messages) happens naturally because the member's next
   message re-enters the graph at the start, not because the graph itself
   cycles. A graph that *is* accidentally cyclic (a conditional edge that can
-  route back to an already-visited node under some condition) is bounded by
-  LangGraph's own recursion limit and surfaces as a standard pipeline error
-  — never an unbounded loop — but author acyclic graphs on purpose.
+  route back to an already-visited node under some condition) is not
+  detected at parse or compile time — cycle detection would require
+  analyzing routing values that only exist at run time. It is bounded, but
+  by a deliberately small recursion ceiling this engine sets on every run
+  (`_GRAPH_RECURSION_LIMIT` in `core/domain/prompt_graph.py`, currently 50),
+  not by LangGraph's own default of 10007 — so a mis-authored cyclic graph
+  fails in well under a second as a standard pipeline error instead of
+  running for hours. Author acyclic graphs on purpose regardless.
 - **Declare every state key you touch.** See the drop rule above; this is
   the single most common authoring mistake.
 - **Prefer `default` on conditional edges whenever a structured-output

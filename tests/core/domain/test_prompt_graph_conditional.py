@@ -259,6 +259,16 @@ class TestConditionalEdgeRouting:
         with pytest.raises(PromptGraphConfigError, match="map"):
             PromptGraph.from_definition(definition)
 
+    def test_conditional_edge_non_dict_map_rejected_at_parse_time(self):
+        definition = _base_definition([
+            {"from": "START", "to": "check"},
+            {"from": "check", "on": "complete", "map": "not-a-dict"},
+            {"from": "next", "to": "END"},
+            {"from": "ask", "to": "END"},
+        ])
+        with pytest.raises(PromptGraphConfigError, match="map"):
+            PromptGraph.from_definition(definition)
+
     def test_duplicate_conditional_edge_source_rejected_at_parse_time(self):
         """Two conditional edges from the same source node must be rejected
         here, at parse time, naming the construct — never left to hit
