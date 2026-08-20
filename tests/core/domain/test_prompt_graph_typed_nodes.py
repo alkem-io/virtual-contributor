@@ -78,6 +78,34 @@ class TestRetrieveNode:
         assert "{bok_id}" in query
         assert "{0}" in query
 
+    async def test_us1_as3_hostile_resolvable_var_reference_is_not_reinterpreted(self):
+        """A hostile value containing ONLY a resolvable variable reference
+        (no positional token like `{0}`) must also pass through literally.
+
+        The sibling test above uses `{0}` in its hostile fixture, which
+        makes a naive fail-open two-pass re-interpretation ("format the
+        already-filled query a second time") raise (positional args are
+        never supplied) rather than silently leak. A `{bok_id}` reference
+        has no such escape hatch: a second format pass would happily
+        substitute the real `bok_id` value into what should be inert
+        member-typed text, cross-field-leaking another field's value into
+        the query (FR-011, R-2). This case fails under BOTH a fail-open and
+        a fail-closed two-pass implementation, closing that gap."""
+        retriever = FakeRetriever()
+        graph = PromptGraph.from_definition(_retrieve_definition())
+        graph.compile(llm=ScriptedLLM(), retriever=retriever)
+        hostile_topic = "{bok_id} and {{nested}}"
+        await graph.invoke({"bok_id": "secret-bok", "topic": hostile_topic})
+        assert len(retriever.calls) == 1
+        collection, query, n = retriever.calls[0]
+        assert collection == "secret-bok-knowledge"
+        assert query == f"info about {hostile_topic}"
+        # The literal placeholder text survives untouched — critically, the
+        # real `bok_id` value must NOT have been substituted into it a
+        # second time.
+        assert "{bok_id}" in query
+        assert "secret-bok and" not in query
+
     async def test_empty_results_write_empty_string_and_continue(self):
         retriever = FakeRetriever(docs=[])
         graph = PromptGraph.from_definition(_retrieve_definition())
