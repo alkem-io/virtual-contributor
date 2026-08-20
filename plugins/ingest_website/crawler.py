@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import asyncio
-import ipaddress
 import logging
-import socket
 from urllib.parse import urljoin, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
+
+from plugins.url_guard import check_destination
 
 logger = logging.getLogger(__name__)
 
@@ -53,36 +52,8 @@ def _should_skip_url(url: str) -> bool:
 
 
 async def _is_safe_url(url: str) -> bool:
-    """Block private/reserved network targets to prevent SSRF.
-
-    Only allows http/https schemes and rejects URLs that resolve
-    to loopback, RFC1918, link-local, or cloud metadata addresses.
-    """
-    parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https"):
-        return False
-
-    hostname = parsed.hostname
-    if not hostname:
-        return False
-
-    try:
-        addr = ipaddress.ip_address(hostname)
-    except ValueError:
-        # Hostname, not an IP — resolve without blocking the event loop
-        try:
-            resolved = await asyncio.to_thread(
-                socket.getaddrinfo, hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM
-            )
-            for _, _, _, _, sockaddr in resolved:
-                addr = ipaddress.ip_address(sockaddr[0])
-                if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved:
-                    return False
-            return True
-        except socket.gaierror:
-            return False
-    else:
-        return not (addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved)
+    """Classify a crawler base URL through the shared destination guard."""
+    return (await check_destination(url, deployment_host=None)).allowed
 
 
 class CrawlError(Exception):
@@ -101,8 +72,14 @@ async def crawl(
     error, DNS failure) so callers can distinguish a genuine empty site
     from a transient failure.
     """
-    if not await _is_safe_url(base_url):
-        logger.warning("Blocked unsafe base URL: %s", base_url)
+    decision = await check_destination(base_url, deployment_host=None)
+    if not decision.allowed:
+        logger.warning(
+            "Blocked unsafe base URL: category=%s scheme=%s host=%s",
+            decision.reason.value if decision.reason else "",
+            urlparse(base_url).scheme.lower(),
+            decision.host,
+        )
         return []
 
     visited: set[str] = set()
