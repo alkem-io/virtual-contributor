@@ -165,6 +165,30 @@ class TestGenericGraphPath:
         collection = store.query_calls[0][0]
         assert collection == "ls-101-knowledge"
 
+    async def test_store_present_but_embeddings_unusable_raises_before_any_llm_call(self):
+        """A knowledge store that is configured but was built with no
+        embeddings provider (the docker-compose default: `VECTOR_DB_HOST`
+        set, `EMBEDDINGS_API_KEY`/`EMBEDDINGS_ENDPOINT` empty) previously
+        passed the presence-only gate and failed late, inside the store
+        itself, after paid LLM calls already ran. The capability must be
+        checked before any node runs."""
+        from core.domain.prompt_graph import PromptGraphConfigError
+
+        class StoreWithNoEmbeddings:
+            """Shape-mirrors ChromaDBAdapter(embeddings=None): present, but
+            unable to embed a query."""
+            _embeddings = None
+
+            async def query(self, *args, **kwargs):
+                raise AssertionError("store must not be queried — capability gate should fail first")
+
+        llm = MockLLMPort(response="unused")
+        plugin = GenericPlugin(llm=llm, knowledge_store=StoreWithNoEmbeddings())
+        event = make_input(promptGraph=_retrieve_graph(), bodyOfKnowledgeID="ls-101")
+        with pytest.raises(PromptGraphConfigError, match="embeddings"):
+            await plugin.handle(event)
+        assert llm.calls == []
+
     async def test_store_error_propagates_no_fabricated_answer(self):
         class RaisingStore:
             async def query(self, *args, **kwargs):

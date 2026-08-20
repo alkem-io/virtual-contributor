@@ -23,6 +23,30 @@ from core.domain.query_rewrite import (
 logger = logging.getLogger(__name__)
 
 
+def _store_can_embed(store: object) -> bool:
+    """Best-effort probe: can this knowledge store perform semantic retrieval?
+
+    An adapter that needs an embeddings provider (e.g. ``ChromaDBAdapter``)
+    exposes it as ``_embeddings``; a store with that attribute set to
+    ``None`` cannot embed a query and would otherwise fail late — inside the
+    store itself, after any upstream LLM calls in the graph have already
+    run and been paid for. Runtime decorators (e.g. ``TracedKnowledgeStore``)
+    are unwrapped via ``_delegate`` to see through to the real adapter. A
+    store exposing neither shape (test doubles, future adapter kinds) is
+    assumed usable — this probe only ever narrows behaviour for the one
+    adapter shape known to fail late, never for stores it doesn't recognise.
+    """
+    seen = store
+    for _ in range(5):
+        if hasattr(seen, "_embeddings"):
+            return getattr(seen, "_embeddings") is not None
+        delegate = getattr(seen, "_delegate", None)
+        if delegate is None:
+            return True
+        seen = delegate
+    return True
+
+
 def _history_as_text(history: list) -> str:
     """Convert history items to a readable text block."""
     lines = []
@@ -122,7 +146,10 @@ class GenericPlugin:
         path (``main.py``), matching expert's graph path and FR-009's
         fail-loudly philosophy.
         """
-        from core.domain.prompt_graph import PromptGraph
+        from core.domain.prompt_graph import PromptGraph, PromptGraphConfigError
+
+        prompt_graph = event.prompt_graph
+        assert prompt_graph is not None  # guarded by handle()'s `if event.prompt_graph:`
 
         # Resolved server-side, exactly once, the same way expert's `collection`
         # is computed in `handle()` — never from the graph's rendered
@@ -140,6 +167,26 @@ class GenericPlugin:
         if self._knowledge_store is not None:
             store = self._knowledge_store
 
+            # Presence of a configured store is not the same as it being
+            # able to embed a query — a store built with no embeddings
+            # provider (the docker-compose default, `embeddings=None`)
+            # passes this presence check but fails later, inside the store
+            # itself, only after a retrieve node is reached — potentially
+            # after earlier LLM nodes in the graph have already run and
+            # been paid for. A retrieve-bearing payload against such a
+            # store must fail here, before any node runs, naming the
+            # missing capability (FR-005).
+            has_retrieve_node = any(
+                n.get("type") == "retrieve"
+                for n in prompt_graph.get("nodes", [])
+            )
+            if has_retrieve_node and not _store_can_embed(store):
+                raise PromptGraphConfigError(
+                    "prompt graph requires a knowledge store with query "
+                    "embeddings, but the configured knowledge store has no "
+                    "embeddings capability available"
+                )
+
             async def _retrieve(collection: str, query: str, n_results: int) -> list[str]:
                 result = await store.query(
                     collection_name, [query], n_results=n_results, where=FACTUAL_WHERE,
@@ -148,7 +195,7 @@ class GenericPlugin:
 
             retriever = _retrieve
 
-        graph = PromptGraph.from_definition(event.prompt_graph)
+        graph = PromptGraph.from_definition(prompt_graph)
         graph.compile(llm=self._llm, retriever=retriever)
 
         # Expert-parity initial state seeding (contracts/prompt-graph-json.md
