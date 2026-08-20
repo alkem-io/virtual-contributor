@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import gzip
+import tracemalloc
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -80,6 +82,10 @@ class TestRewriteAlkemioUri:
         url = "https://evil-alkem.io/api/private/forbidden"
         assert _make_client()._rewrite_alkemio_uri(url) == url
 
+    def test_platform_subdomain_is_not_rewritten(self):
+        url = "https://anything.alkem.io/api/private/forbidden"
+        assert _make_client()._rewrite_alkemio_uri(url) == url
+
     def test_relative_uri_is_not_rewritten(self):
         assert _make_client()._rewrite_alkemio_uri("/api/private/forbidden") == "/api/private/forbidden"
 
@@ -137,6 +143,17 @@ class TestFetchUrl:
 
         assert result is None
         assert client.last_fetch_refusal is RefusalCategory.CONTENT_TYPE
+
+    @pytest.mark.parametrize("content_type", ["application/octet-stream", "", "application/force-download", None])
+    async def test_unrecognised_content_type_is_sniffed_for_pdf(self, content_type: str | None):
+        client = _make_client()
+        client._session_token = "token-123"
+        headers = {} if content_type is None else {"content-type": content_type}
+
+        with _patch_transport(lambda _: httpx.Response(200, headers=headers, content=b"%PDF-1.7 content")):
+            result = await client.fetch_url(f"https://{PUBLIC_ADDRESS}/download", link_id="link-1")
+
+        assert result == (b"%PDF-1.7 content", content_type or "")
 
     async def test_network_error_returns_none(self):
         client = _make_client()
@@ -238,7 +255,8 @@ class TestFetchUrl:
 
         assert result is None
         assert client.last_fetch_refusal is RefusalCategory.HOP_LIMIT
-        assert len(requests) == MAX_REDIRECT_HOPS + 1
+        assert MAX_REDIRECT_HOPS == 5
+        assert len(requests) == 6
 
     async def test_hostname_resolving_private_is_refused_before_transport(self, monkeypatch: pytest.MonkeyPatch):
         _patch_resolver(monkeypatch, {"rebind.example": ["10.0.0.5"]})
@@ -280,6 +298,24 @@ class TestFetchUrl:
         assert requests[0].headers["host"] == "evil-alkem.io"
         assert "authorization" not in requests[0].headers
 
+    @pytest.mark.parametrize("host", ["anything.alkem.io", "storage.alkem.io"])
+    async def test_unexpected_platform_subdomain_never_receives_credentials(
+        self,
+        host: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        _patch_resolver(monkeypatch, {host: [PUBLIC_ADDRESS]})
+        client = _make_client()
+        client._session_token = "token-123"
+        requests: list[httpx.Request] = []
+
+        with _patch_transport(lambda request: requests.append(request) or httpx.Response(200, headers={"content-type": "text/plain"}, content=b"ok")):
+            result = await client.fetch_url(f"https://{host}/api/private/forbidden", link_id="link-1")
+
+        assert result == (b"ok", "text/plain")
+        assert requests[0].headers["host"] == host
+        assert "authorization" not in requests[0].headers
+
     async def test_relative_uri_never_becomes_credentialed_request(self):
         client = _make_client()
         client._session_token = "token-123"
@@ -317,6 +353,23 @@ class TestFetchUrl:
         assert requests[0].headers["authorization"] == "Bearer token-123"
         assert "authorization" not in requests[1].headers
 
+    async def test_same_host_on_an_alternate_port_never_receives_credentials(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        _patch_resolver(monkeypatch, {"localhost": [PUBLIC_ADDRESS]})
+        client = _make_client("http://localhost:3000/api/private/non-interactive/graphql")
+        client._session_token = "token-123"
+        requests: list[httpx.Request] = []
+
+        with _patch_transport(lambda request: requests.append(request) or httpx.Response(200, headers={"content-type": "text/plain"}, content=b"ok")):
+            result = await client.fetch_url("http://localhost:8080/member-path", link_id="link-1")
+
+        assert result == (b"ok", "text/plain")
+        assert requests[0].url.port == 8080
+        assert requests[0].headers["host"] == "localhost:8080"
+        assert "authorization" not in requests[0].headers
+
     async def test_legitimate_storage_uri_is_rewritten_and_credentialed(self, monkeypatch: pytest.MonkeyPatch):
         _patch_resolver(monkeypatch, {"deployment.example": ["10.0.0.10"]})
         client = _make_client()
@@ -332,6 +385,26 @@ class TestFetchUrl:
         assert result == (b"storage pdf", "application/pdf")
         assert requests[0].headers["host"] == "deployment.example"
         assert requests[0].headers["authorization"] == "Bearer token-123"
+
+    async def test_gzip_expansion_is_refused_before_materialising_the_payload(self):
+        client = _make_client()
+        client._session_token = "token-123"
+        max_bytes = 100 * 1024
+        compressed = gzip.compress(b"x" * (20 * 1024 * 1024))
+        stream = CountingStream([compressed])
+
+        tracemalloc.start()
+        try:
+            with _patch_transport(lambda _: httpx.Response(200, headers={"content-type": "application/pdf", "content-encoding": "gzip"}, stream=stream)):
+                result = await client.fetch_url(f"https://{PUBLIC_ADDRESS}/compressed.pdf", max_bytes=max_bytes, link_id="link-1")
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        assert result is None
+        assert client.last_fetch_refusal is RefusalCategory.SIZE
+        assert stream.consumed == len(compressed)
+        assert peak < 1 * 1024 * 1024
 
     def test_refusal_records_are_safe_and_auditable(self, caplog: pytest.LogCaptureFixture):
         client = _make_client()

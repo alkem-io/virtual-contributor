@@ -22,29 +22,36 @@ coverage measurement.
 
 ## Decision
 
-1. Put destination classification in `plugins/url_guard.py`, shared by both
-   ingest paths.  It permits only HTTP(S), resolves hostnames off the event
-   loop with a timeout, denies loopback, link-local, private, reserved,
-   unspecified, and multicast addresses, and returns a named refusal category.
-2. Disable automatic redirects in the space link fetcher.  Its explicit loop
-   validates every target before requesting it, follows at most five redirects,
-   and computes credentials anew for every validated target.
-3. Match deployment credentials by exact normalized hostname.  Rewrite only
-   `alkem.io` itself or a true subdomain, never a raw suffix; relative URLs are
-   not rewritten.
+1. Put the guarded fetch executor as well as destination classification in
+   `plugins/url_guard.py`, shared by both ingest paths and measured by coverage.
+   It permits only HTTP(S), resolves hostnames off the event loop with a
+   timeout, denies loopback, link-local, private, reserved, unspecified, and
+   multicast addresses, and returns a named refusal category.
+2. Disable automatic redirects in the shared executor.  It validates every
+   target before requesting it, follows at most five redirects, and gives the
+   caller a fresh per-hop credential decision.
+3. Match deployment credentials and the private-address exemption by exact
+   normalized scheme, hostname, and port.  Rewrite only the `alkem.io` apex or
+   the configured deployment origin, never a subdomain or raw suffix; relative
+   URLs are not rewritten.
 4. Ship the pinned-address DNS-rebinding defence.  Each validated address is
    used as the connection target while the original hostname is preserved in
    both the `Host` header and HTTPX's `sni_hostname` extension.  This maintains
    virtual hosting and TLS certificate validation without re-resolving between
    validation and connect.
-5. Stream response bytes and stop as soon as the cap is exceeded; reject an
-   over-cap declared length before reading it.
+5. Stream raw response bytes and stop as soon as either the raw or decoded
+   body exceeds the cap; gzip and deflate decoding is bounded before data is
+   appended.  Reject an over-cap declared length before reading it.  Unknown
+   content types receive only a small magic-byte sniff before rejection.
+6. Disable connection reuse between redirect hops with
+   `max_keepalive_connections=0`, ensuring a TLS connection verified for one
+   hostname cannot be reused for another hostname at the same address.
 
 ## Consequences
 
-- The crawler retains its current queue and redirect semantics; only its base
-  URL classification is shared.  Redirect hardening there remains follow-up
-  work.
+- The crawler retains its queue and same-domain policy, but now requests every
+  page through the same pinned, explicit-redirect executor.  A redirect outside
+  the crawl domain or to a refused address is not requested.
 - Link fetch failures stay metadata-only and do not alter published result
   envelopes.  Refusal records carry only the link identifier, category, scheme,
   host, and hop count.

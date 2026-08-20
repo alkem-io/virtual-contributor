@@ -8,7 +8,7 @@ from urllib.parse import urljoin, urlparse
 import httpx
 from bs4 import BeautifulSoup
 
-from plugins.url_guard import check_destination
+from plugins.url_guard import RefusalCategory, check_destination, guarded_fetch
 
 logger = logging.getLogger(__name__)
 
@@ -51,11 +51,6 @@ def _should_skip_url(url: str) -> bool:
     return any(path.endswith(ext) for ext in SKIP_EXTENSIONS)
 
 
-async def _is_safe_url(url: str) -> bool:
-    """Classify a crawler base URL through the shared destination guard."""
-    return (await check_destination(url, deployment_host=None)).allowed
-
-
 class CrawlError(Exception):
     """Raised when the crawl fails to reach the target site."""
 
@@ -88,9 +83,9 @@ async def crawl(
     is_first_request = True
 
     async with httpx.AsyncClient(
-        timeout=30.0,
-        follow_redirects=True,
-        headers={"User-Agent": "AlkemioBot/1.0"},
+        timeout=60.0,
+        follow_redirects=False,
+        limits=httpx.Limits(max_keepalive_connections=0),
     ) as client:
         while queue and len(results) < page_limit:
             url = queue.pop(0)
@@ -105,39 +100,43 @@ async def crawl(
 
             visited.add(normalized)
 
-            try:
-                response = await client.get(normalized)
-                content_type = response.headers.get("content-type", "")
-                if "text/html" not in content_type:
-                    is_first_request = False
-                    continue
-
-                html = response.text
-                # Use the final URL after redirects (e.g. /docs → /docs/en-US)
-                final_url = _normalize_url(str(response.url))
-                results.append({"url": final_url, "html": html})
-
-                # Extract links
-                soup = BeautifulSoup(html, "html.parser")
-                for link in soup.find_all("a", href=True):
-                    href = link["href"]
-                    full_url = urljoin(normalized, href)
-                    full_normalized = _normalize_url(full_url)
-                    if (
-                        full_normalized not in visited
-                        and _is_same_domain(base_url, full_normalized)
-                        and not _should_skip_url(full_normalized)
-                    ):
-                        queue.append(full_normalized)
-
-            except Exception as exc:
-                if is_first_request:
+            result = await guarded_fetch(
+                normalized,
+                max_bytes=10 * 1024 * 1024,
+                request_headers={"User-Agent": "AlkemioBot/1.0"},
+                content_type_policy=lambda content_type, _: "text/html" in content_type,
+                redirect_policy=lambda target: _is_same_domain(base_url, target),
+                client=client,
+            )
+            if result.body is None:
+                if is_first_request and result.reason is RefusalCategory.TRANSPORT and result.status_code is None:
                     raise CrawlError(
-                        f"Failed to reach base URL {normalized}: {exc}"
-                    ) from exc
-                logger.warning("Failed to crawl %s: %s", normalized, exc)
-            finally:
+                        f"Failed to reach base URL {normalized}: {result.error_type or 'transport error'}"
+                    )
+                if result.reason is RefusalCategory.TRANSPORT and result.status_code is None:
+                    logger.warning("Failed to crawl %s: %s", normalized, result.error_type)
                 is_first_request = False
+                continue
+
+            html = result.body.decode("utf-8", errors="replace")
+            # The guarded executor returns the validated final redirect target.
+            final_url = _normalize_url(result.url)
+            results.append({"url": final_url, "html": html})
+
+            # Extract links
+            soup = BeautifulSoup(html, "html.parser")
+            for link in soup.find_all("a", href=True):
+                href = link["href"]
+                full_url = urljoin(normalized, href)
+                full_normalized = _normalize_url(full_url)
+                if (
+                    full_normalized not in visited
+                    and _is_same_domain(base_url, full_normalized)
+                    and not _should_skip_url(full_normalized)
+                ):
+                    queue.append(full_normalized)
+
+            is_first_request = False
 
     logger.info("Crawled %d pages from %s", len(results), base_url)
     return results

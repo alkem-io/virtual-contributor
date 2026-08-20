@@ -6,10 +6,11 @@ import asyncio
 import socket
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 
 from plugins import url_guard
-from plugins.url_guard import RefusalCategory, check_destination
+from plugins.url_guard import RefusalCategory, check_destination, guarded_fetch
 
 
 @pytest.mark.parametrize("url", ["file:///etc/passwd", "gopher://example.com", "ftp://example.com", "data:text/plain,hello"])
@@ -166,3 +167,50 @@ def test_host_helpers_only_match_real_domain_boundaries():
     assert not url_guard.is_platform_domain("evil-alkem.io", "alkem.io")
     assert url_guard.is_deployment_host("DEV.alkemio.org:443", "dev.alkemio.org")
     assert not url_guard.is_deployment_host("dev.alkemio.org.evil.example", "dev.alkemio.org")
+    assert not url_guard.is_deployment_host("evil-deployment.example", "deployment.example")
+
+
+async def test_deployment_origin_requires_matching_scheme_host_and_port(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    async def resolve_host(_: str) -> list[str]:
+        return ["93.184.216.34"]
+
+    monkeypatch.setattr(url_guard, "resolve_host", resolve_host)
+
+    allowed = await check_destination(
+        "http://localhost:3000/document.pdf",
+        deployment_url="http://localhost:3000/api/private/graphql",
+    )
+    alternate_port = await check_destination(
+        "http://localhost:8080/document.pdf",
+        deployment_url="http://localhost:3000/api/private/graphql",
+    )
+    alternate_scheme = await check_destination(
+        "https://localhost:3000/document.pdf",
+        deployment_url="http://localhost:3000/api/private/graphql",
+    )
+
+    assert allowed.is_deployment_host is True
+    assert alternate_port.is_deployment_host is False
+    assert alternate_scheme.is_deployment_host is False
+
+
+async def test_guarded_fetch_disables_connection_reuse_across_hops():
+    captured_limits: list[httpx.Limits] = []
+    transport = httpx.MockTransport(
+        lambda _: httpx.Response(200, headers={"content-type": "text/plain"}, content=b"ok")
+    )
+
+    def client_factory(**kwargs) -> httpx.AsyncClient:
+        captured_limits.append(kwargs["limits"])
+        return httpx.AsyncClient(transport=transport)
+
+    result = await guarded_fetch(
+        "https://93.184.216.34/document.txt",
+        max_bytes=1024,
+        client_factory=client_factory,
+    )
+
+    assert result.body == b"ok"
+    assert captured_limits[0].max_keepalive_connections == 0
