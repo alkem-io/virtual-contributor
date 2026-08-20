@@ -199,6 +199,27 @@ class TestRetrieveNode:
         )
         graph.compile(llm=ScriptedLLM(), retriever=FakeRetriever())
 
+    def test_collection_template_positional_field_rejected_at_parse_time(self):
+        """A bare `{}` auto-numbered field parses to field_name `""` —
+        falsy, so it previously slid past the `if name` allowlist filter and
+        was only caught later as a raw IndexError/ValueError at
+        `format_map` time. Must be rejected here, by name, at parse time."""
+        definition = _retrieve_definition(
+            collection_template="{}-knowledge"
+        )
+        with pytest.raises(PromptGraphConfigError, match="positional"):
+            PromptGraph.from_definition(definition)
+
+    def test_query_template_positional_field_rejected_at_parse_time(self):
+        """Same defect, query_template side: `str.format_map` raises
+        `ValueError: Format string contains positional fields` when the
+        auto-numbered field slips through undetected."""
+        definition = _retrieve_definition(
+            query_template="info about {}"
+        )
+        with pytest.raises(PromptGraphConfigError, match="positional"):
+            PromptGraph.from_definition(definition)
+
     async def test_retrieve_node_enforces_context_budget_on_oversized_docs(self):
         """Unlike every other retrieval path, the retrieve node previously
         joined documents with no context budget. Oversized results must be

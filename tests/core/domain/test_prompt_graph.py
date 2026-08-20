@@ -37,6 +37,28 @@ class TestPromptGraphStructure:
         assert "answer" in graph.nodes
         assert len(graph.edges) == 3
 
+    def test_duplicate_node_names_rejected_at_parse_time(self):
+        """A second node declaring an already-used name previously replaced
+        the first silently (`nodes[node.name] = node`) — edges still
+        resolved, so the graph ran a different node than declared, with no
+        report. Must be rejected here, naming the duplicated node."""
+        definition = {
+            "nodes": [
+                {"name": "analyze", "input_variables": ["question"], "prompt": "Real: {question}", "output": {}},
+                {"name": "analyze", "input_variables": ["question"], "prompt": "Shadow: {question}", "output": {}},
+            ],
+            "edges": [
+                {"from": "START", "to": "analyze"},
+                {"from": "analyze", "to": "END"},
+            ],
+            "state": {
+                "type": "object",
+                "properties": {"question": {"type": "string"}, "result": {"type": "string"}},
+            },
+        }
+        with pytest.raises(PromptGraphConfigError, match="analyze"):
+            PromptGraph.from_definition(definition)
+
     def test_node_dataclass(self):
         node = Node(name="test", input_variables=["x"], prompt="Process {x}")
         assert node.name == "test"

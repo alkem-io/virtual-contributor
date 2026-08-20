@@ -827,11 +827,35 @@ class PromptGraph:
                         f"retrieve node '{node_name}' requires a non-empty "
                         "'collection_template'"
                     )
-                if not node_def.get("query_template"):
+                query_template_raw = node_def.get("query_template", "")
+                if not query_template_raw:
                     raise PromptGraphConfigError(
                         f"retrieve node '{node_name}' requires a non-empty "
                         "'query_template'"
                     )
+                # An auto-numbered positional field (a bare `{}`) parses to
+                # field_name `""` — falsy, so a naive `if name` filter drops
+                # it from the discovered-variables set entirely. That let it
+                # slide past both the collection_template allowlist below
+                # and query_template's variable discovery, then blow up as a
+                # raw IndexError/ValueError at `str.format_map` time instead
+                # of a named configuration error. Rejected here, for both
+                # templates, before any store query is possible.
+                for template_field, template_text in (
+                    ("collection_template", collection_template),
+                    ("query_template", query_template_raw),
+                ):
+                    for _, field_name, _, _ in string.Formatter().parse(
+                        template_text
+                    ):
+                        if field_name == "":
+                            raise PromptGraphConfigError(
+                                f"retrieve node '{node_name}': "
+                                f"{template_field} contains an auto-numbered "
+                                "positional field '{}', which is not "
+                                "supported — reference a named variable "
+                                "instead"
+                            )
                 # Collection scoping is a tenancy boundary, not a formatting
                 # concern: a payload naming any variable other than the
                 # server-supplied `bok_id` could otherwise point a query at
@@ -883,6 +907,14 @@ class PromptGraph:
                 source=node_def.get("source", ""),
                 max_context_chars=max_context_chars,
             )
+            if node.name in nodes:
+                raise PromptGraphConfigError(
+                    f"duplicate node name '{node.name}': a graph definition "
+                    "must declare each node name once — a later node with "
+                    "the same name would silently replace the earlier one, "
+                    "and any edge already pointing at it would resolve to "
+                    "the replacement instead"
+                )
             nodes[node.name] = node
 
         known_nodes = set(nodes.keys())
