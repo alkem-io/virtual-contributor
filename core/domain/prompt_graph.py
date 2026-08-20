@@ -394,8 +394,21 @@ class PromptGraph:
                         "store, but none is configured for this engine "
                         "instance"
                     )
+                if node.output_key not in self._state_model.model_fields:
+                    raise PromptGraphConfigError(
+                        f"retrieve node '{node_name}': output_key "
+                        f"'{node.output_key}' is not declared in the state "
+                        "schema, so its result would be silently dropped "
+                        "on state merge"
+                    )
                 graph.add_node(node_name, self._make_retrieve_node(node, retriever))
             elif node.type == "echo":
+                if "result" not in self._state_model.model_fields:
+                    raise PromptGraphConfigError(
+                        f"echo node '{node_name}': state schema does not "
+                        "declare a 'result' field, so its output would be "
+                        "silently dropped on state merge"
+                    )
                 graph.add_node(node_name, self._make_echo_node(node))
             elif node.type == "llm":
                 # Build LLM chain node (existing, default behaviour).
@@ -695,20 +708,35 @@ class PromptGraph:
         """
         nodes: dict[str, Node] = {}
         for node_def in definition.get("nodes", []):
+            if "name" not in node_def or not node_def["name"]:
+                raise PromptGraphConfigError(
+                    "node definition is missing a required 'name' field: "
+                    f"{node_def!r}"
+                )
+            node_name = node_def["name"]
             node_type = node_def.get("type", "llm")
             if node_type not in ("llm", "retrieve", "echo"):
                 raise PromptGraphConfigError(
-                    f"node '{node_def.get('name', '?')}' declares unknown "
-                    f"type '{node_type}'"
+                    f"node '{node_name}' declares unknown type '{node_type}'"
                 )
             n_results = node_def.get("n_results", 10)
             if node_type == "retrieve" and not (1 <= n_results <= 50):
                 raise PromptGraphConfigError(
-                    f"retrieve node '{node_def.get('name', '?')}': "
+                    f"retrieve node '{node_name}': "
                     f"n_results {n_results!r} is out of range [1, 50]"
                 )
             collection_template = node_def.get("collection_template", "")
             if node_type == "retrieve":
+                if not node_def.get("collection_template"):
+                    raise PromptGraphConfigError(
+                        f"retrieve node '{node_name}' requires a non-empty "
+                        "'collection_template'"
+                    )
+                if not node_def.get("query_template"):
+                    raise PromptGraphConfigError(
+                        f"retrieve node '{node_name}' requires a non-empty "
+                        "'query_template'"
+                    )
                 # Collection scoping is a tenancy boundary, not a formatting
                 # concern: a payload naming any variable other than the
                 # server-supplied `bok_id` could otherwise point a query at
@@ -722,13 +750,17 @@ class PromptGraph:
                 disallowed = collection_vars - _ALLOWED_COLLECTION_TEMPLATE_VARS
                 if disallowed:
                     raise PromptGraphConfigError(
-                        f"retrieve node '{node_def.get('name', '?')}': "
+                        f"retrieve node '{node_name}': "
                         f"collection_template may only reference "
                         f"{sorted(_ALLOWED_COLLECTION_TEMPLATE_VARS)}, "
                         f"found disallowed variable(s) {sorted(disallowed)}"
                     )
+            if node_type == "echo" and not node_def.get("source"):
+                raise PromptGraphConfigError(
+                    f"echo node '{node_name}' requires a non-empty 'source'"
+                )
             node = Node(
-                name=node_def["name"],
+                name=node_name,
                 input_variables=node_def.get("input_variables", []),
                 prompt=node_def.get("prompt", ""),
                 output_schema=node_def.get("output", {}),
@@ -751,11 +783,35 @@ class PromptGraph:
 
         edges: list[Edge] = []
         conditional_edges: list[ConditionalEdge] = []
+        conditional_sources: set[str] = set()
         for edge_def in definition.get("edges", []):
             if "on" in edge_def or "map" in edge_def:
                 from_node = edge_def.get("from", "START")
+                if "on" not in edge_def or not edge_def["on"]:
+                    raise PromptGraphConfigError(
+                        f"conditional edge from '{from_node}' is missing a "
+                        "required non-empty 'on' field"
+                    )
+                if from_node in conditional_sources:
+                    raise PromptGraphConfigError(
+                        f"conditional edge from '{from_node}': a conditional "
+                        "edge from this node is already declared — only one "
+                        "conditional edge per source node is allowed"
+                    )
                 on_field = edge_def["on"]
                 raw_map = edge_def.get("map", {})
+                for key in raw_map.keys():
+                    if not isinstance(key, str):
+                        raise PromptGraphConfigError(
+                            f"conditional edge from '{from_node}': 'map' key "
+                            f"{key!r} must be a string"
+                        )
+                for target in raw_map.values():
+                    if not isinstance(target, str):
+                        raise PromptGraphConfigError(
+                            f"conditional edge from '{from_node}': 'map' "
+                            f"target {target!r} must be a string node name"
+                        )
                 path_map = {str(k).lower(): v for k, v in raw_map.items()}
                 default = edge_def.get("default")
                 _validate_endpoint(from_node, "conditional edge 'from'")
@@ -763,6 +819,7 @@ class PromptGraph:
                     _validate_endpoint(target, "conditional edge 'map' target")
                 if default is not None:
                     _validate_endpoint(default, "conditional edge 'default'")
+                conditional_sources.add(from_node)
                 conditional_edges.append(ConditionalEdge(
                     from_node=from_node,
                     on_field=on_field,

@@ -172,6 +172,50 @@ class TestRetrieveNode:
         final = await graph.invoke({"bok_id": "x", "topic": "y"})
         assert final["knowledge_docs"] != ""
 
+    def test_retrieve_output_key_undeclared_in_state_rejected_at_compile_time(self):
+        """A retrieve node's `output_key` not declared in the state schema
+        would silently drop the retrieved result on LangGraph state merge —
+        this must be a named `PromptGraphConfigError` at compile time, not a
+        silent no-op discovered later."""
+        definition = _retrieve_definition(output_key="undeclared_key")
+        graph = PromptGraph.from_definition(definition)
+        with pytest.raises(PromptGraphConfigError, match="load_bok.*undeclared_key"):
+            graph.compile(llm=ScriptedLLM(), retriever=FakeRetriever())
+
+    def test_echo_result_undeclared_in_state_rejected_at_compile_time(self):
+        """An echo node's implicit `result` write must be declared in the
+        state schema, or its output is silently dropped on state merge."""
+        definition = {
+            "nodes": [{"name": "ask", "type": "echo", "source": "question"}],
+            "edges": [
+                {"from": "START", "to": "ask"},
+                {"from": "ask", "to": "END"},
+            ],
+            "state": {
+                "type": "object",
+                "properties": {"question": {"type": "string"}},
+            },
+        }
+        graph = PromptGraph.from_definition(definition)
+        with pytest.raises(PromptGraphConfigError, match="ask.*result"):
+            graph.compile(llm=ScriptedLLM())
+
+    def test_retrieve_missing_collection_template_rejected_at_parse_time(self):
+        definition = _retrieve_definition(collection_template="")
+        with pytest.raises(PromptGraphConfigError, match="collection_template"):
+            PromptGraph.from_definition(definition)
+
+    def test_retrieve_missing_query_template_rejected_at_parse_time(self):
+        definition = _retrieve_definition(query_template="")
+        with pytest.raises(PromptGraphConfigError, match="query_template"):
+            PromptGraph.from_definition(definition)
+
+    def test_node_missing_name_rejected_at_parse_time(self):
+        definition = _retrieve_definition()
+        del definition["nodes"][0]["name"]
+        with pytest.raises(PromptGraphConfigError, match="name"):
+            PromptGraph.from_definition(definition)
+
     async def test_special_node_name_precedence_over_type(self):
         """Expert's existing name-keyed special-node injection is checked
         BEFORE type dispatch — a node named "retrieve" with no `type` field
@@ -253,3 +297,7 @@ class TestEchoNode:
         graph3.compile(llm=ScriptedLLM())
         final3 = await graph3.invoke({"empty_str": ""})
         assert final3["result"] == ""
+
+    def test_echo_missing_source_rejected_at_parse_time(self):
+        with pytest.raises(PromptGraphConfigError, match="source"):
+            PromptGraph.from_definition(_echo_definition(source=""))

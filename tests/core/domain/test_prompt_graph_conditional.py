@@ -200,6 +200,51 @@ class TestConditionalEdgeRouting:
         with pytest.raises(PromptGraphConfigError, match="ghost"):
             PromptGraph.from_definition(definition)
 
+    def test_conditional_edge_missing_on_rejected_at_parse_time(self):
+        definition = _base_definition([
+            {"from": "START", "to": "check"},
+            {"from": "check", "map": {"true": "next", "false": "ask"}},
+            {"from": "next", "to": "END"},
+            {"from": "ask", "to": "END"},
+        ])
+        with pytest.raises(PromptGraphConfigError, match="'on'"):
+            PromptGraph.from_definition(definition)
+
+    def test_conditional_edge_non_string_map_key_rejected_at_parse_time(self):
+        definition = _base_definition([
+            {"from": "START", "to": "check"},
+            {"from": "check", "on": "complete", "map": {True: "next", "false": "ask"}},
+            {"from": "next", "to": "END"},
+            {"from": "ask", "to": "END"},
+        ])
+        with pytest.raises(PromptGraphConfigError, match="map"):
+            PromptGraph.from_definition(definition)
+
+    def test_conditional_edge_non_string_map_target_rejected_at_parse_time(self):
+        definition = _base_definition([
+            {"from": "START", "to": "check"},
+            {"from": "check", "on": "complete", "map": {"true": ["next"], "false": "ask"}},
+            {"from": "next", "to": "END"},
+            {"from": "ask", "to": "END"},
+        ])
+        with pytest.raises(PromptGraphConfigError, match="map"):
+            PromptGraph.from_definition(definition)
+
+    def test_duplicate_conditional_edge_source_rejected_at_parse_time(self):
+        """Two conditional edges from the same source node must be rejected
+        here, at parse time, naming the construct — never left to hit
+        LangGraph's raw ValueError on the second `add_conditional_edges`
+        call for the same source."""
+        definition = _base_definition([
+            {"from": "START", "to": "check"},
+            {"from": "check", "on": "complete", "map": {"true": "next", "false": "ask"}},
+            {"from": "check", "on": "value", "map": {"x": "next"}},
+            {"from": "next", "to": "END"},
+            {"from": "ask", "to": "END"},
+        ])
+        with pytest.raises(PromptGraphConfigError, match="check"):
+            PromptGraph.from_definition(definition)
+
     async def test_cyclic_conditional_graph_raises_not_infinite_loop(self):
         """A mis-authored cyclic payload is bounded by LangGraph's recursion
         limit and surfaces as a raised exception — never an unbounded loop
