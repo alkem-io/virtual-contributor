@@ -59,6 +59,35 @@ class TestPromptGraphStructure:
         with pytest.raises(PromptGraphConfigError, match="analyze"):
             PromptGraph.from_definition(definition)
 
+    @pytest.mark.parametrize("bad_node", [7, None, 1.5])
+    def test_non_dict_node_entry_rejected_at_parse_time(self, bad_node):
+        """A `nodes[]` entry that isn't an object (int/None/float) must be
+        rejected by name here, before `"name" not in node_def` — a
+        containment test, not a key lookup — reaches it: against an int or
+        float that raises a raw `TypeError: argument of type '...' is not
+        iterable`, and against `None` likewise. Must surface a named
+        `PromptGraphConfigError` naming the index instead."""
+        definition = {
+            "nodes": [bad_node],
+            "edges": [],
+            "state": {"type": "object", "properties": {}},
+        }
+        with pytest.raises(PromptGraphConfigError, match="index 0"):
+            PromptGraph.from_definition(definition)
+
+    def test_non_dict_edge_entry_rejected_at_parse_time(self):
+        """A bare string in `edges[]` (instead of an object) previously
+        reached `edge_def.get(...)` and raised a raw
+        `AttributeError: 'str' object has no attribute 'get'`. Must surface
+        a named `PromptGraphConfigError` naming the index instead."""
+        definition = {
+            "nodes": [{"name": "analyze", "prompt": "Analyze"}],
+            "edges": ["e"],
+            "state": {"type": "object", "properties": {}},
+        }
+        with pytest.raises(PromptGraphConfigError, match="index 0"):
+            PromptGraph.from_definition(definition)
+
     def test_node_dataclass(self):
         node = Node(name="test", input_variables=["x"], prompt="Process {x}")
         assert node.name == "test"

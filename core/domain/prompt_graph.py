@@ -771,7 +771,20 @@ class PromptGraph:
             )
 
         nodes: dict[str, Node] = {}
-        for node_def in raw_nodes:
+        for node_index, node_def in enumerate(raw_nodes):
+            if not isinstance(node_def, dict):
+                # `"name" not in node_def` below is a containment test, not
+                # a key lookup — against a non-dict it silently degrades:
+                # `"name" in "myname"` is a substring test (can be True, then
+                # `node_def["name"]` raises a raw TypeError on a string),
+                # and against an int/None/float it raises a raw TypeError of
+                # its own. Reject the shape explicitly, before either branch
+                # is reached, so every malformed entry gets the same named
+                # error instead of an incidental one.
+                raise PromptGraphConfigError(
+                    f"node definition at index {node_index} is not an "
+                    f"object: {node_def!r}"
+                )
             if "name" not in node_def or not node_def["name"]:
                 raise PromptGraphConfigError(
                     "node definition is missing a required 'name' field: "
@@ -940,7 +953,17 @@ class PromptGraph:
         edges: list[Edge] = []
         conditional_edges: list[ConditionalEdge] = []
         conditional_sources: set[str] = set()
-        for edge_def in raw_edges:
+        for edge_index, edge_def in enumerate(raw_edges):
+            if not isinstance(edge_def, dict):
+                # Same shape hazard as the node loop above: a non-dict edge
+                # entry (e.g. a bare string) reaches `edge_def.get(...)`
+                # below and raises a raw AttributeError instead of a named
+                # PromptGraphConfigError. Reject explicitly, before either
+                # the conditional or plain edge branch is reached.
+                raise PromptGraphConfigError(
+                    f"edge definition at index {edge_index} is not an "
+                    f"object: {edge_def!r}"
+                )
             if "on" in edge_def or "map" in edge_def:
                 from_node = edge_def.get("from", "START")
                 if "on" not in edge_def or not edge_def["on"]:

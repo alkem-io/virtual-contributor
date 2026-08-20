@@ -225,28 +225,33 @@ class TestGenericGraphPath:
         assert store.query_calls == []
 
     async def test_malformed_node_entry_raises_named_config_error_no_store(self):
-        """A bare string in `nodes` (instead of a dict) previously produced
-        a named `PromptGraphConfigError` from `from_definition`'s own
-        `"name" not in node_def` guard. Hoisting `has_retrieve_node` to scan
-        the raw payload unconditionally (for the tenancy/embeddings
-        pre-checks) must stay defensive against exactly this malformed
-        shape — a `.get()` call on a plain string raises `AttributeError`
-        instead, losing the construct-naming guarantee (SC-004). Must still
-        surface a named `PromptGraphConfigError`, not an `AttributeError`."""
+        """A bare string in `nodes` (instead of a dict) must still surface a
+        named `PromptGraphConfigError`, not a raw `AttributeError`/`TypeError`
+        (SC-004). Uses `"myname"` rather than `"load"`: against a string,
+        `"name" not in node_def` is a *substring* test, so `"load"` happens
+        to satisfy it (`"name" not in "load"` is True) and falls into the
+        "missing a required 'name' field" branch by coincidence — that
+        input alone doesn't prove the guard is dict-aware. `"myname"`
+        contains the substring `"name"`, so `"name" not in "myname"` is
+        False and, without an explicit `isinstance(..., dict)` check, the
+        next line indexes a string with `node_def["name"]` and raises a raw
+        `TypeError` instead. This is the case that actually exercises the
+        construct-naming guarantee."""
         from core.domain.prompt_graph import PromptGraphConfigError
 
         llm = MockLLMPort(response="unused")
         plugin = GenericPlugin(llm=llm, knowledge_store=None)
         event = make_input(
             promptGraph={
-                "nodes": ["load"],
-                "edges": [{"from": "START", "to": "load"}, {"from": "load", "to": "END"}],
+                "nodes": ["myname"],
+                "edges": [{"from": "START", "to": "myname"}, {"from": "myname", "to": "END"}],
                 "state": {"type": "object", "properties": {}},
             },
         )
-        with pytest.raises(PromptGraphConfigError, match="load") as excinfo:
+        with pytest.raises(PromptGraphConfigError, match="0") as excinfo:
             await plugin.handle(event)
         assert not isinstance(excinfo.value, AttributeError)
+        assert not isinstance(excinfo.value, TypeError)
 
     async def test_malformed_node_entry_raises_named_config_error_with_store(self):
         """Same malformed shape, but with a knowledge store configured —
