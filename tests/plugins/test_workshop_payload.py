@@ -7,6 +7,7 @@ via ``json.load`` — never a copy embedded in this file (FR-008/R-5).
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -187,6 +188,39 @@ class TestWorkshopPayloadRefine:
         # node between analyse and the store query.
         assert len(ScriptedChatModel.calls) == 4
         assert len(store.query_calls) == 1
+
+
+class TestStructuredParseFailureLogging:
+    async def test_parse_failure_never_logs_raw_response_only_error_type_and_length(
+        self, caplog
+    ):
+        """A structured-output parse failure must log only the exception
+        class, node name, and response length — never the raw LLM response
+        text, which can be a near-verbatim restatement of member
+        conversation content."""
+        payload = _load_shipped_payload()
+        store = MockKnowledgeStorePort()
+        plugin = _make_plugin(store)
+        sentinel = "Jane Doe, jane@acme.example, our Q3 layoff planning session"
+        # No JSON object at all: fails PydanticOutputParser.parse() AND the
+        # best-effort `_recover_fields` fallback, so the exception re-raises
+        # after the warning is logged.
+        ScriptedChatModel.responses = [
+            f"Here is the workshop design from the conversation: {sentinel} "
+            "— no structured output was produced."
+        ]
+        event = make_input(
+            message="I want to run a workshop.",
+            promptGraph=payload,
+            bodyOfKnowledgeID="ls-101",
+        )
+        with caplog.at_level(logging.WARNING):
+            with pytest.raises(Exception):
+                await plugin.handle(event)
+        log_text = "\n".join(record.getMessage() for record in caplog.records)
+        assert sentinel not in log_text
+        assert "error_type=" in log_text
+        assert "response_chars=" in log_text
 
 
 class TestWorkshopPayloadRecovery:

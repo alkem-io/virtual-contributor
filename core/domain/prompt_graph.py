@@ -543,10 +543,15 @@ class PromptGraph:
                     result = parser.parse(raw_text)
                     return result.model_dump()
                 except Exception as exc:
+                    # Never log `exc` or `raw_text`: the raw LLM response can
+                    # be a near-verbatim restatement of member conversation
+                    # content (FR-009). Match main.py's error_type-only
+                    # redaction idiom — construct name, exception class, and
+                    # response length only.
                     logger.warning(
-                        "Structured parse failed for node %s: %s — "
-                        "attempting recovery",
-                        node.name, exc,
+                        "Structured parse failed for node %s: error_type=%s "
+                        "response_chars=%d — attempting recovery",
+                        node.name, type(exc).__name__, len(raw_text),
                     )
                     recovered = PromptGraph._recover_fields(
                         raw_text, output_model
