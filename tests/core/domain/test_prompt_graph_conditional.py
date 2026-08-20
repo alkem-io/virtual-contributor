@@ -7,10 +7,21 @@ import pytest
 from core.domain.prompt_graph import PromptGraph, PromptGraphConfigError
 
 
+#: Distinct seeded values for the two branch nodes below, so a test's
+#: assertion on `final["result"]` names WHICH node ran rather than merely
+#: confirming a value round-tripped. Both nodes echo the same `value` field
+#: prior to this fix, which made every assertion pass even with the routing
+#: map inverted or the conditional edge deleted outright.
+_NEXT_RAN = "next-branch-ran"
+_ASK_RAN = "ask-branch-ran"
+
+
 def _base_definition(edges: list[dict], extra_state: dict | None = None) -> dict:
     state_props = {
         "complete": {"type": "boolean"},
         "value": {"type": "string"},
+        "next_marker": {"type": "string"},
+        "ask_marker": {"type": "string"},
         "result": {"type": "string"},
     }
     if extra_state:
@@ -23,19 +34,29 @@ def _base_definition(edges: list[dict], extra_state: dict | None = None) -> dict
                 "source": "value",
             },
             {
+                # Echoes its OWN marker field — distinct from "ask" below —
+                # so a test can tell from `final["result"]` alone that THIS
+                # node, and not the other branch, actually ran.
                 "name": "next",
                 "type": "echo",
-                "source": "value",
+                "source": "next_marker",
             },
             {
                 "name": "ask",
                 "type": "echo",
-                "source": "value",
+                "source": "ask_marker",
             },
         ],
         "edges": edges,
         "state": {"type": "object", "properties": state_props},
     }
+
+
+def _branch_markers() -> dict:
+    """Initial-state fragment seeding both branch markers with distinct,
+    recognisable values — merge into every `invoke()` call that routes
+    through `next` or `ask` so the assertion discriminates the two."""
+    return {"next_marker": _NEXT_RAN, "ask_marker": _ASK_RAN}
 
 
 class ScriptedLLM:
@@ -58,10 +79,14 @@ class TestConditionalEdgeRouting:
         # itself write `complete` — seed `complete` directly in initial state
         # and route on it (the router reads whatever state carries, however
         # it got there — a structured LLM node's merged output in real use).
+        # `next` and `ask` each echo their OWN distinct marker field, so the
+        # final result names which one actually ran.
         graph = PromptGraph.from_definition(definition)
         graph.compile(llm=ScriptedLLM())
-        final = await graph.invoke({"complete": False, "value": "the question"})
-        assert final["result"] == "the question"
+        final = await graph.invoke({
+            "complete": False, "value": "the question", **_branch_markers(),
+        })
+        assert final["result"] == _ASK_RAN
 
     async def test_us1_as2_true_routes_to_next_not_ask(self):
         definition = _base_definition([
@@ -72,8 +97,10 @@ class TestConditionalEdgeRouting:
         ])
         graph = PromptGraph.from_definition(definition)
         graph.compile(llm=ScriptedLLM())
-        final = await graph.invoke({"complete": True, "value": "next-value"})
-        assert final["result"] == "next-value"
+        final = await graph.invoke({
+            "complete": True, "value": "next-value", **_branch_markers(),
+        })
+        assert final["result"] == _NEXT_RAN
 
     async def test_boolean_true_matches_lowercase_string_key(self):
         definition = _base_definition([
@@ -84,8 +111,8 @@ class TestConditionalEdgeRouting:
         ])
         graph = PromptGraph.from_definition(definition)
         graph.compile(llm=ScriptedLLM())
-        final = await graph.invoke({"complete": True, "value": "x"})
-        assert final["result"] == "x"
+        final = await graph.invoke({"complete": True, "value": "x", **_branch_markers()})
+        assert final["result"] == _NEXT_RAN
 
     async def test_none_value_routes_to_default_when_declared(self):
         definition = _base_definition([
@@ -99,8 +126,8 @@ class TestConditionalEdgeRouting:
         ], extra_state={"missing_field": {"type": ["boolean", "null"]}})
         graph = PromptGraph.from_definition(definition)
         graph.compile(llm=ScriptedLLM())
-        final = await graph.invoke({"value": "unrouted-default"})
-        assert final["result"] == "unrouted-default"
+        final = await graph.invoke({"value": "unrouted-default", **_branch_markers()})
+        assert final["result"] == _ASK_RAN
 
     async def test_literal_none_map_key_never_matched_by_absent_value(self):
         """An absent field must never stringify to `"none"` and match a
@@ -116,11 +143,10 @@ class TestConditionalEdgeRouting:
         ], extra_state={"missing_field": {"type": ["boolean", "null"]}})
         graph = PromptGraph.from_definition(definition)
         graph.compile(llm=ScriptedLLM())
-        final = await graph.invoke({"value": "default-not-none"})
-        # Routed via default (ask), not via the "none" map key (next) —
-        # both write the same result via echo, so assert via distinguishable
-        # values on separate nodes instead.
-        assert final["result"] == "default-not-none"
+        final = await graph.invoke({"value": "default-not-none", **_branch_markers()})
+        # Routed via default (ask), not via the "none" map key (next) — each
+        # branch echoes its own marker field, so the two are distinguishable.
+        assert final["result"] == _ASK_RAN
 
     async def test_us1_as6_unmatched_value_no_default_raises_config_error(self):
         definition = _base_definition([
@@ -162,9 +188,12 @@ class TestConditionalEdgeRouting:
         graph.compile(llm=ScriptedLLM())
         # complete=false must route to ask, proving the plain edge to `next`
         # was NOT registered (LangGraph would otherwise run both branches or
-        # raise on ambiguous edges).
-        final = await graph.invoke({"complete": False, "value": "routed-via-conditional"})
-        assert final["result"] == "routed-via-conditional"
+        # raise on ambiguous edges) — `ask`'s own marker in the result proves
+        # it, not `next`'s.
+        final = await graph.invoke({
+            "complete": False, "value": "routed-via-conditional", **_branch_markers(),
+        })
+        assert final["result"] == _ASK_RAN
 
     def test_unknown_target_rejected_at_parse_time(self):
         definition = _base_definition([
