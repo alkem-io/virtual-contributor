@@ -43,6 +43,12 @@ message trigger an unbounded burst of provider calls. Every existing
 payload (the shipped `workshop-design.json`, expert's own graphs) is a
 handful of nodes, well under the cap.
 
+**Every node name must be unique.** A second node declaring an
+already-used `name` is a `PromptGraphConfigError` at parse time, naming
+the duplicate — it is never silently accepted as a replacement of the
+earlier node (edges targeting that name would otherwise resolve to
+whichever node happened to be declared last, with no report).
+
 ## Node types
 
 Every node has a `type` field. It defaults to `"llm"` and may be omitted for
@@ -82,8 +88,8 @@ parse failure) and the parsed fields are merged into state. Without
 
 | Field | Required | Notes |
 |---|---|---|
-| `collection_template` | yes | may reference **only** `{bok_id}`, unmodified — the engine-seeded body-of-knowledge id; any other variable, or a format spec/conversion on `{bok_id}` itself (e.g. `{bok_id:.0}`, `{bok_id!r}`), is a configuration error at parse time (tenancy boundary, not a formatting concern) |
-| `query_template` | yes | filled with state values, single pass |
+| `collection_template` | yes | may reference **only** `{bok_id}`, unmodified — the engine-seeded body-of-knowledge id; any other variable, or a format spec/conversion on `{bok_id}` itself (e.g. `{bok_id:.0}`, `{bok_id!r}`), is a configuration error at parse time (tenancy boundary, not a formatting concern). An auto-numbered positional field — a bare `{}` — is likewise rejected at parse time; only named `{variable}` references are supported. |
+| `query_template` | yes | filled with state values, single pass. An auto-numbered positional field — a bare `{}` — is rejected at parse time, same as `collection_template`. |
 | `n_results` | no (default `10`) | integer, **must be in `[1, 50]`** — out of range is a configuration error at parse time, never silently clamped |
 | `max_context_chars` | no (default `20000`) | integer, **must be in `[1000, 120000]`** — out of range or wrong type is a configuration error at parse time, never silently clamped. Per-node override of the join budget below; the range keeps it a real budget (floor) and a real security control (ceiling), not an unbounded escape hatch. |
 | `output_key` | no (default `"knowledge_docs"`) | where the joined document text is written |
@@ -123,6 +129,12 @@ Behaviour:
   `collection_template` value — closing the gap where a payload's own
   upstream nodes could otherwise overwrite the `bok_id` state value before
   the retrieve node runs.
+- **An empty `Input.bodyOfKnowledgeID` with a `retrieve` node present is a
+  configuration error**, raised before any node runs and before a
+  collection name is even constructed. There is no shared/default
+  collection fallback — a BoK-less persona whose payload contains a
+  `retrieve` node cannot silently read a collection pooled across tenants.
+  A payload with no `retrieve` node is unaffected.
 - No matching documents → `output_key` is set to `""` and the flow
   continues; this is not an error.
 - A store/embedding error propagates to the caller's standard error
@@ -237,7 +249,7 @@ Send an `Input` message to the deployment's generic-engine queue with:
 | `userID` | required, no default — the platform always supplies this ahead of any configurator-authored payload; it is never something a configurator constructs by hand |
 | `message` / `history` | the member conversation |
 | `promptGraph` | the JSON payload (e.g. the contents of `workshop-design.json`) |
-| `bodyOfKnowledgeID` | required for any payload using a `retrieve` node |
+| `bodyOfKnowledgeID` | required for any payload using a `retrieve` node — an empty value with a `retrieve` node present is a configuration error raised before any node runs and before any collection name is constructed; there is no fallback shared collection. A payload with no `retrieve` node is unaffected by an absent `bodyOfKnowledgeID`. |
 | `prompt` | unused on the graph path |
 
 **Deployment prerequisite for `retrieve` nodes**: the generic engine
