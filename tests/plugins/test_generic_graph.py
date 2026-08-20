@@ -134,36 +134,54 @@ class TestGenericGraphPath:
         retriever is scoped from `Input.bodyOfKnowledgeID` server-side and
         ignores whatever collection name the graph itself computed — a
         payload cannot redirect retrieval to another tenant's collection by
-        manipulating state either."""
+        manipulating state either.
+
+        The poisoning node is itself a `retrieve` node whose `output_key` is
+        `bok_id` — an `echo` node can only ever write to `result` (its
+        output key is hardcoded in `_make_echo_node`), so it can never
+        actually overwrite `bok_id` and would make this assertion pass
+        whether or not the plugin's scoping exists at all. This shape
+        overwrites the real `bok_id` *state* value, so the test only passes
+        if the plugin genuinely ignores it."""
         llm = MockLLMPort(response="unused")
         store = MockKnowledgeStorePort()
+        # Both queries the fixed plugin ever issues land on the caller's own
+        # collection — seeded with a document whose text IS the string
+        # "victim-space", so the poison node's retrieved value becomes that
+        # literal string once written into `bok_id` state.
         store.collections["ls-101-knowledge"] = [
-            {"document": "own-doc", "metadata": {"embeddingType": "chunk"}, "id": "1"},
+            {"document": "victim-space", "metadata": {"embeddingType": "chunk"}, "id": "1"},
         ]
+        # Never legitimately queried; its presence is what a scoping defect
+        # would redirect the second query to.
         store.collections["victim-space-knowledge"] = [
             {"document": "victim-doc", "metadata": {"embeddingType": "chunk"}, "id": "2"},
         ]
         plugin = GenericPlugin(llm=llm, knowledge_store=store)
         graph = _retrieve_graph()
-        # An echo node re-seeds `bok_id` from a constant "victim-space" before
-        # the retrieve node runs, standing in for any payload node that
-        # could overwrite state.
-        graph["nodes"].insert(0, {"name": "poison", "type": "echo", "source": "poison_value"})
+        graph["nodes"].insert(0, {
+            "name": "poison",
+            "type": "retrieve",
+            "collection_template": "{bok_id}-knowledge",
+            "query_template": "about {current_question}",
+            "n_results": 1,
+            "output_key": "bok_id",
+        })
         graph["edges"].insert(0, {"from": "START", "to": "poison"})
         graph["edges"][1] = {"from": "poison", "to": "load"}
-        graph["state"]["properties"]["poison_value"] = {"type": "string"}
         event = make_input(
             promptGraph=graph,
             bodyOfKnowledgeID="ls-101",
         )
         result = await plugin.handle(event)
         assert isinstance(result, Response)
-        # Retrieval must still be scoped to the caller's own bok_id, never
-        # the "victim-space" collection, regardless of what a payload's own
-        # nodes compute along the way.
-        assert len(store.query_calls) == 1
-        collection = store.query_calls[0][0]
-        assert collection == "ls-101-knowledge"
+        # Both the poison node's own query and the downstream `load` node's
+        # query must land on the caller's real collection — never on
+        # "victim-space-knowledge", regardless of what `bok_id` state holds
+        # by the time `load` runs.
+        assert len(store.query_calls) == 2
+        collections = [call[0] for call in store.query_calls]
+        assert collections == ["ls-101-knowledge", "ls-101-knowledge"]
 
     async def test_store_present_but_embeddings_unusable_raises_before_any_llm_call(self):
         """A knowledge store that is configured but was built with no
@@ -188,6 +206,35 @@ class TestGenericGraphPath:
         with pytest.raises(PromptGraphConfigError, match="embeddings"):
             await plugin.handle(event)
         assert llm.calls == []
+
+    async def test_retrieve_node_with_no_bok_id_raises_before_any_llm_call(self):
+        """A retrieve-bearing payload with an empty `bodyOfKnowledgeID`
+        previously fell back to a shared `default-knowledge` collection —
+        pooling every BoK-less persona's retrieval into one collection. Must
+        fail loudly, naming the missing field, before any node runs or any
+        collection name is even constructed."""
+        from core.domain.prompt_graph import PromptGraphConfigError
+
+        llm = MockLLMPort(response="unused")
+        store = MockKnowledgeStorePort()
+        plugin = GenericPlugin(llm=llm, knowledge_store=store)
+        event = make_input(promptGraph=_retrieve_graph(), bodyOfKnowledgeID="")
+        with pytest.raises(PromptGraphConfigError, match="bodyOfKnowledgeID"):
+            await plugin.handle(event)
+        assert llm.calls == []
+        assert store.query_calls == []
+
+    async def test_no_retrieve_node_still_works_without_bok_id(self):
+        """Regression guard: a graph with no retrieve node has nothing to
+        scope, so an absent `bodyOfKnowledgeID` must not be affected by the
+        new guard — this is exactly `test_graph_path_taken_when_payload_present_no_condensation`'s
+        setup, re-asserted here to pin the "unaffected" half of the fix."""
+        llm = MockLLMPort(response="unused")
+        plugin = GenericPlugin(llm=llm)
+        event = make_input(promptGraph=_echo_graph(), bodyOfKnowledgeID="")
+        result = await plugin.handle(event)
+        assert isinstance(result, Response)
+        assert result.result == event.message
 
     async def test_store_error_propagates_no_fabricated_answer(self):
         class RaisingStore:

@@ -161,7 +161,26 @@ class GenericPlugin:
         # closes that gap: whatever the payload computes, retrieval is always
         # scoped to the caller's own body of knowledge.
         bok_id = event.body_of_knowledge_id or ""
-        collection_name = f"{bok_id}-knowledge" if bok_id else "default-knowledge"
+
+        has_retrieve_node = any(
+            n.get("type") == "retrieve"
+            for n in prompt_graph.get("nodes", [])
+        )
+        # A retrieve-bearing payload with no `bodyOfKnowledgeID` has no
+        # tenant to scope its query to. Falling back to a fixed
+        # "default-knowledge" collection would silently pool every
+        # BoK-less persona's retrieval into one shared collection — a
+        # cross-tenant leak, not a graceful default. Fail here, before
+        # `collection_name` is even constructed and before any LLM call,
+        # naming the missing field. A graph with no retrieve node has
+        # nothing to scope and is unaffected.
+        if has_retrieve_node and not bok_id:
+            raise PromptGraphConfigError(
+                "prompt graph contains a retrieve node, but "
+                "'bodyOfKnowledgeID' is empty — retrieval has no tenant "
+                "to scope its collection to"
+            )
+        collection_name = f"{bok_id}-knowledge"
 
         retriever = None
         if self._knowledge_store is not None:
@@ -176,10 +195,6 @@ class GenericPlugin:
             # been paid for. A retrieve-bearing payload against such a
             # store must fail here, before any node runs, naming the
             # missing capability (FR-005).
-            has_retrieve_node = any(
-                n.get("type") == "retrieve"
-                for n in prompt_graph.get("nodes", [])
-            )
             if has_retrieve_node and not _store_can_embed(store):
                 raise PromptGraphConfigError(
                     "prompt graph requires a knowledge store with query "
