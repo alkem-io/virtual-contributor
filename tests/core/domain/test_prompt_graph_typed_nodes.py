@@ -207,7 +207,7 @@ class TestRetrieveNode:
             )
         with pytest.raises(PromptGraphConfigError, match="max_context_chars"):
             PromptGraph.from_definition(
-                _retrieve_definition(max_context_chars=60_001)
+                _retrieve_definition(max_context_chars=120_001)
             )
 
     def test_max_context_chars_wrong_type_rejected_at_parse_time(self):
@@ -249,10 +249,12 @@ class TestRetrieveNode:
 
     async def test_shipped_workshop_payload_full_result_set_survives_whole(self):
         """The shipped `workshop-design.json` retrieve nodes request
-        `n_results=10`; at the repo's default ingest chunk size (2500
-        chars) a full result set is ~25,000 chars. Its
-        `max_context_chars: 30000` override must let all 10 chunks survive
-        un-truncated on the headline US2-AS2 scenario."""
+        `n_results=10`; at the **deployed** ingest chunk size (9,000 chars —
+        `CHUNK_SIZE` in the infra-ops configMap, also
+        `core/domain/routing.py` and `docs/adr/0016`) a full result set is
+        10 * 9000 + 9 separators ~= 90,018 chars. Its
+        `max_context_chars: 95000` override must let all 10 chunks survive
+        un-truncated on the headline US2-AS2 scenario, with margin."""
         import json
         from pathlib import Path
 
@@ -268,7 +270,7 @@ class TestRetrieveNode:
         assert retrieve_nodes, "expected at least one retrieve node"
         for node_def in retrieve_nodes:
             assert node_def["n_results"] == 10
-            chunk_size = 2_500
+            chunk_size = 9_000
             docs = [("x" * chunk_size)] * node_def["n_results"]
             budget = node_def.get("max_context_chars", 20_000)
             joined = PromptGraph._join_docs_within_budget(

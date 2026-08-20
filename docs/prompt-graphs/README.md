@@ -105,7 +105,7 @@ Behaviour:
 - Results are combined as a plain `"\n\n"` join of the returned document
   texts, in store order — no numbered blocks, no source labels, no
   score-threshold filtering. The join is budgeted at `max_context_chars`
-  (default 20,000 characters, payload-settable per node in `[1000, 60000]`
+  (default 20,000 characters, payload-settable per node in `[1000, 120000]`
   — see the field table above): trailing documents are dropped once the
   budget is spent, mirroring every other retrieval path in the repo
   (expert, guidance). A single document that alone exceeds the budget is
@@ -113,9 +113,11 @@ Behaviour:
   the warning log line (node name + kept/dropped chunk counts) so it stays
   observable; widen `max_context_chars` on that node if the full result
   set should survive — e.g. the shipped `workshop-design.json` sets
-  `max_context_chars: 30000` on both `retrieve_refine`/`retrieve_generate`
-  so their `n_results: 10` result set fits whole at the repo's default
-  ingest chunk size, matching FR-002's "documents are used as returned".
+  `max_context_chars: 95000` on both `retrieve_refine`/`retrieve_generate`
+  so their `n_results: 10` result set fits whole at the **deployed** ingest
+  chunk size (9,000 characters — `CHUNK_SIZE` in the infra-ops configMap,
+  also `core/domain/routing.py` and `docs/adr/0016`), matching FR-002's
+  "documents are used as returned".
 - The collection actually queried is always derived server-side from
   `Input.bodyOfKnowledgeID` — never the payload's rendered
   `collection_template` value — closing the gap where a payload's own

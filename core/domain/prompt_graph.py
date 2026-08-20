@@ -40,9 +40,11 @@ _ALLOWED_COLLECTION_TEMPLATE_VARS = frozenset({"bok_id"})
 #: `plugins/guidance/plugin.py`). A payload may override this per node via
 #: the optional `max_context_chars` field (bounded by the min/max below) —
 #: the fixed 20,000-char default silently dropped trailing documents on a
-#: full `n_results=10` result set at the repo's default ingest chunk size,
-#: so a node whose own retrieval volume needs a larger budget can say so
-#: explicitly rather than lose documents FR-002 says are "used as returned".
+#: full `n_results=10` result set at the deployed ingest chunk size (9,000
+#: characters — `CHUNK_SIZE` in the infra-ops configMap, also
+#: `core/domain/routing.py` and `docs/adr/0016`), so a node whose own
+#: retrieval volume needs a larger budget can say so explicitly rather than
+#: lose documents FR-002 says are "used as returned".
 _RETRIEVE_MAX_CONTEXT_CHARS_DEFAULT = 20_000
 
 #: Bounds for a payload's per-node `max_context_chars` override. The floor
@@ -50,8 +52,12 @@ _RETRIEVE_MAX_CONTEXT_CHARS_DEFAULT = 20_000
 #: values); the ceiling keeps it a security control — the field lets a
 #: payload widen the context sent to the next LLM call, so it stays capped
 #: rather than becoming an unbounded escape hatch from the budget entirely.
+#: Raised to 120,000 so a full `n_results=10` result set at the deployed
+#: 9,000-char ingest chunk size (10 * 9000 + separators ~= 90,018 chars)
+#: fits within the ceiling with margin, rather than being unfixable by any
+#: in-range payload override.
 _RETRIEVE_MAX_CONTEXT_CHARS_MIN = 1_000
-_RETRIEVE_MAX_CONTEXT_CHARS_MAX = 60_000
+_RETRIEVE_MAX_CONTEXT_CHARS_MAX = 120_000
 
 #: Parse-time caps on total graph size. A declarative payload with no
 #: node/edge ceiling could fan out to hundreds of nodes, each one an LLM or

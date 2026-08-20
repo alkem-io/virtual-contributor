@@ -75,7 +75,7 @@
       "collection_template": "{bok_id}-knowledge",
       "query_template": "I need information about Liberating Structures suitable for a {workshop_type} for {audience_size} people held by {role} for {duration} in order to {purpose}.",
       "n_results": 10,
-      "max_context_chars": 30000,
+      "max_context_chars": 95000,
       "output_key": "knowledge_docs"
     },
     {
@@ -90,7 +90,7 @@
       "collection_template": "{bok_id}-knowledge",
       "query_template": "I need information about Liberating Structures suitable for a {workshop_type} for {audience_size} people held by {role} for {duration} in order to {purpose}.",
       "n_results": 10,
-      "max_context_chars": 30000,
+      "max_context_chars": 95000,
       "output_key": "knowledge_docs"
     },
     {
