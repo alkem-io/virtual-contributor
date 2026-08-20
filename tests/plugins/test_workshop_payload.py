@@ -223,6 +223,73 @@ class TestStructuredParseFailureLogging:
         assert "response_chars=" in log_text
 
 
+class TestWorkshopPayloadSlotRecovery:
+    async def test_complete_true_omitted_slot_recovers_default_one_store_query(self):
+        """A `complete: true` model reply that drops one of the five
+        required slots must not raise `PromptGraphConfigError` inside
+        `_make_retrieve_node` — the payload schema requires every slot, so
+        the parse failure lands in `_recover_fields`, which fills the
+        missing slot with its type default, and the flow completes with
+        exactly ONE store query (not retried across 3 RabbitMQ attempts)."""
+        payload = _load_shipped_payload()
+        store = MockKnowledgeStorePort()
+        store.collections["ls-101-knowledge"] = [
+            {"document": "LS: 1-2-4-All is a facilitation technique.", "metadata": {"embeddingType": "chunk"}, "id": "1"},
+        ]
+        plugin = _make_plugin(store)
+        ScriptedChatModel.responses = [
+            # `purpose` is entirely omitted, not merely null.
+            json.dumps({
+                "role": "facilitator", "duration": "2 hours",
+                "workshop_type": "in-person", "audience_size": 20,
+                "question": "unused", "complete": True,
+            }),
+            json.dumps({"action": "generate"}),
+            "## Workshop Design\n\nUse 1-2-4-All to kick things off.",
+        ]
+        event = make_input(
+            message="Generate a workshop design for me.",
+            promptGraph=payload,
+            bodyOfKnowledgeID="ls-101",
+        )
+        result = await plugin.handle(event)
+        assert isinstance(result, Response)
+        assert result.result == "## Workshop Design\n\nUse 1-2-4-All to kick things off."
+        assert len(store.query_calls) == 1
+
+    async def test_complete_false_omitted_question_still_answers_member(self):
+        """A `complete: false` reply that renames the canonical `question`
+        key (e.g. a terse model writing `question_text` instead) previously
+        parsed cleanly against the old nullable/not-required schema — the
+        canonical field landed as `None`, silently, with nothing logged, and
+        the member got a blank reply despite the model having written a
+        real clarifying question. Now that `question` is required, the
+        strict parse fails and best-effort recovery's `_text`-alias walk
+        finds the model's actual text and the member gets it verbatim."""
+        payload = _load_shipped_payload()
+        store = MockKnowledgeStorePort()
+        plugin = _make_plugin(store)
+        ScriptedChatModel.responses = [
+            json.dumps({
+                "role": None, "duration": None, "workshop_type": None,
+                "purpose": None, "audience_size": None,
+                "complete": False,
+                # Model wrote the clarifying text under a near-miss key
+                # instead of the canonical `question` field.
+                "question_text": "How long should the workshop be?",
+            }),
+        ]
+        event = make_input(
+            message="I want to run a workshop.",
+            promptGraph=payload,
+            bodyOfKnowledgeID="ls-101",
+        )
+        result = await plugin.handle(event)
+        assert isinstance(result, Response)
+        assert result.result == "How long should the workshop be?"
+        assert store.query_calls == []
+
+
 class TestWorkshopPayloadRecovery:
     async def test_missing_complete_field_recovers_to_false_clarify_path(self):
         """RK-2: a check_input reply missing the required `complete` field

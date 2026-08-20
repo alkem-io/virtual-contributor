@@ -27,15 +27,15 @@
       "output": {
         "type": "object",
         "properties": {
-          "role": {"type": ["string", "null"], "description": "The role of the workshop creator/facilitator in the organisation."},
-          "duration": {"type": ["string", "null"], "description": "The duration of the workshop."},
-          "workshop_type": {"type": ["string", "null"], "description": "The type of the workshop - in-person, online, etc."},
-          "purpose": {"type": ["string", "null"], "description": "The purpose/goal of the workshop."},
-          "audience_size": {"type": ["integer", "null"], "description": "The size of the audience of the workshop."},
-          "question": {"type": ["string", "null"], "description": "A question asking the workshop creator to provide a missing key variable."},
+          "role": {"type": "string", "description": "The role of the workshop creator/facilitator in the organisation."},
+          "duration": {"type": "string", "description": "The duration of the workshop."},
+          "workshop_type": {"type": "string", "description": "The type of the workshop - in-person, online, etc."},
+          "purpose": {"type": "string", "description": "The purpose/goal of the workshop."},
+          "audience_size": {"type": "integer", "description": "The size of the audience of the workshop."},
+          "question": {"type": "string", "description": "A question asking the workshop creator to provide a missing key variable."},
           "complete": {"type": "boolean", "description": "True when all five data points are present."}
         },
-        "required": ["complete"]
+        "required": ["role", "duration", "workshop_type", "purpose", "audience_size", "question", "complete"]
       }
     },
     {
