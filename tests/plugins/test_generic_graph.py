@@ -224,6 +224,54 @@ class TestGenericGraphPath:
         assert llm.calls == []
         assert store.query_calls == []
 
+    async def test_malformed_node_entry_raises_named_config_error_no_store(self):
+        """A bare string in `nodes` (instead of a dict) previously produced
+        a named `PromptGraphConfigError` from `from_definition`'s own
+        `"name" not in node_def` guard. Hoisting `has_retrieve_node` to scan
+        the raw payload unconditionally (for the tenancy/embeddings
+        pre-checks) must stay defensive against exactly this malformed
+        shape — a `.get()` call on a plain string raises `AttributeError`
+        instead, losing the construct-naming guarantee (SC-004). Must still
+        surface a named `PromptGraphConfigError`, not an `AttributeError`."""
+        from core.domain.prompt_graph import PromptGraphConfigError
+
+        llm = MockLLMPort(response="unused")
+        plugin = GenericPlugin(llm=llm, knowledge_store=None)
+        event = make_input(
+            promptGraph={
+                "nodes": ["load"],
+                "edges": [{"from": "START", "to": "load"}, {"from": "load", "to": "END"}],
+                "state": {"type": "object", "properties": {}},
+            },
+        )
+        with pytest.raises(PromptGraphConfigError, match="load") as excinfo:
+            await plugin.handle(event)
+        assert not isinstance(excinfo.value, AttributeError)
+
+    async def test_malformed_node_entry_raises_named_config_error_with_store(self):
+        """Same malformed shape, but with a knowledge store configured —
+        the hoisted scan runs inside the `if self._knowledge_store is not
+        None` branch's sibling checks too, so both configurations must fall
+        through to `from_definition`'s named rejection rather than raising
+        `AttributeError` from the retrieve-node scan itself."""
+        from core.domain.prompt_graph import PromptGraphConfigError
+
+        llm = MockLLMPort(response="unused")
+        store = MockKnowledgeStorePort()
+        plugin = GenericPlugin(llm=llm, knowledge_store=store)
+        event = make_input(
+            promptGraph={
+                "nodes": ["load"],
+                "edges": [{"from": "START", "to": "load"}, {"from": "load", "to": "END"}],
+                "state": {"type": "object", "properties": {}},
+            },
+            bodyOfKnowledgeID="ls-101",
+        )
+        with pytest.raises(PromptGraphConfigError, match="load") as excinfo:
+            await plugin.handle(event)
+        assert not isinstance(excinfo.value, AttributeError)
+        assert store.query_calls == []
+
     async def test_no_retrieve_node_still_works_without_bok_id(self):
         """Regression guard: a graph with no retrieve node has nothing to
         scope, so an absent `bodyOfKnowledgeID` must not be affected by the

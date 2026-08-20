@@ -162,9 +162,18 @@ class GenericPlugin:
         # scoped to the caller's own body of knowledge.
         bok_id = event.body_of_knowledge_id or ""
 
+        # A malformed node entry (e.g. a bare string in `nodes` instead of a
+        # dict) must fall through to `PromptGraph.from_definition`, which
+        # owns the named-rejection contract for such entries (SC-004) — not
+        # blow up here as a raw AttributeError from `.get()` on a non-dict.
+        # This scan only needs to know whether ANY retrieve node might be
+        # present to decide the tenancy/embeddings pre-checks below; a
+        # malformed entry is conservatively not a retrieve node and is left
+        # for `from_definition` to reject by name.
         has_retrieve_node = any(
             n.get("type") == "retrieve"
             for n in prompt_graph.get("nodes", [])
+            if isinstance(n, dict)
         )
         # A retrieve-bearing payload with no `bodyOfKnowledgeID` has no
         # tenant to scope its query to. Falling back to a fixed
