@@ -173,6 +173,32 @@ class TestRetrieveNode:
         graph = PromptGraph.from_definition(_retrieve_definition())
         graph.compile(llm=ScriptedLLM(), retriever=FakeRetriever())
 
+    def test_collection_template_format_spec_on_bok_id_rejected(self):
+        """`{bok_id:.0}` names only the allowed variable, but a format spec
+        renders it to a different string than the plain identifier — this
+        must be rejected at parse time, not silently accepted because the
+        variable *name* passed the allowlist check."""
+        definition = _retrieve_definition(
+            collection_template="{bok_id:.0}victim-bok-knowledge"
+        )
+        with pytest.raises(PromptGraphConfigError, match="bok_id"):
+            PromptGraph.from_definition(definition)
+
+    def test_collection_template_conversion_on_bok_id_rejected(self):
+        """`{bok_id!r}` likewise renders differently (repr) than the plain
+        identifier and must be rejected at parse time."""
+        definition = _retrieve_definition(collection_template="{bok_id!r}")
+        with pytest.raises(PromptGraphConfigError, match="bok_id"):
+            PromptGraph.from_definition(definition)
+
+    def test_collection_template_legit_bok_id_suffix_still_allowed(self):
+        """Regression guard: an unmodified `{bok_id}` with a literal suffix
+        (no format spec, no conversion) still parses fine."""
+        graph = PromptGraph.from_definition(
+            _retrieve_definition(collection_template="{bok_id}-knowledge")
+        )
+        graph.compile(llm=ScriptedLLM(), retriever=FakeRetriever())
+
     async def test_retrieve_node_enforces_context_budget_on_oversized_docs(self):
         """Unlike every other retrieval path, the retrieve node previously
         joined documents with no context budget. Oversized results must be

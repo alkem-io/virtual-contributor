@@ -82,10 +82,10 @@ parse failure) and the parsed fields are merged into state. Without
 
 | Field | Required | Notes |
 |---|---|---|
-| `collection_template` | yes | may reference **only** `{bok_id}` — the engine-seeded body-of-knowledge id; any other variable is a configuration error at parse time (tenancy boundary, not a formatting concern) |
+| `collection_template` | yes | may reference **only** `{bok_id}`, unmodified — the engine-seeded body-of-knowledge id; any other variable, or a format spec/conversion on `{bok_id}` itself (e.g. `{bok_id:.0}`, `{bok_id!r}`), is a configuration error at parse time (tenancy boundary, not a formatting concern) |
 | `query_template` | yes | filled with state values, single pass |
 | `n_results` | no (default `10`) | integer, **must be in `[1, 50]`** — out of range is a configuration error at parse time, never silently clamped |
-| `max_context_chars` | no (default `20000`) | integer, **must be in `[1000, 60000]`** — out of range or wrong type is a configuration error at parse time, never silently clamped. Per-node override of the join budget below; the range keeps it a real budget (floor) and a real security control (ceiling), not an unbounded escape hatch. |
+| `max_context_chars` | no (default `20000`) | integer, **must be in `[1000, 120000]`** — out of range or wrong type is a configuration error at parse time, never silently clamped. Per-node override of the join budget below; the range keeps it a real budget (floor) and a real security control (ceiling), not an unbounded escape hatch. |
 | `output_key` | no (default `"knowledge_docs"`) | where the joined document text is written |
 | `input_variables` | no | accepted for documentation only — **not load-bearing**. Template variables are discovered by parsing `collection_template`/`query_template` themselves. |
 

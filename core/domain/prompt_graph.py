@@ -838,9 +838,9 @@ class PromptGraph:
                 # another tenant's knowledge-store collection. Rejected here,
                 # at parse time, before any store query is possible.
                 formatter = string.Formatter()
+                parsed_fields = list(formatter.parse(collection_template))
                 collection_vars = {
-                    name for _, name, _, _ in formatter.parse(collection_template)
-                    if name
+                    name for _, name, _, _ in parsed_fields if name
                 }
                 disallowed = collection_vars - _ALLOWED_COLLECTION_TEMPLATE_VARS
                 if disallowed:
@@ -850,6 +850,22 @@ class PromptGraph:
                         f"{sorted(_ALLOWED_COLLECTION_TEMPLATE_VARS)}, "
                         f"found disallowed variable(s) {sorted(disallowed)}"
                     )
+                # A format spec or conversion on `{bok_id}` (e.g.
+                # `{bok_id:.0}` or `{bok_id!r}`) still passes the name-only
+                # check above while rendering to a different string than the
+                # plain identifier. The engine ignores the rendered value
+                # today, but nothing should depend on that staying true —
+                # reject any spec/conversion here, at parse time, so the
+                # only way `{bok_id}` can appear is unmodified.
+                for _, field_name, format_spec, conversion in parsed_fields:
+                    if field_name is None:
+                        continue
+                    if format_spec not in (None, "") or conversion is not None:
+                        raise PromptGraphConfigError(
+                            f"retrieve node '{node_name}': "
+                            f"collection_template field '{{{field_name}}}' "
+                            "must not use a format spec or conversion"
+                        )
             if node_type == "echo" and not node_def.get("source"):
                 raise PromptGraphConfigError(
                     f"echo node '{node_name}' requires a non-empty 'source'"
