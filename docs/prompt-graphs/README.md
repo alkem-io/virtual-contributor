@@ -34,6 +34,15 @@ undeclared key is correct behaviour.
 list form (`[{"name": ..., "type": ..., "optional": ...}, ...]`) — both are
 normalised identically, unchanged from before this feature.
 
+**Size limits.** `nodes` is capped at 50 entries and `edges` at 100 —
+exceeding either is a `PromptGraphConfigError` at parse time, before any
+node is compiled or any LLM/retrieve call is possible. Each node can be an
+LLM or knowledge-store invocation, and a single LangGraph superstep can run
+many nodes at once, so an unbounded payload would otherwise let one inbound
+message trigger an unbounded burst of provider calls. Every existing
+payload (the shipped `workshop-design.json`, expert's own graphs) is a
+handful of nodes, well under the cap.
+
 ## Node types
 
 Every node has a `type` field. It defaults to `"llm"` and may be omitted for
@@ -66,6 +75,7 @@ parse failure) and the parsed fields are merged into state. Without
   "collection_template": "{bok_id}-knowledge",
   "query_template": "info about {topic}",
   "n_results": 10,
+  "max_context_chars": 20000,
   "output_key": "knowledge_docs"
 }
 ```
@@ -75,6 +85,7 @@ parse failure) and the parsed fields are merged into state. Without
 | `collection_template` | yes | may reference **only** `{bok_id}` — the engine-seeded body-of-knowledge id; any other variable is a configuration error at parse time (tenancy boundary, not a formatting concern) |
 | `query_template` | yes | filled with state values, single pass |
 | `n_results` | no (default `10`) | integer, **must be in `[1, 50]`** — out of range is a configuration error at parse time, never silently clamped |
+| `max_context_chars` | no (default `20000`) | integer, **must be in `[1000, 60000]`** — out of range or wrong type is a configuration error at parse time, never silently clamped. Per-node override of the join budget below; the range keeps it a real budget (floor) and a real security control (ceiling), not an unbounded escape hatch. |
 | `output_key` | no (default `"knowledge_docs"`) | where the joined document text is written |
 | `input_variables` | no | accepted for documentation only — **not load-bearing**. Template variables are discovered by parsing `collection_template`/`query_template` themselves. |
 
@@ -93,11 +104,18 @@ Behaviour:
   summaries) — this filter is **not** payload-configurable.
 - Results are combined as a plain `"\n\n"` join of the returned document
   texts, in store order — no numbered blocks, no source labels, no
-  score-threshold filtering. The join is budgeted at the repo's standard
-  `max_context_chars` (20,000 characters): trailing documents are dropped
-  once the budget is spent, mirroring every other retrieval path in the
-  repo (expert, guidance). A single document that alone exceeds the budget
-  is still returned rather than dropped to empty.
+  score-threshold filtering. The join is budgeted at `max_context_chars`
+  (default 20,000 characters, payload-settable per node in `[1000, 60000]`
+  — see the field table above): trailing documents are dropped once the
+  budget is spent, mirroring every other retrieval path in the repo
+  (expert, guidance). A single document that alone exceeds the budget is
+  still returned rather than dropped to empty. A truncation still drops
+  the warning log line (node name + kept/dropped chunk counts) so it stays
+  observable; widen `max_context_chars` on that node if the full result
+  set should survive — e.g. the shipped `workshop-design.json` sets
+  `max_context_chars: 30000` on both `retrieve_refine`/`retrieve_generate`
+  so their `n_results: 10` result set fits whole at the repo's default
+  ingest chunk size, matching FR-002's "documents are used as returned".
 - The collection actually queried is always derived server-side from
   `Input.bodyOfKnowledgeID` — never the payload's rendered
   `collection_template` value — closing the gap where a payload's own

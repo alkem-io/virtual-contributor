@@ -200,6 +200,82 @@ class TestRetrieveNode:
         final = await graph.invoke({"bok_id": "ls-101", "topic": "facilitation"})
         assert final["knowledge_docs"] == huge_doc
 
+    def test_max_context_chars_out_of_range_rejected_at_parse_time(self):
+        with pytest.raises(PromptGraphConfigError, match="max_context_chars"):
+            PromptGraph.from_definition(
+                _retrieve_definition(max_context_chars=999)
+            )
+        with pytest.raises(PromptGraphConfigError, match="max_context_chars"):
+            PromptGraph.from_definition(
+                _retrieve_definition(max_context_chars=60_001)
+            )
+
+    def test_max_context_chars_wrong_type_rejected_at_parse_time(self):
+        with pytest.raises(PromptGraphConfigError, match="max_context_chars"):
+            PromptGraph.from_definition(
+                _retrieve_definition(max_context_chars="20000")
+            )
+        with pytest.raises(PromptGraphConfigError, match="max_context_chars"):
+            PromptGraph.from_definition(
+                _retrieve_definition(max_context_chars=1000.5)
+            )
+        with pytest.raises(PromptGraphConfigError, match="max_context_chars"):
+            PromptGraph.from_definition(
+                _retrieve_definition(max_context_chars=True)
+            )
+
+    async def test_custom_max_context_chars_honoured(self):
+        """A payload-declared budget larger than the default lets a full
+        result set that would otherwise be truncated pass through whole
+        (FR-002 — documents are used as returned)."""
+        doc = "x" * 2_500
+        docs = [doc] * 10  # 10 * 2500 + 9 separators ≈ 25_018 chars
+        retriever = FakeRetriever(docs=docs)
+        definition = _retrieve_definition(max_context_chars=30_000)
+        graph = PromptGraph.from_definition(definition)
+        graph.compile(llm=ScriptedLLM(), retriever=retriever)
+        final = await graph.invoke({"bok_id": "ls-101", "topic": "facilitation"})
+        assert final["knowledge_docs"].count(doc) == 10
+
+    async def test_default_max_context_chars_unchanged_at_20000(self):
+        """No explicit `max_context_chars` in the payload still budgets at
+        the pre-existing 20,000-char default — a regression guard."""
+        big_doc = "x" * 15_000
+        retriever = FakeRetriever(docs=[big_doc, big_doc, big_doc])
+        graph = PromptGraph.from_definition(_retrieve_definition())
+        graph.compile(llm=ScriptedLLM(), retriever=retriever)
+        final = await graph.invoke({"bok_id": "ls-101", "topic": "facilitation"})
+        assert final["knowledge_docs"] == big_doc
+
+    async def test_shipped_workshop_payload_full_result_set_survives_whole(self):
+        """The shipped `workshop-design.json` retrieve nodes request
+        `n_results=10`; at the repo's default ingest chunk size (2500
+        chars) a full result set is ~25,000 chars. Its
+        `max_context_chars: 30000` override must let all 10 chunks survive
+        un-truncated on the headline US2-AS2 scenario."""
+        import json
+        from pathlib import Path
+
+        payload = json.loads(
+            (
+                Path(__file__).resolve().parents[3]
+                / "docs" / "prompt-graphs" / "workshop-design.json"
+            ).read_text()
+        )
+        retrieve_nodes = [
+            n for n in payload["nodes"] if n.get("type") == "retrieve"
+        ]
+        assert retrieve_nodes, "expected at least one retrieve node"
+        for node_def in retrieve_nodes:
+            assert node_def["n_results"] == 10
+            chunk_size = 2_500
+            docs = [("x" * chunk_size)] * node_def["n_results"]
+            budget = node_def.get("max_context_chars", 20_000)
+            joined = PromptGraph._join_docs_within_budget(
+                docs, budget, node_def["name"]
+            )
+            assert joined.count("x" * chunk_size) == 10
+
     async def test_input_variables_field_is_documentation_only(self):
         """An `input_variables` list on a retrieve node must not be
         load-bearing — variables are discovered from the templates."""

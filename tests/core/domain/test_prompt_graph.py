@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import pytest
 
-from core.domain.prompt_graph import Edge, Node, PromptGraph
+from core.domain.prompt_graph import (
+    Edge,
+    Node,
+    PromptGraph,
+    PromptGraphConfigError,
+)
 
 
 class TestPromptGraphStructure:
@@ -408,3 +413,60 @@ class TestStateToDictAndWrappers:
         # Verify the model can be used to validate data
         instance = model(result="hello")
         assert instance.model_dump()["result"] == "hello"
+
+
+# ---------------------------------------------------------------------------
+# from_definition — graph size caps (sec-vc-5)
+# ---------------------------------------------------------------------------
+
+
+def _chain_definition(node_count: int, edge_count: int | None = None) -> dict:
+    """A minimal valid `node_count`-node chain, all `llm` type.
+
+    Each node is a trivial passthrough; edges chain START -> n0 -> n1 ->
+    ... -> END. If `edge_count` is given and exceeds the natural chain
+    length, the excess is padded with harmless duplicate edges (from the
+    last real node to itself's successor) so only edge COUNT is exercised,
+    not edge semantics.
+    """
+    names = [f"n{i}" for i in range(node_count)]
+    nodes = [
+        {"name": name, "input_variables": [], "prompt": "noop", "output": {}}
+        for name in names
+    ]
+    edges = [{"from": "START", "to": names[0]}] if names else []
+    for a, b in zip(names, names[1:]):
+        edges.append({"from": a, "to": b})
+    if names:
+        edges.append({"from": names[-1], "to": "END"})
+    if edge_count is not None:
+        while len(edges) < edge_count:
+            # Harmless duplicate — from_definition does not dedupe edges.
+            edges.append(edges[-1])
+        edges = edges[:edge_count] if len(edges) > edge_count else edges
+    state_props = {name: {"type": "string"} for name in names}
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "state": {"type": "object", "properties": state_props},
+    }
+
+
+class TestGraphSizeCaps:
+    def test_node_count_exceeding_max_rejected_at_parse_time(self):
+        definition = _chain_definition(node_count=51)
+        with pytest.raises(PromptGraphConfigError, match="51"):
+            PromptGraph.from_definition(definition)
+
+    def test_edge_count_exceeding_max_rejected_at_parse_time(self):
+        definition = _chain_definition(node_count=2, edge_count=101)
+        with pytest.raises(PromptGraphConfigError, match="101"):
+            PromptGraph.from_definition(definition)
+
+    def test_graph_at_node_and_edge_bound_still_parses(self):
+        """A graph right at the 50-node / 100-edge bound must still be
+        accepted — the cap rejects only what exceeds it."""
+        definition = _chain_definition(node_count=50, edge_count=100)
+        graph = PromptGraph.from_definition(definition)
+        assert len(graph.nodes) == 50
+        assert len(graph.edges) == 100

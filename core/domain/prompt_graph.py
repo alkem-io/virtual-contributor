@@ -33,14 +33,36 @@ _MAX_LOGGED_VALUE_CHARS = 64
 #: rejected before any store query is ever made.
 _ALLOWED_COLLECTION_TEMPLATE_VARS = frozenset({"bok_id"})
 
-#: Context budget applied to documents joined by a declarative `retrieve`
-#: node, mirroring the `max_context_chars` idiom every other retrieval path
-#: in this repo enforces (`core/config.py`, `core/domain/routing.py`,
-#: `plugins/expert/plugin.py`, `plugins/guidance/plugin.py`). The graph
-#: domain object takes no config injection seam, so this is the same
-#: default value repeated as a local constant rather than threaded through
-#: `compile()`/`from_definition()` for a single declarative node type.
-_RETRIEVE_MAX_CONTEXT_CHARS = 20_000
+#: Default context budget applied to documents joined by a declarative
+#: `retrieve` node, mirroring the `max_context_chars` idiom every other
+#: retrieval path in this repo enforces (`core/config.py`,
+#: `core/domain/routing.py`, `plugins/expert/plugin.py`,
+#: `plugins/guidance/plugin.py`). A payload may override this per node via
+#: the optional `max_context_chars` field (bounded by the min/max below) —
+#: the fixed 20,000-char default silently dropped trailing documents on a
+#: full `n_results=10` result set at the repo's default ingest chunk size,
+#: so a node whose own retrieval volume needs a larger budget can say so
+#: explicitly rather than lose documents FR-002 says are "used as returned".
+_RETRIEVE_MAX_CONTEXT_CHARS_DEFAULT = 20_000
+
+#: Bounds for a payload's per-node `max_context_chars` override. The floor
+#: keeps the budget a real budget (not effectively unlimited for small
+#: values); the ceiling keeps it a security control — the field lets a
+#: payload widen the context sent to the next LLM call, so it stays capped
+#: rather than becoming an unbounded escape hatch from the budget entirely.
+_RETRIEVE_MAX_CONTEXT_CHARS_MIN = 1_000
+_RETRIEVE_MAX_CONTEXT_CHARS_MAX = 60_000
+
+#: Parse-time caps on total graph size. A declarative payload with no
+#: node/edge ceiling could fan out to hundreds of nodes, each one an LLM or
+#: retrieve invocation — a single superstep can run many nodes, so an
+#: unbounded node count is effectively an unbounded burst of provider calls
+#: and knowledge-store queries per inbound message. Sized well above the
+#: shipped workshop-design payload (a handful of nodes) and any plausible
+#: hand-authored graph, while still refusing a runaway fan-out payload at
+#: parse time rather than mid-execution.
+_MAX_GRAPH_NODES = 50
+_MAX_GRAPH_EDGES = 100
 
 #: Recursion ceiling passed to every graph run. A declarative conditional
 #: edge whose ``map``/``default`` routes back to an already-visited node
@@ -103,6 +125,7 @@ class Node:
     n_results: int = 10
     output_key: str = "knowledge_docs"
     source: str = ""
+    max_context_chars: int = _RETRIEVE_MAX_CONTEXT_CHARS_DEFAULT
 
 
 @dataclass
@@ -488,7 +511,9 @@ class PromptGraph:
         return router
 
     @staticmethod
-    def _join_docs_within_budget(docs: list[str], max_chars: int) -> str:
+    def _join_docs_within_budget(
+        docs: list[str], max_chars: int, node_name: str
+    ) -> str:
         """Join retrieved documents with the repo's `"\n\n"` separator,
         dropping trailing documents once the budget is exceeded.
 
@@ -499,7 +524,8 @@ class PromptGraph:
         the same character-budget idiom (`max_context_chars`) every other
         retrieval path in the repo already enforces; without it, a payload
         that widens `n_results` can push unbounded document text into the
-        next LLM prompt.
+        next LLM prompt. The budget itself is per-node and payload-settable
+        (`Node.max_context_chars`) — the caller passes the resolved value in.
         """
         kept: list[str] = []
         accumulated = 0
@@ -521,8 +547,9 @@ class PromptGraph:
         dropped = len(docs) - len(kept)
         if dropped:
             logger.warning(
-                "retrieve node context budget exceeded: dropped %d chunks",
-                dropped,
+                "retrieve node '%s' context budget exceeded: kept %d, "
+                "dropped %d chunks",
+                node_name, len(kept), dropped,
             )
         return INTER_BLOCK_SEPARATOR.join(kept)
 
@@ -571,7 +598,7 @@ class PromptGraph:
             docs = await retriever(collection, query, node.n_results)
             combined = (
                 PromptGraph._join_docs_within_budget(
-                    docs, _RETRIEVE_MAX_CONTEXT_CHARS
+                    docs, node.max_context_chars, node.name
                 )
                 if docs else ""
             )
@@ -724,8 +751,21 @@ class PromptGraph:
         :class:`PromptGraphConfigError` naming the offending construct
         (FR-001/FR-002/FR-003 parse side; spec edge cases).
         """
+        raw_nodes = definition.get("nodes", [])
+        if len(raw_nodes) > _MAX_GRAPH_NODES:
+            raise PromptGraphConfigError(
+                f"graph definition declares {len(raw_nodes)} nodes, "
+                f"exceeding the maximum of {_MAX_GRAPH_NODES}"
+            )
+        raw_edges = definition.get("edges", [])
+        if len(raw_edges) > _MAX_GRAPH_EDGES:
+            raise PromptGraphConfigError(
+                f"graph definition declares {len(raw_edges)} edges, "
+                f"exceeding the maximum of {_MAX_GRAPH_EDGES}"
+            )
+
         nodes: dict[str, Node] = {}
-        for node_def in definition.get("nodes", []):
+        for node_def in raw_nodes:
             if "name" not in node_def or not node_def["name"]:
                 raise PromptGraphConfigError(
                     "node definition is missing a required 'name' field: "
@@ -749,6 +789,30 @@ class PromptGraph:
                     raise PromptGraphConfigError(
                         f"retrieve node '{node_name}': "
                         f"n_results {n_results!r} is out of range [1, 50]"
+                    )
+            max_context_chars = node_def.get(
+                "max_context_chars", _RETRIEVE_MAX_CONTEXT_CHARS_DEFAULT
+            )
+            if node_type == "retrieve":
+                if (
+                    not isinstance(max_context_chars, int)
+                    or isinstance(max_context_chars, bool)
+                ):
+                    raise PromptGraphConfigError(
+                        f"retrieve node '{node_name}': max_context_chars "
+                        f"{max_context_chars!r} must be an integer, got "
+                        f"{type(max_context_chars).__name__}"
+                    )
+                if not (
+                    _RETRIEVE_MAX_CONTEXT_CHARS_MIN
+                    <= max_context_chars
+                    <= _RETRIEVE_MAX_CONTEXT_CHARS_MAX
+                ):
+                    raise PromptGraphConfigError(
+                        f"retrieve node '{node_name}': max_context_chars "
+                        f"{max_context_chars!r} is out of range "
+                        f"[{_RETRIEVE_MAX_CONTEXT_CHARS_MIN}, "
+                        f"{_RETRIEVE_MAX_CONTEXT_CHARS_MAX}]"
                     )
             collection_template = node_def.get("collection_template", "")
             if node_type == "retrieve":
@@ -795,6 +859,7 @@ class PromptGraph:
                 n_results=n_results,
                 output_key=node_def.get("output_key", "knowledge_docs"),
                 source=node_def.get("source", ""),
+                max_context_chars=max_context_chars,
             )
             nodes[node.name] = node
 
@@ -809,7 +874,7 @@ class PromptGraph:
         edges: list[Edge] = []
         conditional_edges: list[ConditionalEdge] = []
         conditional_sources: set[str] = set()
-        for edge_def in definition.get("edges", []):
+        for edge_def in raw_edges:
             if "on" in edge_def or "map" in edge_def:
                 from_node = edge_def.get("from", "START")
                 if "on" not in edge_def or not edge_def["on"]:
