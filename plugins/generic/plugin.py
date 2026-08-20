@@ -124,13 +124,25 @@ class GenericPlugin:
         """
         from core.domain.prompt_graph import PromptGraph
 
+        # Resolved server-side, exactly once, the same way expert's `collection`
+        # is computed in `handle()` — never from the graph's rendered
+        # `collection_template` argument. `collection_template` may only
+        # reference `{bok_id}` (enforced at PromptGraph parse time), but a
+        # payload's own nodes can still overwrite the `bok_id` *state* value
+        # before a retrieve node runs (e.g. an upstream LLM node's structured
+        # output). Ignoring the retriever's `collection` argument entirely
+        # closes that gap: whatever the payload computes, retrieval is always
+        # scoped to the caller's own body of knowledge.
+        bok_id = event.body_of_knowledge_id or ""
+        collection_name = f"{bok_id}-knowledge" if bok_id else "default-knowledge"
+
         retriever = None
         if self._knowledge_store is not None:
             store = self._knowledge_store
 
             async def _retrieve(collection: str, query: str, n_results: int) -> list[str]:
                 result = await store.query(
-                    collection, [query], n_results=n_results, where=FACTUAL_WHERE,
+                    collection_name, [query], n_results=n_results, where=FACTUAL_WHERE,
                 )
                 return result.documents[0] if result.documents else []
 

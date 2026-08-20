@@ -112,6 +112,56 @@ class TestRetrieveNode:
         with pytest.raises(PromptGraphConfigError, match="bogus"):
             PromptGraph.from_definition(definition)
 
+    def test_collection_template_disallowed_variable_rejected_at_parse_time(self):
+        """A payload cannot address an arbitrary collection: naming any
+        variable other than the server-supplied `bok_id` in
+        `collection_template` is a parse-time configuration error, not a
+        runtime value the retriever ever sees."""
+        definition = _retrieve_definition(
+            collection_template="{victim_space_id}-knowledge"
+        )
+        with pytest.raises(PromptGraphConfigError, match="victim_space_id"):
+            PromptGraph.from_definition(definition)
+
+    def test_collection_template_mixing_bok_id_with_disallowed_variable_rejected(self):
+        definition = _retrieve_definition(
+            collection_template="{bok_id}-{topic}-knowledge"
+        )
+        with pytest.raises(PromptGraphConfigError, match="topic"):
+            PromptGraph.from_definition(definition)
+
+    def test_collection_template_bok_id_only_still_allowed(self):
+        """Regression guard: the one legitimate shape still parses fine."""
+        graph = PromptGraph.from_definition(_retrieve_definition())
+        graph.compile(llm=ScriptedLLM(), retriever=FakeRetriever())
+
+    async def test_retrieve_node_enforces_context_budget_on_oversized_docs(self):
+        """Unlike every other retrieval path, the retrieve node previously
+        joined documents with no context budget. Oversized results must be
+        truncated to the repo's 20_000-char idiom, not pushed whole into the
+        next LLM prompt."""
+        big_doc = "x" * 15_000
+        retriever = FakeRetriever(docs=[big_doc, big_doc, big_doc])
+        graph = PromptGraph.from_definition(_retrieve_definition())
+        graph.compile(llm=ScriptedLLM(), retriever=retriever)
+        final = await graph.invoke({"bok_id": "ls-101", "topic": "facilitation"})
+        assert len(final["knowledge_docs"]) <= 20_000
+        # First doc alone (15_000 chars) fits; the second would push the
+        # running total over budget with its doc + separator, so only one
+        # of the three oversized docs survives.
+        assert final["knowledge_docs"] == big_doc
+
+    async def test_single_oversized_doc_still_returned_alone(self):
+        """A single document that alone exceeds the budget still comes
+        through rather than being silently dropped to empty — that would
+        look indistinguishable from a failed/empty retrieval."""
+        huge_doc = "x" * 25_000
+        retriever = FakeRetriever(docs=[huge_doc])
+        graph = PromptGraph.from_definition(_retrieve_definition())
+        graph.compile(llm=ScriptedLLM(), retriever=retriever)
+        final = await graph.invoke({"bok_id": "ls-101", "topic": "facilitation"})
+        assert final["knowledge_docs"] == huge_doc
+
     async def test_input_variables_field_is_documentation_only(self):
         """An `input_variables` list on a retrieve node must not be
         load-bearing — variables are discovered from the templates."""

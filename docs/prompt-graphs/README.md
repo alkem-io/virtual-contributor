@@ -72,7 +72,7 @@ parse failure) and the parsed fields are merged into state. Without
 
 | Field | Required | Notes |
 |---|---|---|
-| `collection_template` | yes | filled with state values, single pass |
+| `collection_template` | yes | may reference **only** `{bok_id}` — the engine-seeded body-of-knowledge id; any other variable is a configuration error at parse time (tenancy boundary, not a formatting concern) |
 | `query_template` | yes | filled with state values, single pass |
 | `n_results` | no (default `10`) | integer, **must be in `[1, 50]`** — out of range is a configuration error at parse time, never silently clamped |
 | `output_key` | no (default `"knowledge_docs"`) | where the joined document text is written |
@@ -93,7 +93,16 @@ Behaviour:
   summaries) — this filter is **not** payload-configurable.
 - Results are combined as a plain `"\n\n"` join of the returned document
   texts, in store order — no numbered blocks, no source labels, no
-  score-threshold filtering.
+  score-threshold filtering. The join is budgeted at the repo's standard
+  `max_context_chars` (20,000 characters): trailing documents are dropped
+  once the budget is spent, mirroring every other retrieval path in the
+  repo (expert, guidance). A single document that alone exceeds the budget
+  is still returned rather than dropped to empty.
+- The collection actually queried is always derived server-side from
+  `Input.bodyOfKnowledgeID` — never the payload's rendered
+  `collection_template` value — closing the gap where a payload's own
+  upstream nodes could otherwise overwrite the `bok_id` state value before
+  the retrieve node runs.
 - No matching documents → `output_key` is set to `""` and the flow
   continues; this is not an error.
 - A store/embedding error propagates to the caller's standard error

@@ -11,6 +11,8 @@ from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph import StateGraph, END, START
 from pydantic import BaseModel
 
+from core.domain.prompts_shared import INTER_BLOCK_SEPARATOR
+
 logger = logging.getLogger(__name__)
 
 #: Value form bound in raised errors and log lines. A routing value can
@@ -19,6 +21,26 @@ logger = logging.getLogger(__name__)
 #: message or land verbatim, unbounded, in a log line (FR-009 — construct
 #: names and error types only, never member content).
 _MAX_LOGGED_VALUE_CHARS = 64
+
+#: The only template variable a `collection_template` may reference. It is
+#: sourced exclusively from the engine-seeded `bok_id` state key — itself
+#: taken from `Input.bodyOfKnowledgeID`, never from a member/LLM-derived
+#: field — the same tenancy binding the expert engine enforces server-side
+#: (plugins/expert/plugin.py). A payload naming any other variable there
+#: could otherwise address an arbitrary knowledge-store collection outside
+#: the caller's own body of knowledge; this is a parse-time configuration
+#: error, not a runtime authorization check, so a hostile payload is
+#: rejected before any store query is ever made.
+_ALLOWED_COLLECTION_TEMPLATE_VARS = frozenset({"bok_id"})
+
+#: Context budget applied to documents joined by a declarative `retrieve`
+#: node, mirroring the `max_context_chars` idiom every other retrieval path
+#: in this repo enforces (`core/config.py`, `core/domain/routing.py`,
+#: `plugins/expert/plugin.py`, `plugins/guidance/plugin.py`). The graph
+#: domain object takes no config injection seam, so this is the same
+#: default value repeated as a local constant rather than threaded through
+#: `compile()`/`from_definition()` for a single declarative node type.
+_RETRIEVE_MAX_CONTEXT_CHARS = 20_000
 
 
 class PromptGraphConfigError(ValueError):
@@ -441,6 +463,45 @@ class PromptGraph:
         return router
 
     @staticmethod
+    def _join_docs_within_budget(docs: list[str], max_chars: int) -> str:
+        """Join retrieved documents with the repo's `"\n\n"` separator,
+        dropping trailing documents once the budget is exceeded.
+
+        Unlike expert/guidance's rendered-block budgeting (which drops
+        lowest-scoring chunks first), a declarative retrieve node has no
+        per-document score — store order is the only ordering it has, so
+        documents are kept in that order until the budget is spent. This is
+        the same character-budget idiom (`max_context_chars`) every other
+        retrieval path in the repo already enforces; without it, a payload
+        that widens `n_results` can push unbounded document text into the
+        next LLM prompt.
+        """
+        kept: list[str] = []
+        accumulated = 0
+        for doc in docs:
+            # Cost of appending `doc`: its own chars, plus one more
+            # separator once a document already precedes it.
+            addition = len(doc) + (len(INTER_BLOCK_SEPARATOR) if kept else 0)
+            if accumulated + addition > max_chars:
+                if not kept:
+                    # A single oversized document still gets through alone —
+                    # matches "no answer is fabricated from a failed
+                    # retrieval": dropping everything would silently look
+                    # like empty retrieval rather than a budget cut.
+                    kept.append(doc)
+                    accumulated += addition
+                break
+            kept.append(doc)
+            accumulated += addition
+        dropped = len(docs) - len(kept)
+        if dropped:
+            logger.warning(
+                "retrieve node context budget exceeded: dropped %d chunks",
+                dropped,
+            )
+        return INTER_BLOCK_SEPARATOR.join(kept)
+
+    @staticmethod
     def _make_retrieve_node(node: Node, retriever: Callable) -> Callable:
         """Build a LangGraph node function for a declarative retrieve node.
 
@@ -483,7 +544,12 @@ class PromptGraph:
             query = node.query_template.format_map(values)
 
             docs = await retriever(collection, query, node.n_results)
-            combined = "\n\n".join(docs) if docs else ""
+            combined = (
+                PromptGraph._join_docs_within_budget(
+                    docs, _RETRIEVE_MAX_CONTEXT_CHARS
+                )
+                if docs else ""
+            )
             return {node.output_key: combined}
 
         return node_fn
@@ -641,13 +707,33 @@ class PromptGraph:
                     f"retrieve node '{node_def.get('name', '?')}': "
                     f"n_results {n_results!r} is out of range [1, 50]"
                 )
+            collection_template = node_def.get("collection_template", "")
+            if node_type == "retrieve":
+                # Collection scoping is a tenancy boundary, not a formatting
+                # concern: a payload naming any variable other than the
+                # server-supplied `bok_id` could otherwise point a query at
+                # another tenant's knowledge-store collection. Rejected here,
+                # at parse time, before any store query is possible.
+                formatter = string.Formatter()
+                collection_vars = {
+                    name for _, name, _, _ in formatter.parse(collection_template)
+                    if name
+                }
+                disallowed = collection_vars - _ALLOWED_COLLECTION_TEMPLATE_VARS
+                if disallowed:
+                    raise PromptGraphConfigError(
+                        f"retrieve node '{node_def.get('name', '?')}': "
+                        f"collection_template may only reference "
+                        f"{sorted(_ALLOWED_COLLECTION_TEMPLATE_VARS)}, "
+                        f"found disallowed variable(s) {sorted(disallowed)}"
+                    )
             node = Node(
                 name=node_def["name"],
                 input_variables=node_def.get("input_variables", []),
                 prompt=node_def.get("prompt", ""),
                 output_schema=node_def.get("output", {}),
                 type=node_type,
-                collection_template=node_def.get("collection_template", ""),
+                collection_template=collection_template,
                 query_template=node_def.get("query_template", ""),
                 n_results=n_results,
                 output_key=node_def.get("output_key", "knowledge_docs"),

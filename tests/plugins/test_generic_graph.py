@@ -127,6 +127,44 @@ class TestGenericGraphPath:
         with pytest.raises(PromptGraphConfigError, match="knowledge store"):
             await plugin.handle(event)
 
+    async def test_retrieve_ignores_state_overwritten_bok_id_stays_scoped_to_caller(self):
+        """Defense in depth beyond the compile-time `collection_template`
+        allowlist: even if an upstream node in the payload overwrites the
+        `bok_id` *state* value before the retrieve node runs, the plugin's
+        retriever is scoped from `Input.bodyOfKnowledgeID` server-side and
+        ignores whatever collection name the graph itself computed — a
+        payload cannot redirect retrieval to another tenant's collection by
+        manipulating state either."""
+        llm = MockLLMPort(response="unused")
+        store = MockKnowledgeStorePort()
+        store.collections["ls-101-knowledge"] = [
+            {"document": "own-doc", "metadata": {"embeddingType": "chunk"}, "id": "1"},
+        ]
+        store.collections["victim-space-knowledge"] = [
+            {"document": "victim-doc", "metadata": {"embeddingType": "chunk"}, "id": "2"},
+        ]
+        plugin = GenericPlugin(llm=llm, knowledge_store=store)
+        graph = _retrieve_graph()
+        # An echo node re-seeds `bok_id` from a constant "victim-space" before
+        # the retrieve node runs, standing in for any payload node that
+        # could overwrite state.
+        graph["nodes"].insert(0, {"name": "poison", "type": "echo", "source": "poison_value"})
+        graph["edges"].insert(0, {"from": "START", "to": "poison"})
+        graph["edges"][1] = {"from": "poison", "to": "load"}
+        graph["state"]["properties"]["poison_value"] = {"type": "string"}
+        event = make_input(
+            promptGraph=graph,
+            bodyOfKnowledgeID="ls-101",
+        )
+        result = await plugin.handle(event)
+        assert isinstance(result, Response)
+        # Retrieval must still be scoped to the caller's own bok_id, never
+        # the "victim-space" collection, regardless of what a payload's own
+        # nodes compute along the way.
+        assert len(store.query_calls) == 1
+        collection = store.query_calls[0][0]
+        assert collection == "ls-101-knowledge"
+
     async def test_store_error_propagates_no_fabricated_answer(self):
         class RaisingStore:
             async def query(self, *args, **kwargs):
