@@ -31,6 +31,13 @@ def _load_shipped_payload() -> dict:
         return json.load(f)
 
 
+#: Shared ordered event log the scripted chat model and the store double
+#: both append to, so a test can assert interleaving (extract before store
+#: query before refine) rather than just a call count. Populated per-test
+#: via the `_reset_scripted_model`/store fixtures below.
+EVENT_LOG: list[str] = []
+
+
 class ScriptedChatModel(BaseChatModel):
     """Real LangChain chat model returning queued responses in call order.
 
@@ -51,6 +58,7 @@ class ScriptedChatModel(BaseChatModel):
         run_manager: Any = None, **kwargs: Any,
     ) -> ChatResult:
         type(self).calls.append(messages)
+        EVENT_LOG.append(f"llm:{len(type(self).calls)}")
         content = type(self).responses.pop(0)
         return ChatResult(generations=[ChatGeneration(message=AIMessage(content=content))])
 
@@ -75,9 +83,25 @@ class _LLMAdapter:
 def _reset_scripted_model():
     ScriptedChatModel.responses = []
     ScriptedChatModel.calls = []
+    EVENT_LOG.clear()
     yield
     ScriptedChatModel.responses = []
     ScriptedChatModel.calls = []
+    EVENT_LOG.clear()
+
+
+class LoggingKnowledgeStore(MockKnowledgeStorePort):
+    """`MockKnowledgeStorePort` plus an append to the shared `EVENT_LOG`.
+
+    Lets a test assert the real extract -> retrieve -> refine interleaving
+    against the scripted LLM's own log entries, instead of only a call
+    count (which can't distinguish "ran in order" from "ran out of
+    order but the same number of times").
+    """
+
+    async def query(self, collection, query_texts, n_results=10, where=None):
+        EVENT_LOG.append(f"store:{len(self.query_calls) + 1}")
+        return await super().query(collection, query_texts, n_results=n_results, where=where)
 
 
 def _make_plugin(store: MockKnowledgeStorePort | None = None) -> GenericPlugin:
@@ -122,9 +146,10 @@ class TestWorkshopPayloadClarify:
 class TestWorkshopPayloadGenerate:
     async def test_us2_as2_generate_path_retrieves_and_returns_design(self):
         payload = _load_shipped_payload()
-        store = MockKnowledgeStorePort()
+        store = LoggingKnowledgeStore()
+        marker_doc = "LS: 1-2-4-All is a facilitation technique."
         store.collections["ls-101-knowledge"] = [
-            {"document": "LS: 1-2-4-All is a facilitation technique.", "metadata": {"embeddingType": "chunk"}, "id": "1"},
+            {"document": marker_doc, "metadata": {"embeddingType": "chunk"}, "id": "1"},
         ]
         plugin = _make_plugin(store)
         ScriptedChatModel.responses = [
@@ -151,14 +176,26 @@ class TestWorkshopPayloadGenerate:
         for slot in ("facilitator", "2 hours", "in-person", "team building", "20"):
             assert slot in query_text
         assert n_results == 10
+        # Grounding: the store's marker document must actually reach the
+        # generate node's LLM prompt — a broken `output_key` (LangGraph
+        # silently drops an undeclared state key) or a mis-wired retrieve
+        # node would still pass every assertion above while `generate`
+        # receives empty `{knowledge_docs}` (R-4, confident ungrounded
+        # designs).
+        final_call_content = ScriptedChatModel.calls[-1][0].content
+        assert marker_doc in final_call_content
+        # Ordering: the store query ran strictly before the final (generate)
+        # LLM call, not merely "some LLM call ran and some store call ran".
+        assert EVENT_LOG.index("store:1") < EVENT_LOG.index(f"llm:{len(ScriptedChatModel.calls)}")
 
 
 class TestWorkshopPayloadRefine:
     async def test_us2_as3_refine_path_extracts_then_retrieves_then_revises(self):
         payload = _load_shipped_payload()
-        store = MockKnowledgeStorePort()
+        store = LoggingKnowledgeStore()
+        marker_doc = "LS: Impromptu Networking for onboarding."
         store.collections["ls-101-knowledge"] = [
-            {"document": "LS: Impromptu Networking for onboarding.", "metadata": {"embeddingType": "chunk"}, "id": "1"},
+            {"document": marker_doc, "metadata": {"embeddingType": "chunk"}, "id": "1"},
         ]
         plugin = _make_plugin(store)
         ScriptedChatModel.responses = [
@@ -183,11 +220,20 @@ class TestWorkshopPayloadRefine:
         result = await plugin.handle(event)
         assert isinstance(result, Response)
         assert result.result == "## Revised Design\n\nUpdated content with the requested change."
-        # extract (call 3) ran before the store query, which ran before
-        # refine (call 4) — call order proves it since extract is the only
-        # node between analyse and the store query.
         assert len(ScriptedChatModel.calls) == 4
         assert len(store.query_calls) == 1
+        # Ordering: the shared event log — appended to by BOTH the scripted
+        # LLM and the store double — pins the true interleaving. "llm:3" is
+        # `extract`'s call (check_input, analyse_last_message, extract are
+        # the first three LLM nodes on this path); it must precede the sole
+        # store query, which must precede "llm:4" (`refine`). A payload
+        # rewired to retrieve before extracting, or to retrieve after
+        # refining, breaks this even though the call *counts* stay 4 and 1.
+        assert EVENT_LOG == ["llm:1", "llm:2", "llm:3", "store:1", "llm:4"]
+        # Grounding: the retrieved marker document must actually reach the
+        # refine node's LLM prompt, not just get queried and discarded.
+        refine_call_content = ScriptedChatModel.calls[-1][0].content
+        assert marker_doc in refine_call_content
 
 
 class TestStructuredParseFailureLogging:
@@ -243,6 +289,46 @@ class TestWorkshopPayloadSlotRecovery:
                 "role": "facilitator", "duration": "2 hours",
                 "workshop_type": "in-person", "audience_size": 20,
                 "question": "unused", "complete": True,
+            }),
+            json.dumps({"action": "generate"}),
+            "## Workshop Design\n\nUse 1-2-4-All to kick things off.",
+        ]
+        event = make_input(
+            message="Generate a workshop design for me.",
+            promptGraph=payload,
+            bodyOfKnowledgeID="ls-101",
+        )
+        result = await plugin.handle(event)
+        assert isinstance(result, Response)
+        assert result.result == "## Workshop Design\n\nUse 1-2-4-All to kick things off."
+        assert len(store.query_calls) == 1
+
+    async def test_complete_true_explicit_null_slot_recovers_default_one_store_query(self):
+        """R-3's actual reachable failure class: the model returns
+        `complete: true` alongside an EXPLICIT `null` for a slot (not
+        merely omitting the key — the schema fully permits an internally
+        consistent reply where the model claims completeness but leaves a
+        slot null). Before batch2's schema tightening, this parsed cleanly
+        with the null intact and reached `_make_retrieve_node`'s template
+        fill, raising `PromptGraphConfigError` there — burning the LLM
+        calls already made and repeating on every RabbitMQ retry, with the
+        member getting only the standard error response instead of a
+        design or a clarifying question. Now that every slot is required
+        AND non-nullable, a literal JSON `null` also fails
+        `PydanticOutputParser.parse()` and lands in `_recover_fields`,
+        which fills the type default — same safe path as an omitted key."""
+        payload = _load_shipped_payload()
+        store = MockKnowledgeStorePort()
+        store.collections["ls-101-knowledge"] = [
+            {"document": "LS: 1-2-4-All is a facilitation technique.", "metadata": {"embeddingType": "chunk"}, "id": "1"},
+        ]
+        plugin = _make_plugin(store)
+        ScriptedChatModel.responses = [
+            # `duration` is present but explicitly null, not omitted.
+            json.dumps({
+                "role": "facilitator", "duration": None,
+                "workshop_type": "in-person", "purpose": "team building",
+                "audience_size": 20, "question": "unused", "complete": True,
             }),
             json.dumps({"action": "generate"}),
             "## Workshop Design\n\nUse 1-2-4-All to kick things off.",
