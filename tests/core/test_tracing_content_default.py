@@ -105,6 +105,84 @@ async def test_default_wiring_end_to_end_root_span_dark(traced_exporter) -> None
     assert "vc.message" not in root.attributes
 
 
+async def test_default_early_ack_success_span_omits_future_message_content(
+    traced_exporter, monkeypatch,
+) -> None:
+    import asyncio
+
+    from core.events.ingest_website import IngestWebsite, IngestWebsiteResult
+    from tests.core.test_main_tracing import _Message, _wiring
+
+    class MessageBearingIngestWebsite(IngestWebsite):
+        message: str
+
+    event = MessageBearingIngestWebsite(
+        baseUrl="https://example.test",
+        type="website",
+        purpose="knowledge",
+        personaId="persona",
+        message="future early-ACK member message",
+    )
+
+    async def handle(_event):
+        return IngestWebsiteResult()
+
+    monkeypatch.setattr(
+        "core.router.Router.parse_event", lambda _router, _body: event,
+    )
+    handler, active, config, _ = _wiring(handle, plugin_type="ingest-website")
+    assert config.tracing_capture_content is False
+    message = _Message()
+    await handler({"eventType": "IngestWebsite"}, message)
+    await asyncio.gather(*active)
+    shutdown_tracing()
+
+    spans = list(traced_exporter.get_finished_spans())
+    assert message.acked
+    assert any(span.name == "vc.handle" and span.status.status_code.name == "OK" for span in spans)
+    assert all("vc.message" not in span.attributes for span in spans)
+
+
+async def test_capture_enabled_early_ack_success_records_bounded_future_message(
+    traced_exporter, monkeypatch,
+) -> None:
+    import asyncio
+
+    from core.events.ingest_website import IngestWebsite, IngestWebsiteResult
+    from tests.core.test_main_tracing import _Message, _wiring
+
+    class MessageBearingIngestWebsite(IngestWebsite):
+        message: str
+
+    event = MessageBearingIngestWebsite(
+        baseUrl="https://example.test",
+        type="website",
+        purpose="knowledge",
+        personaId="persona",
+        message="future early-ACK member message",
+    )
+
+    async def handle(_event):
+        return IngestWebsiteResult()
+
+    monkeypatch.setattr(
+        "core.router.Router.parse_event", lambda _router, _body: event,
+    )
+    handler, active, _, _ = _wiring(
+        handle,
+        plugin_type="ingest-website",
+        tracing_capture_content=True,
+        tracing_content_max_chars=7,
+    )
+    await handler({"eventType": "IngestWebsite"}, _Message())
+    await asyncio.gather(*active)
+    shutdown_tracing()
+
+    root = next(span for span in traced_exporter.get_finished_spans() if span.name == "vc.handle")
+    assert root.status.status_code.name == "OK"
+    assert root.attributes["vc.message"] == "future "
+
+
 def test_default_config_keeps_noncontent_diagnostics(traced_exporter) -> None:
     _complete_chat(_config())
     shutdown_tracing()

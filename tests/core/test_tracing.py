@@ -312,7 +312,15 @@ def test_capture_enabled_warns_naming_exported_data(caplog) -> None:
         warnings = [record for record in caplog.records if record.levelname == "WARNING"]
         assert len(warnings) == 1
         message = warnings[0].getMessage()
-        for value in ("gen_ai.prompt", "gen_ai.completion", "vc.message", "777"):
+        for value in (
+            "gen_ai.prompt",
+            "gen_ai.completion",
+            "vc.message",
+            "member messages",
+            "prompts",
+            "model completions",
+            "777",
+        ):
             assert value in message
         assert endpoint not in message
         assert "warn-secret" not in message
