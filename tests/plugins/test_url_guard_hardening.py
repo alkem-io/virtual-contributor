@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import gzip
+
 import httpx
 import pytest
 
@@ -21,6 +23,22 @@ def _patch_guard_transport(
         return client_class(transport=transport, **kwargs)
 
     monkeypatch.setattr(url_guard.httpx, "AsyncClient", guarded_client)
+
+
+class ChunkedStream(httpx.AsyncByteStream):
+    """A raw response stream whose chunk boundaries are controlled by the test."""
+
+    def __init__(self, chunks: list[bytes]) -> None:
+        self.chunks = chunks
+        self.iterated = False
+
+    async def __aiter__(self):
+        self.iterated = True
+        for chunk in self.chunks:
+            yield chunk
+
+    async def aclose(self) -> None:
+        return None
 
 
 @pytest.mark.parametrize("header_name", ["accept-encoding", "Accept-Encoding", "ACCEPT-ENCODING"])
@@ -59,6 +77,89 @@ async def test_guard_owns_accept_encoding_regardless_of_caller_header_casing(
 
     assert result.body == b"ok"
     assert requests[0].headers["accept-encoding"] == "gzip, deflate"
+
+
+async def test_guard_owns_host_regardless_of_caller_header_casing(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The validated virtual-host authority must be the only Host header."""
+    requests: list[httpx.Request] = []
+    _patch_guard_transport(
+        monkeypatch,
+        lambda request: requests.append(request) or httpx.Response(
+            200,
+            headers={"content-type": "text/plain"},
+            content=b"ok",
+        ),
+    )
+
+    async def resolve_host(host: str) -> list[str]:
+        assert host == "public.example"
+        return ["93.184.216.34"]
+
+    monkeypatch.setattr(url_guard, "resolve_host", resolve_host)
+    result = await guarded_fetch(
+        "https://public.example/document.txt",
+        max_bytes=1024,
+        request_headers={
+            "host": "attacker-one.example",
+            "Host": "attacker-two.example",
+            "HOST": "attacker-three.example",
+        },
+    )
+
+    assert result.body == b"ok"
+    assert requests[0].headers.get_list("host") == ["public.example"]
+
+
+async def test_guarded_fetch_refuses_streamed_gzip_expansion_over_cap(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The bounded decoder applies the decoded limit to raw streamed gzip."""
+    compressed = gzip.compress(b"x" * 2048)
+    stream = ChunkedStream([compressed])
+    _patch_guard_transport(
+        monkeypatch,
+        lambda _: httpx.Response(
+            200,
+            headers={"content-encoding": "gzip", "content-type": "text/plain"},
+            stream=stream,
+        ),
+    )
+
+    result = await guarded_fetch("https://93.184.216.34/document.txt", max_bytes=1024)
+
+    assert result.body is None
+    assert result.reason is url_guard.RefusalCategory.SIZE
+    assert stream.iterated
+
+
+async def test_guarded_fetch_decodes_streamed_gzip_across_chunk_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Raw gzip decoding has the same successful result in one or many chunks."""
+    body = b"a legitimate compressed response" * 8
+    compressed = gzip.compress(body)
+    single_chunk = ChunkedStream([compressed])
+    several_chunks = ChunkedStream([compressed[:3], compressed[3:11], compressed[11:]])
+    streams = iter([single_chunk, several_chunks])
+    _patch_guard_transport(
+        monkeypatch,
+        lambda _: httpx.Response(
+            200,
+            headers={"content-encoding": "gzip", "content-type": "text/plain"},
+            stream=next(streams),
+        ),
+    )
+
+    one_chunk = await guarded_fetch("https://93.184.216.34/document.txt", max_bytes=1024)
+    multiple_chunks = await guarded_fetch("https://93.184.216.34/document.txt", max_bytes=1024)
+
+    assert one_chunk == multiple_chunks
+    assert one_chunk.body == body
+    assert one_chunk.reason is None
+    assert single_chunk.iterated
+    assert several_chunks.iterated
 
 
 async def test_guard_owns_credentials_on_public_hops(

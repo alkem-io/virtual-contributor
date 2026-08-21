@@ -167,6 +167,49 @@ class TestCrawlFunction:
             results = await crawl("https://example.com", page_limit=10)
         assert len(results) == 1  # Only the root page
 
+    async def test_relative_links_resolve_against_the_post_redirect_url(self):
+        """A redirected page's relative hrefs must resolve against its final URL, not its pre-redirect URL."""
+        pages = {
+            "https://example.com/": _html_page("Home", "Home page", ["https://example.com/docs"]),
+            "https://example.com/docs/en/": _html_page("Docs", "Docs page", ["intro"]),
+            "https://example.com/docs/en/intro": _html_page("Intro", "Intro page"),
+        }
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = _logical_url(request)
+            if url == "https://example.com/docs":
+                return httpx.Response(301, headers={"location": "https://example.com/docs/en/"})
+            return _mock_response(pages.get(url, "<html></html>"))
+
+        with self._patch_transport(handler):
+            results = await crawl("https://example.com", page_limit=10)
+
+        urls = {r["url"] for r in results}
+        assert "https://example.com/docs/en/intro" in urls
+        assert "https://example.com/intro" not in urls
+
+    async def test_redirected_page_visited_directly_is_not_crawled_twice(self):
+        """A link that points straight at a redirect's final URL must not duplicate the redirected page."""
+        pages = {
+            "https://example.com/": _html_page(
+                "Home", "Home page", ["https://example.com/docs", "https://example.com/docs/en/"]
+            ),
+            "https://example.com/docs/en/": _html_page("Docs", "Docs page"),
+        }
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = _logical_url(request)
+            if url == "https://example.com/docs":
+                return httpx.Response(301, headers={"location": "https://example.com/docs/en/"})
+            return _mock_response(pages.get(url, "<html></html>"))
+
+        with self._patch_transport(handler):
+            results = await crawl("https://example.com", page_limit=10)
+
+        # Results carry the normalized URL, which has no trailing slash.
+        docs_urls = [r["url"] for r in results if r["url"] == "https://example.com/docs/en"]
+        assert len(docs_urls) == 1
+
     async def test_redirect_to_private_address_is_refused_before_the_crawler_requests_it(
         self,
         monkeypatch: pytest.MonkeyPatch,

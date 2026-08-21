@@ -114,13 +114,21 @@ async def crawl(
         html = result.body.decode("utf-8", errors="replace")
         # The guarded executor returns the validated final redirect target.
         final_url = _normalize_url(result.url)
+        if final_url != normalized:
+            if final_url in visited:
+                continue
+            visited.add(final_url)
         results.append({"url": final_url, "html": html})
 
-        # Extract links
+        # Extract links, resolved against the post-redirect URL so relative
+        # hrefs land on the page that actually served them. Join against the
+        # RAW url: _normalize_url strips the trailing slash, and urljoin reads
+        # a slashless final segment as a file, resolving "intro" against the
+        # parent directory instead of the page's own.
         soup = BeautifulSoup(html, "html.parser")
         for link in soup.find_all("a", href=True):
             href = link["href"]
-            full_url = urljoin(normalized, href)
+            full_url = urljoin(result.url, href)
             full_normalized = _normalize_url(full_url)
             if (
                 full_normalized not in visited

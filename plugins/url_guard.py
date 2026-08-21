@@ -28,7 +28,7 @@ _STREAM_CHUNK_BYTES = 64 * 1024
 _SNIFF_WINDOW_BYTES = 4 * 1024
 _SUPPORTED_ACCEPT_ENCODINGS = "gzip, deflate"
 _CREDENTIAL_HEADERS = frozenset({"authorization", "proxy-authorization"})
-_GUARD_OWNED_HEADERS = _CREDENTIAL_HEADERS | frozenset({"accept-encoding"})
+_GUARD_OWNED_HEADERS = _CREDENTIAL_HEADERS | frozenset({"accept-encoding", "host"})
 _NO_CREDENTIALS_AUTH = httpx.Auth()
 
 
