@@ -9,49 +9,62 @@ from plugins import url_guard
 from plugins.url_guard import guarded_fetch
 
 
+def _patch_guard_transport(
+    monkeypatch: pytest.MonkeyPatch,
+    handler,
+) -> None:
+    """Route the guard-owned client through an in-process transport."""
+    client_class = httpx.AsyncClient
+    transport = httpx.MockTransport(handler)
+
+    def guarded_client(**kwargs) -> httpx.AsyncClient:
+        return client_class(transport=transport, **kwargs)
+
+    monkeypatch.setattr(url_guard.httpx, "AsyncClient", guarded_client)
+
+
 @pytest.mark.parametrize("header_name", ["accept-encoding", "Accept-Encoding", "ACCEPT-ENCODING"])
 @pytest.mark.parametrize("source", ["request_headers", "headers_for_request"])
 async def test_guard_owns_accept_encoding_regardless_of_caller_header_casing(
     header_name: str,
     source: str,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     """Caller casing must not turn the supported encoding list into a union."""
     requests: list[httpx.Request] = []
-    client = httpx.AsyncClient(
-        transport=httpx.MockTransport(
-            lambda request: requests.append(request) or httpx.Response(
-                200,
-                headers={"content-type": "text/plain"},
-                content=b"ok",
-            )
-        )
+    _patch_guard_transport(
+        monkeypatch,
+        lambda request: requests.append(request) or httpx.Response(
+            200,
+            headers={"content-type": "text/plain"},
+            content=b"ok",
+        ),
     )
 
-    async with client:
-        if source == "request_headers":
-            result = await guarded_fetch(
-                "https://93.184.216.34/document.txt",
-                max_bytes=1024,
-                request_headers={header_name: "zstd"},
-                client=client,
-            )
-        else:
-            async def headers_for_request(_: str, __: url_guard.FetchDecision) -> dict[str, str]:
-                return {header_name: "zstd"}
+    if source == "request_headers":
+        result = await guarded_fetch(
+            "https://93.184.216.34/document.txt",
+            max_bytes=1024,
+            request_headers={header_name: "zstd"},
+        )
+    else:
+        async def headers_for_request(_: str, __: url_guard.FetchDecision) -> dict[str, str]:
+            return {header_name: "zstd"}
 
-            result = await guarded_fetch(
-                "https://93.184.216.34/document.txt",
-                max_bytes=1024,
-                headers_for_request=headers_for_request,
-                client=client,
-            )
+        result = await guarded_fetch(
+            "https://93.184.216.34/document.txt",
+            max_bytes=1024,
+            headers_for_request=headers_for_request,
+        )
 
     assert result.body == b"ok"
     assert requests[0].headers["accept-encoding"] == "gzip, deflate"
 
 
-async def test_guard_neutralizes_credentials_on_a_preconfigured_supplied_client():
-    """Client defaults cannot bypass the guard's per-origin bearer decision."""
+async def test_guard_owns_credentials_on_public_hops(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Only the guard-approved bearer reaches its matching deployment hop."""
     requests: list[httpx.Request] = []
     deployment_url = "https://93.184.216.34/api/private/graphql"
 
@@ -61,25 +74,19 @@ async def test_guard_neutralizes_credentials_on_a_preconfigured_supplied_client(
             return httpx.Response(302, headers={"location": "https://1.1.1.1/public.txt"})
         return httpx.Response(200, headers={"content-type": "text/plain"}, content=b"ok")
 
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(handler),
-        headers={"Authorization": "Bearer client-default", "Proxy-Authorization": "client-proxy-default"},
-        auth=httpx.BasicAuth("client", "secret"),
-    ) as client:
-        public_result = await guarded_fetch(
-            "https://1.1.1.1/document.txt",
-            max_bytes=1024,
-            deployment_url=deployment_url,
-            credential_token="trusted-token",
-            client=client,
-        )
-        redirect_result = await guarded_fetch(
-            "https://93.184.216.34/initial",
-            max_bytes=1024,
-            deployment_url=deployment_url,
-            credential_token="trusted-token",
-            client=client,
-        )
+    _patch_guard_transport(monkeypatch, handler)
+    public_result = await guarded_fetch(
+        "https://1.1.1.1/document.txt",
+        max_bytes=1024,
+        deployment_url=deployment_url,
+        credential_token="trusted-token",
+    )
+    redirect_result = await guarded_fetch(
+        "https://93.184.216.34/initial",
+        max_bytes=1024,
+        deployment_url=deployment_url,
+        credential_token="trusted-token",
+    )
 
     assert public_result.body == b"ok"
     assert redirect_result.body == b"ok"
@@ -92,41 +99,14 @@ async def test_guard_neutralizes_credentials_on_a_preconfigured_supplied_client(
     assert "proxy-authorization" not in requests[2].headers
 
 
-@pytest.mark.parametrize(
-    "target",
-    [
-        pytest.param("https://1.1.1.1/document.txt", id="direct-public"),
-        pytest.param("https://93.184.216.34/initial", id="deployment-to-public-redirect"),
-    ],
-)
-async def test_guard_rejects_client_request_hooks_before_any_public_hop(target: str):
-    """Event hooks run after guard sanitisation, so they cannot be accepted."""
-    transport_requests: list[httpx.Request] = []
-    hook_requests: list[httpx.Request] = []
-
-    async def sneaky_hook(request: httpx.Request) -> None:
-        hook_requests.append(request)
-        request.headers["Authorization"] = "Bearer event-hook-secret"
-        request.headers["Accept-Encoding"] = "zstd"
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        transport_requests.append(request)
-        if request.url.path == "/initial":
-            return httpx.Response(302, headers={"location": "https://1.1.1.1/public.txt"})
-        return httpx.Response(200, headers={"content-type": "text/plain"}, content=b"ok")
-
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(handler),
-        event_hooks={"request": [sneaky_hook]},
-    ) as client:
-        with pytest.raises(ValueError, match="request event hooks"):
-            await guarded_fetch(
-                target,
-                max_bytes=1024,
-                deployment_url="https://93.184.216.34/api/private/graphql",
-                credential_token="trusted-token",
-                client=client,
-            )
-
-    assert hook_requests == []
-    assert transport_requests == []
+@pytest.mark.parametrize("transport_argument", ["client", "client_factory"])
+async def test_guarded_fetch_rejects_caller_controlled_transport(
+    transport_argument: str,
+):
+    """The public fetch API cannot receive a caller-created transport."""
+    with pytest.raises(TypeError, match=f"unexpected keyword argument '{transport_argument}'"):
+        await guarded_fetch(
+            "https://1.1.1.1/document.txt",
+            max_bytes=1024,
+            **{transport_argument: object()},
+        )

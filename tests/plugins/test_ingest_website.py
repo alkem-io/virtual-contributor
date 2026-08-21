@@ -73,9 +73,10 @@ class TestCrawlFunction:
     def _patch_transport(handler):
         """Patch httpx.AsyncClient to use a mock transport handler."""
         transport = httpx.MockTransport(handler)
+        client_class = httpx.AsyncClient
         return patch(
-            "plugins.ingest_website.crawler.httpx.AsyncClient",
-            return_value=httpx.AsyncClient(transport=transport),
+            "plugins.url_guard.httpx.AsyncClient",
+            side_effect=lambda **kwargs: client_class(transport=transport, **kwargs),
         )
 
     async def test_single_page(self):
@@ -431,9 +432,10 @@ class TestCrawlerRedirectURL:
     @staticmethod
     def _patch_transport(handler):
         transport = httpx.MockTransport(handler)
+        client_class = httpx.AsyncClient
         return patch(
-            "plugins.ingest_website.crawler.httpx.AsyncClient",
-            return_value=httpx.AsyncClient(transport=transport, follow_redirects=True),
+            "plugins.url_guard.httpx.AsyncClient",
+            side_effect=lambda **kwargs: client_class(transport=transport, **kwargs),
         )
 
     async def test_records_redirect_url(self):

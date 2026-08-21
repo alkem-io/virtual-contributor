@@ -231,27 +231,43 @@ async def test_deployment_origin_requires_matching_scheme_host_and_port(
     assert alternate_scheme.is_deployment_host is False
 
 
-async def test_guarded_fetch_disables_connection_reuse_across_hops():
-    captured_limits: list[httpx.Limits] = []
+def _patch_guard_transport(
+    monkeypatch: pytest.MonkeyPatch,
+    handler,
+    captured_options: list[dict] | None = None,
+) -> None:
+    """Route the guard-owned client through an in-process transport."""
+    client_class = httpx.AsyncClient
+    transport = httpx.MockTransport(handler)
+
+    def guarded_client(**kwargs) -> httpx.AsyncClient:
+        if captured_options is not None:
+            captured_options.append(kwargs)
+        return client_class(transport=transport, **kwargs)
+
+    monkeypatch.setattr(url_guard.httpx, "AsyncClient", guarded_client)
+
+
+async def test_guarded_fetch_disables_connection_reuse_across_hops(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    captured_options: list[dict] = []
     transport = httpx.MockTransport(
         lambda _: httpx.Response(200, headers={"content-type": "text/plain"}, content=b"ok")
     )
 
-    def client_factory(**kwargs) -> httpx.AsyncClient:
-        captured_limits.append(kwargs["limits"])
-        return httpx.AsyncClient(transport=transport)
-
-    result = await guarded_fetch(
-        "https://93.184.216.34/document.txt",
-        max_bytes=1024,
-        client_factory=client_factory,
-    )
+    _patch_guard_transport(monkeypatch, transport.handler, captured_options)
+    result = await guarded_fetch("https://93.184.216.34/document.txt", max_bytes=1024)
 
     assert result.body == b"ok"
-    assert captured_limits[0].max_keepalive_connections == 0
+    assert captured_options[0]["limits"].max_keepalive_connections == 0
+    assert captured_options[0]["timeout"] == 60.0
+    assert captured_options[0]["follow_redirects"] is False
 
 
-async def test_guarded_fetch_owns_authorization_header_eligibility():
+async def test_guarded_fetch_owns_authorization_header_eligibility(
+    monkeypatch: pytest.MonkeyPatch,
+):
     requests: list[httpx.Request] = []
     transport = httpx.MockTransport(
         lambda request: requests.append(request) or httpx.Response(
@@ -262,23 +278,21 @@ async def test_guarded_fetch_owns_authorization_header_eligibility():
     )
     deployment = "https://93.184.216.34/api/private/graphql"
 
-    async with httpx.AsyncClient(transport=transport) as client:
-        result = await guarded_fetch(
-            "https://93.184.216.34/rest/storage/document/id",
-            max_bytes=1024,
-            deployment_url=deployment,
-            credential_token="trusted-token",
-            request_headers={"Authorization": "Bearer caller-token"},
-            client=client,
-        )
-        public_result = await guarded_fetch(
-            "https://1.1.1.1/document.txt",
-            max_bytes=1024,
-            deployment_url=deployment,
-            credential_token="trusted-token",
-            request_headers={"Authorization": "Bearer caller-token"},
-            client=client,
-        )
+    _patch_guard_transport(monkeypatch, transport.handler)
+    result = await guarded_fetch(
+        "https://93.184.216.34/rest/storage/document/id",
+        max_bytes=1024,
+        deployment_url=deployment,
+        credential_token="trusted-token",
+        request_headers={"Authorization": "Bearer caller-token"},
+    )
+    public_result = await guarded_fetch(
+        "https://1.1.1.1/document.txt",
+        max_bytes=1024,
+        deployment_url=deployment,
+        credential_token="trusted-token",
+        request_headers={"Authorization": "Bearer caller-token"},
+    )
 
     assert result.body == b"ok"
     assert public_result.body == b"ok"
@@ -286,7 +300,9 @@ async def test_guarded_fetch_owns_authorization_header_eligibility():
     assert "authorization" not in requests[1].headers
 
 
-async def test_guarded_fetch_never_advertises_unbounded_zstd():
+async def test_guarded_fetch_never_advertises_unbounded_zstd(
+    monkeypatch: pytest.MonkeyPatch,
+):
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -299,12 +315,8 @@ async def test_guarded_fetch_never_advertises_unbounded_zstd():
             )
         return httpx.Response(200, headers={"content-type": "text/plain"}, content=b"ok")
 
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        result = await guarded_fetch(
-            "https://93.184.216.34/document.txt",
-            max_bytes=1024,
-            client=client,
-        )
+    _patch_guard_transport(monkeypatch, handler)
+    result = await guarded_fetch("https://93.184.216.34/document.txt", max_bytes=1024)
 
     assert result.body == b"ok"
     assert requests[0].headers["accept-encoding"] == "gzip, deflate"

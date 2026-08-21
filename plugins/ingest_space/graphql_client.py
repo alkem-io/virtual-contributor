@@ -66,7 +66,6 @@ class GraphQLClient:
             deployment_url=self._graphql_endpoint,
             credential_token_provider=self._credential_token,
             content_type_policy=self._content_type_policy,
-            client_factory=httpx.AsyncClient,
         )
         if result.body is None:
             self._refuse(

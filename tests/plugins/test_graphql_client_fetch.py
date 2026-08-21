@@ -30,9 +30,10 @@ def _make_client(
 
 def _patch_transport(handler):
     transport = httpx.MockTransport(handler)
+    client_class = httpx.AsyncClient
     return patch(
-        "plugins.ingest_space.graphql_client.httpx.AsyncClient",
-        return_value=httpx.AsyncClient(transport=transport),
+        "plugins.url_guard.httpx.AsyncClient",
+        side_effect=lambda **kwargs: client_class(transport=transport, **kwargs),
     )
 
 

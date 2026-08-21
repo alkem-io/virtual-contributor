@@ -74,7 +74,6 @@ ContentTypePolicy = Callable[[str, bytes | None], bool | None]
 HeadersForRequest = Callable[[str, FetchDecision], Awaitable[dict[str, str]]]
 CredentialTokenProvider = Callable[[], Awaitable[str | None]]
 RedirectPolicy = Callable[[str], bool]
-AsyncClientFactory = Callable[..., httpx.AsyncClient]
 
 
 async def resolve_host(host: str) -> list[str]:
@@ -526,15 +525,9 @@ async def _read_bounded_body(
 
 
 @asynccontextmanager
-async def _guarded_client(
-    client: httpx.AsyncClient | None,
-    client_factory: AsyncClientFactory,
-):
-    """Use a supplied client without owning it, otherwise make a safe one."""
-    if client is not None:
-        yield client
-        return
-    async with client_factory(
+async def _guarded_client():
+    """Create the guard-owned client used for every outbound fetch."""
+    async with httpx.AsyncClient(
         timeout=60.0,
         follow_redirects=False,
         limits=httpx.Limits(max_keepalive_connections=0),
@@ -551,19 +544,12 @@ def _caller_headers(headers: dict[str, str]) -> dict[str, str]:
     }
 
 
-def _strip_client_credentials(headers: httpx.Headers) -> None:
-    """Remove credential defaults merged into a request by an httpx client."""
-    for name in _CREDENTIAL_HEADERS:
-        if name in headers:
-            del headers[name]
-
-
 @asynccontextmanager
-async def _stream_without_client_credentials(
+async def _stream_guarded_request(
     client: httpx.AsyncClient,
     request: httpx.Request,
 ):
-    """Stream a prepared request without applying the client's ``auth=``."""
+    """Stream a prepared request without allowing client authentication."""
     response = await client.send(
         request,
         auth=_NO_CREDENTIALS_AUTH,
@@ -587,24 +573,16 @@ async def guarded_fetch(
     request_headers: dict[str, str] | None = None,
     content_type_policy: ContentTypePolicy | None = None,
     redirect_policy: RedirectPolicy | None = None,
-    client: httpx.AsyncClient | None = None,
-    client_factory: AsyncClientFactory = httpx.AsyncClient,
 ) -> GuardedFetchResult:
     """Fetch an HTTP resource through per-hop validation and address pinning.
 
     Connections have no keep-alive capacity, so a TLS session opened for one
     redirect hostname can never be reused for another hostname sharing an IP.
     """
-    if client is not None and client.event_hooks.get("request"):
-        raise ValueError(
-            "Invalid guarded_fetch client configuration: request event hooks can mutate "
-            "guard-owned Authorization and Accept-Encoding headers"
-        )
-
     target = url
     redirects_followed = 0
     try:
-        async with _guarded_client(client, client_factory) as active_client:
+        async with _guarded_client() as active_client:
             while True:
                 decision = await check_destination(target, deployment_url=deployment_url)
                 if not decision.allowed:
@@ -643,15 +621,10 @@ async def guarded_fetch(
                     headers=headers,
                     extensions={"sni_hostname": decision.host},
                 )
-                # ``build_request`` deliberately merges client defaults.  A
-                # supplied client must not turn its default credentials into
-                # a cross-origin leak, so remove them after that merge and
-                # restore only the guard-approved bearer for this hop.
-                _strip_client_credentials(request.headers)
                 if authorization is not None:
                     request.headers["Authorization"] = authorization
 
-                async with _stream_without_client_credentials(active_client, request) as response:
+                async with _stream_guarded_request(active_client, request) as response:
                     if response.status_code in _REDIRECT_STATUSES:
                         redirect_target = _redirect_target(response, target)
                         if redirect_target is None or (
