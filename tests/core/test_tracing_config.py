@@ -36,3 +36,12 @@ def test_invalid_tracing_config_is_rejected(key: str, value: float | int) -> Non
 def test_otlp_headers_are_masked() -> None:
     assert _mask_sensitive("tracing_otlp_headers", "secret-value").startswith("sec")
     assert "secret-value" not in _mask_sensitive("tracing_otlp_headers", "secret-value")
+
+
+def test_capture_content_defaults_off() -> None:
+    assert _config().tracing_capture_content is False
+
+
+def test_capture_content_binds_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TRACING_CAPTURE_CONTENT", "true")
+    assert _config().tracing_capture_content is True

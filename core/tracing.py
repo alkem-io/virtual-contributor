@@ -171,6 +171,13 @@ def configure_tracing(
     _tracer = provider.get_tracer("virtual-contributor")
     _active_config = config
     _configured = True
+    if config.tracing_capture_content:
+        logger.warning(
+            "Tracing content capture is enabled: member messages, prompts, and model completions "
+            "will be exported to the trace collector as span attributes gen_ai.prompt, "
+            "gen_ai.completion, and vc.message, each truncated to %s characters.",
+            config.tracing_content_max_chars,
+        )
     return True
 
 

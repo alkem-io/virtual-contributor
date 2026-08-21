@@ -61,7 +61,7 @@ class BaseConfig(BaseSettings):
     tracing_otlp_headers: str | None = None
     tracing_service_name: str | None = None
     tracing_sample_ratio: float = 1.0
-    tracing_capture_content: bool = True
+    tracing_capture_content: bool = False
     tracing_content_max_chars: int = 1000
 
     # ChromaDB / Vector DB

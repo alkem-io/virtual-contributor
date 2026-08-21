@@ -778,7 +778,7 @@ are never used.
 | `TRACING_OTLP_HEADERS` | unset | Comma-separated `key=value` authentication headers |
 | `TRACING_SERVICE_NAME` | plugin-derived | Service resource name |
 | `TRACING_SAMPLE_RATIO` | `1.0` | Trace sampling ratio, from 0 through 1 |
-| `TRACING_CAPTURE_CONTENT` | `true` | Include bounded prompts, answers, and messages |
+| `TRACING_CAPTURE_CONTENT` | `false` | Off by default. When `true`, exports bounded member messages, prompts, and model completions to the trace collector as span attributes — enable only as a recorded, deliberate decision. |
 | `TRACING_CONTENT_MAX_CHARS` | `1000` | Maximum characters per content attribute |
 
 For local self-hosted Langfuse, point the service at its OTLP endpoint:
