@@ -5,14 +5,18 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from evaluation.assertions import Assertion
 from evaluation.case_identity import evaluation_case_digest, ordered_evaluation_case_digest
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_TEST_SET_PATH = Path("evaluation/golden/test_set.jsonl")
+
+Category = Literal["documentation", "building-alkemio", "design-thinker"]
 
 
 class TestCase(BaseModel):
@@ -20,17 +24,35 @@ class TestCase(BaseModel):
 
     question: str = Field(min_length=1)
     expected_answer: str = Field(min_length=1)
-    relevant_documents: list[str] = Field(min_length=1)
+    relevant_documents: list[str] = Field(default_factory=list)
+    category: Category | None = None
+    assertions: list[Assertion] = Field(default_factory=list)
+
+
+def _identity_payload(case: TestCase) -> dict[str, object]:
+    """Project a case onto exactly the v1 case-identity fields.
+
+    ``category`` and ``assertions`` are metadata about a case, not inputs a
+    RAGAS score is computed from, so they are deliberately excluded from the
+    identity that pairs runs for comparison. Passing the projection (not the
+    ``TestCase`` object itself) keeps identity stable as the schema widens —
+    the same pattern already used by ``report.py``'s digest helpers.
+    """
+    return {
+        "question": case.question,
+        "expected_answer": case.expected_answer,
+        "relevant_documents": case.relevant_documents,
+    }
 
 
 def canonical_test_set_digest(cases: list[TestCase]) -> str:
     """Hash ordered canonical case JSON, independent of its source path."""
-    return ordered_evaluation_case_digest(cases)
+    return ordered_evaluation_case_digest([_identity_payload(case) for case in cases])
 
 
 def successful_case_digest(case: TestCase) -> str:
     """Stable identity for the successful input case, excluding model output."""
-    return evaluation_case_digest(case)
+    return evaluation_case_digest(_identity_payload(case))
 
 
 def load_test_set(path: Path = DEFAULT_TEST_SET_PATH) -> list[TestCase]:
@@ -108,5 +130,5 @@ def write_test_cases(cases: list[TestCase], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w") as f:
         for case in cases:
-            f.write(case.model_dump_json() + "\n")
+            f.write(case.model_dump_json(exclude_defaults=True) + "\n")
     logger.info("Wrote %d test cases to %s", len(cases), path)
