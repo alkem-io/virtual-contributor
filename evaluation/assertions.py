@@ -46,14 +46,25 @@ class AssertionOutcome(BaseModel):
 # Normalization
 # ---------------------------------------------------------------------------
 
+_TYPOGRAPHIC_DOUBLE_QUOTES = '"“”'
+
 
 def _normalize(text: str) -> str:
-    """NFC + casefold + whitespace collapse (FR-015, C-3).
+    """NFC + casefold + whitespace collapse + quote-punctuation strip (FR-015, C-3).
 
     NFC only — never NFKC, which rewrites U+2122 (TM) to the ASCII digraph
     "TM" and would silently alter operator wording under comparison.
+
+    Double-quote punctuation (ASCII ``"`` and curly ``“``/``”``) is stripped
+    from both sides of a comparison so an assertion checks the underlying
+    fact, never the operator's typographic quoting style. Derived assertion
+    values are already quote-free (see ``_strip_typographic_quotes``), so in
+    practice this only affects the pipeline answer being checked: quotes
+    present there are optional, never required.
     """
     nfc = unicodedata.normalize("NFC", text)
+    for quote_char in _TYPOGRAPHIC_DOUBLE_QUOTES:
+        nfc = nfc.replace(quote_char, "")
     return " ".join(nfc.casefold().split())
 
 
@@ -109,6 +120,23 @@ _STOPWORDS = {
     "while", "through", "by", "to", "that", "where", "which",
     "not", "being", "or", "and", "yes", "no",
 }
+
+
+def _strip_typographic_quotes(text: str) -> str:
+    """Remove double-quote punctuation, keeping the quoted fact itself.
+
+    An enumeration item can embed the operator's typographic quoting around
+    a sub-phrase (``'"How might we" statements'``) — the quoting marks how
+    the operator wrote the fact, not the fact itself. A pipeline answer that
+    states the same fact without quotes is still correct, so the quote
+    characters (both ASCII ``"`` and curly ``“``/``”``) are stripped from the
+    derived value, surrounding or embedded, before it is shipped as an
+    assertion.
+    """
+    stripped = text
+    for quote_char in _TYPOGRAPHIC_DOUBLE_QUOTES:
+        stripped = stripped.replace(quote_char, "")
+    return " ".join(stripped.split())
 
 
 def _split_top_level_commas(text: str) -> list[str]:
@@ -167,7 +195,7 @@ def _enumeration_values(answer: str) -> list[str] | None:
     if first_token in _STOPWORDS:
         return None
 
-    return cleaned
+    return [_strip_typographic_quotes(item) for item in cleaned]
 
 
 # ---------------------------------------------------------------------------
