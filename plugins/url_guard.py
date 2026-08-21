@@ -27,6 +27,9 @@ _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 _STREAM_CHUNK_BYTES = 64 * 1024
 _SNIFF_WINDOW_BYTES = 4 * 1024
 _SUPPORTED_ACCEPT_ENCODINGS = "gzip, deflate"
+_CREDENTIAL_HEADERS = frozenset({"authorization", "proxy-authorization"})
+_GUARD_OWNED_HEADERS = _CREDENTIAL_HEADERS | frozenset({"accept-encoding"})
+_NO_CREDENTIALS_AUTH = httpx.Auth()
 
 
 class RefusalCategory(str, Enum):
@@ -539,6 +542,40 @@ async def _guarded_client(
         yield managed_client
 
 
+def _caller_headers(headers: dict[str, str]) -> dict[str, str]:
+    """Drop headers whose values must be controlled by the guard."""
+    return {
+        name: value
+        for name, value in headers.items()
+        if name.casefold() not in _GUARD_OWNED_HEADERS
+    }
+
+
+def _strip_client_credentials(headers: httpx.Headers) -> None:
+    """Remove credential defaults merged into a request by an httpx client."""
+    for name in _CREDENTIAL_HEADERS:
+        if name in headers:
+            del headers[name]
+
+
+@asynccontextmanager
+async def _stream_without_client_credentials(
+    client: httpx.AsyncClient,
+    request: httpx.Request,
+):
+    """Stream a prepared request without applying the client's ``auth=``."""
+    response = await client.send(
+        request,
+        auth=_NO_CREDENTIALS_AUTH,
+        follow_redirects=False,
+        stream=True,
+    )
+    try:
+        yield response
+    finally:
+        await response.aclose()
+
+
 async def guarded_fetch(
     url: str,
     *,
@@ -578,35 +615,37 @@ async def guarded_fetch(
                         redirects_followed,
                     )
 
-                # The executor owns bearer eligibility.  Callers may supply
-                # ordinary per-request headers, but never an Authorization
-                # header that can bypass the per-hop deployment-origin check.
-                headers = {
-                    name: value
-                    for name, value in (request_headers or {}).items()
-                    if name.lower() != "authorization"
-                }
+                # The executor owns bearer eligibility and content decoding.
+                # Callers may supply ordinary per-request headers, but never
+                # headers which could bypass per-hop credential scoping or
+                # advertise a decoder this bounded reader does not support.
+                headers = _caller_headers(request_headers or {})
                 if headers_for_request:
-                    headers.update({
-                        name: value
-                        for name, value in (await headers_for_request(target, decision)).items()
-                        if name.lower() != "authorization"
-                    })
+                    headers.update(_caller_headers(await headers_for_request(target, decision)))
                 headers["Accept-Encoding"] = _SUPPORTED_ACCEPT_ENCODINGS
                 token = credential_token
                 if credential_token_provider is not None:
                     token = await credential_token_provider()
+                authorization: str | None = None
                 if token and should_attach_credentials(target, deployment_url):
-                    headers["Authorization"] = f"Bearer {token}"
+                    authorization = f"Bearer {token}"
                 headers["Host"] = _host_header(target)
 
-                async with active_client.stream(
+                request = active_client.build_request(
                     "GET",
                     _pinned_target(target, decision.address),
                     headers=headers,
                     extensions={"sni_hostname": decision.host},
-                    follow_redirects=False,
-                ) as response:
+                )
+                # ``build_request`` deliberately merges client defaults.  A
+                # supplied client must not turn its default credentials into
+                # a cross-origin leak, so remove them after that merge and
+                # restore only the guard-approved bearer for this hop.
+                _strip_client_credentials(request.headers)
+                if authorization is not None:
+                    request.headers["Authorization"] = authorization
+
+                async with _stream_without_client_credentials(active_client, request) as response:
                     if response.status_code in _REDIRECT_STATUSES:
                         redirect_target = _redirect_target(response, target)
                         if redirect_target is None or (
