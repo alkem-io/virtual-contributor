@@ -48,8 +48,16 @@ def _parse_tsv(path: Path) -> list[tuple[str, str]]:
         if not line:
             continue
         question, expected_answer = line.split("\t", 1)
-        question = unicodedata.normalize("NFC", question)
-        expected_answer = unicodedata.normalize("NFC", expected_answer)
+        # Assert the source is ALREADY NFC rather than normalizing it here.
+        # Normalizing both sides would only prove the two agree after folding —
+        # a source that arrived decomposed would be silently accepted while the
+        # shipped JSONL carried different code points from the operator's file.
+        assert question == unicodedata.normalize("NFC", question), (
+            f"{path.name}: question is not NFC-normalized at source"
+        )
+        assert expected_answer == unicodedata.normalize("NFC", expected_answer), (
+            f"{path.name}: expected_answer is not NFC-normalized at source"
+        )
         pairs.append((question, expected_answer))
     return pairs
 
