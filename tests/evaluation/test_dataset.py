@@ -6,7 +6,14 @@ from pathlib import Path
 
 import pytest
 
-from evaluation.dataset import TestCase, canonical_test_set_digest, load_test_set, validate_test_set, write_test_cases
+from evaluation.dataset import (
+    TestCase,
+    canonical_test_set_digest,
+    filter_by_category,
+    load_test_set,
+    validate_test_set,
+    write_test_cases,
+)
 from evaluation.case_identity import CASE_IDENTITY_VERSION, evaluation_case_identity_payload
 
 
@@ -212,3 +219,37 @@ class TestWriteTestCases:
         write_test_cases([TestCase(question="Q", expected_answer="A")], p)
         line = p.read_text().strip()
         assert json.loads(line) == {"question": "Q", "expected_answer": "A"}
+
+
+# ---------------------------------------------------------------------------
+# filter_by_category — the mechanism behind --category
+# ---------------------------------------------------------------------------
+
+
+class TestFilterByCategory:
+    def _cases(self) -> list[TestCase]:
+        return [
+            TestCase(question="Q1", expected_answer="A1", category="documentation"),
+            TestCase(question="Q2", expected_answer="A2", category="building-alkemio"),
+            TestCase(question="Q3", expected_answer="A3", category="design-thinker"),
+            TestCase(question="Q4", expected_answer="A4", category="documentation"),
+            TestCase(question="Q5", expected_answer="A5"),  # untagged, e.g. synthetic
+        ]
+
+    def test_selects_only_the_requested_category(self):
+        result = filter_by_category(self._cases(), "documentation")
+        assert [c.question for c in result] == ["Q1", "Q4"]
+
+    def test_each_category_selects_its_own_count(self):
+        cases = self._cases()
+        assert len(filter_by_category(cases, "documentation")) == 2
+        assert len(filter_by_category(cases, "building-alkemio")) == 1
+        assert len(filter_by_category(cases, "design-thinker")) == 1
+
+    def test_untagged_case_never_matches_a_specific_filter(self):
+        result = filter_by_category(self._cases(), "documentation")
+        assert "Q5" not in [c.question for c in result]
+
+    def test_no_matching_cases_returns_empty_list(self):
+        cases = [TestCase(question="Q1", expected_answer="A1", category="documentation")]
+        assert filter_by_category(cases, "design-thinker") == []

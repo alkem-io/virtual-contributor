@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from evaluation.assertions import Assertion
 from evaluation.dataset import TestCase
 
 
@@ -625,3 +626,173 @@ class TestEvaluationRunner:
             await EvaluationRunner(mock_pipeline_invoker, mock_scorer, tmp_path).run(
                 _make_test_cases(1), plugin_type="expert", corpus_revision="r1"
             )
+
+
+# ---------------------------------------------------------------------------
+# Assertion-outcome wiring — pure string comparison beside the judged scores
+# ---------------------------------------------------------------------------
+
+
+class TestAssertionWiring:
+    @pytest.fixture
+    def mock_scorer(self):
+        scorer = AsyncMock()
+        scorer.score.return_value = {
+            "faithfulness": 0.8,
+            "answer_relevancy": 0.7,
+            "context_precision": 0.6,
+            "context_recall": 0.5,
+        }
+        return scorer
+
+    async def test_case_with_no_assertions_is_reported_judge_only_not_passing(
+        self, mock_scorer, tmp_path
+    ):
+        """The important guarantee: a case with nothing to check must not be
+        silently counted as a pass. It must be not_applicable."""
+        from evaluation.runner import EvaluationRunner
+
+        invoker = AsyncMock()
+        invoker.invoke.return_value = ("Pipeline answer", ["context"], [])
+        case = TestCase(question="Q", expected_answer="Some prose with no anchor")
+        assert case.assertions == []
+
+        run = await EvaluationRunner(invoker, mock_scorer, tmp_path).run(
+            [case], plugin_type="guidance"
+        )
+
+        outcome = run.cases[0].assertion_outcome
+        assert outcome is not None
+        assert outcome.status == "not_applicable"
+        # Explicitly not "passed" — the whole point of the layer.
+        assert outcome.status != "passed"
+
+    async def test_case_with_satisfied_assertion_is_reported_passed(
+        self, mock_scorer, tmp_path
+    ):
+        from evaluation.runner import EvaluationRunner
+
+        invoker = AsyncMock()
+        invoker.invoke.return_value = ("Email support@alkem.io for help.", ["context"], [])
+        case = TestCase(
+            question="Q",
+            expected_answer="Contact support@alkem.io.",
+            assertions=[Assertion(kind="contains", values=["support@alkem.io"])],
+        )
+
+        run = await EvaluationRunner(invoker, mock_scorer, tmp_path).run(
+            [case], plugin_type="guidance"
+        )
+
+        assert run.cases[0].assertion_outcome.status == "passed"
+
+    async def test_case_with_unsatisfied_assertion_is_reported_failed_with_missing_fact(
+        self, mock_scorer, tmp_path
+    ):
+        from evaluation.runner import EvaluationRunner
+
+        invoker = AsyncMock()
+        invoker.invoke.return_value = ("Please reach out to our team.", ["context"], [])
+        case = TestCase(
+            question="Q",
+            expected_answer="Contact support@alkem.io.",
+            assertions=[Assertion(kind="contains", values=["support@alkem.io"])],
+        )
+
+        run = await EvaluationRunner(invoker, mock_scorer, tmp_path).run(
+            [case], plugin_type="guidance"
+        )
+
+        outcome = run.cases[0].assertion_outcome
+        assert outcome.status == "failed"
+        assert outcome.missing == ["support@alkem.io"]
+
+    async def test_assertion_evaluation_is_never_attempted_on_a_failed_invocation(
+        self, mock_scorer, tmp_path
+    ):
+        """A pipeline failure has no answer to check — assertion_outcome
+        must stay unset, not default to any verdict."""
+        from evaluation.runner import EvaluationRunner
+
+        invoker = AsyncMock()
+        invoker.invoke.side_effect = RuntimeError("pipeline down")
+        case = TestCase(
+            question="Q",
+            expected_answer="Contact support@alkem.io.",
+            assertions=[Assertion(kind="contains", values=["support@alkem.io"])],
+        )
+
+        run = await EvaluationRunner(invoker, mock_scorer, tmp_path).run(
+            [case], plugin_type="guidance"
+        )
+
+        assert run.cases[0].assertion_outcome is None
+
+
+# ---------------------------------------------------------------------------
+# category_scope persistence and the unpointed-run warning
+# ---------------------------------------------------------------------------
+
+
+class TestCategoryScopePersistence:
+    @pytest.fixture
+    def mock_scorer(self):
+        scorer = AsyncMock()
+        scorer.score.return_value = {
+            "faithfulness": 0.8,
+            "answer_relevancy": 0.7,
+            "context_precision": 0.6,
+            "context_recall": 0.5,
+        }
+        return scorer
+
+    async def test_category_scope_is_persisted_on_the_run(self, mock_scorer, tmp_path):
+        from evaluation.runner import EvaluationRunner
+
+        invoker = AsyncMock()
+        invoker.invoke.return_value = ("answer", [], [])
+        run = await EvaluationRunner(invoker, mock_scorer, tmp_path).run(
+            _make_test_cases(1), plugin_type="guidance", category_scope="documentation"
+        )
+        assert run.category_scope == "documentation"
+        assert run.category_scope_missing_body_of_knowledge is False
+
+    async def test_bok_scoped_category_without_id_is_marked_and_continues(
+        self, mock_scorer, tmp_path, caplog
+    ):
+        from evaluation.runner import EvaluationRunner
+
+        invoker = AsyncMock()
+        invoker.invoke.return_value = ("answer", [], [])
+        run = await EvaluationRunner(invoker, mock_scorer, tmp_path).run(
+            _make_test_cases(1),
+            plugin_type="guidance",
+            category_scope="building-alkemio",
+            body_of_knowledge_id=None,
+        )
+        assert run.category_scope_missing_body_of_knowledge is True
+        assert run.success_count == 1  # continues, does not hard-fail
+
+    async def test_bok_scoped_category_with_id_is_not_marked(self, mock_scorer, tmp_path):
+        from evaluation.runner import EvaluationRunner
+
+        invoker = AsyncMock()
+        invoker.invoke.return_value = ("answer", [], [])
+        run = await EvaluationRunner(invoker, mock_scorer, tmp_path).run(
+            _make_test_cases(1),
+            plugin_type="guidance",
+            category_scope="design-thinker",
+            body_of_knowledge_id="bok-1",
+        )
+        assert run.category_scope_missing_body_of_knowledge is False
+
+    async def test_omitted_category_scope_is_none(self, mock_scorer, tmp_path):
+        from evaluation.runner import EvaluationRunner
+
+        invoker = AsyncMock()
+        invoker.invoke.return_value = ("answer", [], [])
+        run = await EvaluationRunner(invoker, mock_scorer, tmp_path).run(
+            _make_test_cases(1), plugin_type="guidance"
+        )
+        assert run.category_scope is None
+        assert run.category_scope_missing_body_of_knowledge is False

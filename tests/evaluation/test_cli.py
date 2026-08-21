@@ -270,3 +270,102 @@ def test_nominal_v5_fixture_is_self_consistent(tmp_path, monkeypatch) -> None:
     (directory / "on.json").write_text(on.model_dump_json())
     monkeypatch.chdir(tmp_path)
     assert CliRunner().invoke(cli, ["compare", "flat", "on"]).exit_code == 0
+
+
+# ---------------------------------------------------------------------------
+# --category scoping
+# ---------------------------------------------------------------------------
+
+
+def test_run_rejects_unknown_category_before_test_set_load(monkeypatch) -> None:
+    """Click's Choice type must fail before _run_evaluation (and thus the
+    test set and pipeline) is ever touched."""
+    called = False
+
+    async def record(*_args):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr("evaluation.cli._run_evaluation", record)
+    result = CliRunner().invoke(
+        cli, ["run", "--plugin", "guidance", "--category", "not-a-real-category"]
+    )
+    assert result.exit_code != 0
+    assert "documentation" in result.output
+    assert "building-alkemio" in result.output
+    assert "design-thinker" in result.output
+    assert called is False
+
+
+def test_run_category_selecting_zero_cases_fails_fast_before_pipeline_boot(
+    tmp_path, monkeypatch
+) -> None:
+    """A known category that matches nothing in this test set is a distinct,
+    dataset-shaped failure — not the same message as an unknown category —
+    and must exit before any pipeline construction."""
+    test_set = tmp_path / "cases.jsonl"
+    test_set.write_text(
+        '{"question":"q1","expected_answer":"a1","category":"documentation"}\n'
+    )
+
+    def boot_guard(*_args, **_kwargs):
+        raise AssertionError("pipeline must not be constructed on zero-case scope")
+
+    monkeypatch.setattr("evaluation.pipeline_invoker.PipelineInvoker", boot_guard)
+    result = CliRunner().invoke(
+        cli,
+        [
+            "run",
+            "--plugin",
+            "guidance",
+            "--test-set",
+            str(test_set),
+            "--category",
+            "design-thinker",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "design-thinker" in result.output
+    assert "zero cases" in result.output
+
+
+def test_run_category_flows_through_to_evaluation(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    async def record(*args):
+        captured["category"] = args[5]
+
+    def consume(coro):
+        try:
+            coro.send(None)
+        except StopIteration:
+            pass
+
+    monkeypatch.setattr("evaluation.cli._run_evaluation", record)
+    monkeypatch.setattr("evaluation.cli.asyncio.run", consume)
+    result = CliRunner().invoke(
+        cli, ["run", "--plugin", "guidance", "--category", "documentation"]
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["category"] == "documentation"
+
+
+def test_run_omitting_category_defaults_to_none(monkeypatch) -> None:
+    """Omitting --category MUST run all categories, preserving current
+    behaviour."""
+    captured: dict[str, object] = {}
+
+    async def record(*args):
+        captured["category"] = args[5]
+
+    def consume(coro):
+        try:
+            coro.send(None)
+        except StopIteration:
+            pass
+
+    monkeypatch.setattr("evaluation.cli._run_evaluation", record)
+    monkeypatch.setattr("evaluation.cli.asyncio.run", consume)
+    result = CliRunner().invoke(cli, ["run", "--plugin", "guidance"])
+    assert result.exit_code == 0, result.output
+    assert captured["category"] is None

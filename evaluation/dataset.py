@@ -125,6 +125,16 @@ def validate_test_set(path: Path = DEFAULT_TEST_SET_PATH) -> list[str]:
     return issues
 
 
+def filter_by_category(cases: list[TestCase], category: str) -> list[TestCase]:
+    """Restrict a loaded test set to the cases tagged with one category.
+
+    A case with no category (pre-existing or synthetic records predate the
+    field) never matches a specific filter — this is a mechanism for
+    narrowing a run, not for silently including untagged cases.
+    """
+    return [case for case in cases if case.category == category]
+
+
 def write_test_cases(cases: list[TestCase], path: Path) -> None:
     """Write test cases to a JSONL file."""
     path.parent.mkdir(parents=True, exist_ok=True)

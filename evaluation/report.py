@@ -9,6 +9,7 @@ import numbers
 import statistics
 
 from plugins.expert.composition import expert_full_composition_fingerprint
+from evaluation.assertions import AssertionOutcome
 from evaluation.case_identity import CASE_IDENTITY_VERSION
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -60,6 +61,7 @@ class EvaluationCase(BaseModel):
     retrieved_contexts: list[str] = Field(default_factory=list)
     retrieved_sources: list[SourceInfo] = Field(default_factory=list)
     scores: MetricScores | None = None
+    assertion_outcome: AssertionOutcome | None = None
     duration_seconds: float
     error: str | None = None
 
@@ -112,6 +114,8 @@ class EvaluationRun(BaseModel):
     duration_seconds: float
     aggregate: dict[str, AggregateMetrics]
     cases: list[EvaluationCase]
+    category_scope: str | None = None
+    category_scope_missing_body_of_knowledge: bool = False
 
 
 def load_comparison_run(raw_json: str) -> EvaluationRun:
@@ -163,12 +167,67 @@ class MetricDelta(BaseModel):
     percentage_change: float
 
 
+class ExactMatchSummary(BaseModel):
+    """Aggregate deterministic assertion outcome across one run.
+
+    ``not_applicable`` cases (no derived assertions) are carried separately
+    and never folded into the pass rate — a case with nothing to check is
+    neither a pass nor a failure.
+    """
+
+    passed: int = 0
+    failed: int = 0
+    not_applicable: int = 0
+
+    @property
+    def checked(self) -> int:
+        return self.passed + self.failed
+
+    @property
+    def pass_rate(self) -> float | None:
+        return self.passed / self.checked if self.checked else None
+
+
+def compute_exact_match_summary(cases: list[EvaluationCase]) -> ExactMatchSummary:
+    """Tally per-case assertion outcomes. Cases with no outcome recorded
+    (e.g. a failed pipeline invocation) count toward neither bucket."""
+    summary = ExactMatchSummary()
+    for case in cases:
+        outcome = case.assertion_outcome
+        if outcome is None:
+            continue
+        if outcome.status == "passed":
+            summary.passed += 1
+        elif outcome.status == "failed":
+            summary.failed += 1
+        else:
+            summary.not_applicable += 1
+    return summary
+
+
+class ExactMatchDelta(BaseModel):
+    """Before/after comparison of the exact-match pass rate.
+
+    Carries each side's ``checked``/``not_applicable`` counts rather than
+    only the rate, so a comparison is never read against a silently changed
+    denominator.
+    """
+
+    baseline_pass_rate: float | None
+    current_pass_rate: float | None
+    baseline_checked: int
+    baseline_not_applicable: int
+    current_checked: int
+    current_not_applicable: int
+
+
 class ComparisonReport(BaseModel):
     """Before/after comparison between two evaluation runs."""
 
     baseline_id: str
     current_id: str
     deltas: dict[str, MetricDelta]
+    exact_match: ExactMatchDelta | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -242,6 +301,31 @@ def format_run_summary(run: EvaluationRun, output_path: str | None = None) -> st
                 f"  {name:<22}{agg.mean:>8.3f}{agg.median:>8.3f}{agg.min:>8.3f}{agg.max:>8.3f}"
             )
 
+    if run.category_scope:
+        lines.append("")
+        lines.append(f"Category scope: {run.category_scope}")
+        if run.category_scope_missing_body_of_knowledge:
+            lines.append(
+                "  WARNING: this category expects --body-of-knowledge-id and none was supplied"
+            )
+
+    # Exact-match assertions — a separate deterministic layer, never blended
+    # into the judged metrics table above.
+    exact_match = compute_exact_match_summary(run.cases)
+    lines.append("")
+    lines.append("Exact-match assertions (deterministic, separate from judged metrics):")
+    if exact_match.checked:
+        lines.append(
+            f"  Pass rate: {exact_match.passed}/{exact_match.checked}"
+            f" ({exact_match.pass_rate:.1%})"
+            f" | not-applicable (no derivable fact): {exact_match.not_applicable}"
+        )
+    else:
+        lines.append(
+            f"  No checkable cases in this run"
+            f" | judge-only: {exact_match.not_applicable}"
+        )
+
     # Failures
     failures = [c for c in run.cases if c.error is not None]
     lines.append("")
@@ -286,6 +370,31 @@ def format_comparison(report: ComparisonReport) -> str:
 
     lines.append("")
     lines.append(f"Overall: {improved}/{total} metrics improved, {regressed}/{total} regressed")
+
+    if report.exact_match is not None:
+        em = report.exact_match
+        lines.append("")
+        lines.append("Exact-match assertions (deterministic, separate from judged metrics):")
+
+        def _rate(rate: float | None) -> str:
+            return f"{rate:.1%}" if rate is not None else "N/A"
+
+        lines.append(
+            f"  Baseline: {_rate(em.baseline_pass_rate)}"
+            f" ({em.baseline_checked} checked, {em.baseline_not_applicable} not-applicable)"
+        )
+        lines.append(
+            f"  Current:  {_rate(em.current_pass_rate)}"
+            f" ({em.current_checked} checked, {em.current_not_applicable} not-applicable)"
+        )
+        if (
+            em.baseline_checked != em.current_checked
+            or em.baseline_not_applicable != em.current_not_applicable
+        ):
+            lines.append(
+                "  NOTE: checked/not-applicable denominators differ between runs —"
+                " the pass-rate delta is not a like-for-like comparison"
+            )
 
     return "\n".join(lines)
 
@@ -341,10 +450,22 @@ def compute_comparison(
                 percentage_change=pct_change,
             )
 
+    baseline_em = compute_exact_match_summary(baseline.cases)
+    current_em = compute_exact_match_summary(current.cases)
+    exact_match = ExactMatchDelta(
+        baseline_pass_rate=baseline_em.pass_rate,
+        current_pass_rate=current_em.pass_rate,
+        baseline_checked=baseline_em.checked,
+        baseline_not_applicable=baseline_em.not_applicable,
+        current_checked=current_em.checked,
+        current_not_applicable=current_em.not_applicable,
+    )
+
     return ComparisonReport(
         baseline_id=baseline.id,
         current_id=current.id,
         deltas=deltas,
+        exact_match=exact_match,
     )
 
 

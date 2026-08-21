@@ -11,14 +11,18 @@ from evaluation.dataset import (
     successful_case_digest,
 )
 
+from evaluation.assertions import AssertionOutcome
 from evaluation.report import (
     AggregateMetrics,
     ComparisonReport,
     EvaluationCase,
     EvaluationRun,
+    ExactMatchDelta,
+    ExactMatchSummary,
     MetricDelta,
     MetricScores,
     compute_comparison,
+    compute_exact_match_summary,
     format_comparison,
     format_run_summary,
 )
@@ -226,6 +230,94 @@ class TestFormatRunSummary:
         run = _make_run()
         output = format_run_summary(run)
         assert "Failures: 0/1" in output
+
+    def test_no_checked_assertions_is_reported_judge_only_not_silently_passing(self):
+        """The case with no assertion_outcome at all (the default _make_run
+        fixture) must render as judge-only, never folded into a pass rate."""
+        run = _make_run()
+        output = format_run_summary(run)
+        assert "No checkable cases in this run" in output
+        assert "judge-only: 0" in output
+        # Never claims a pass rate for a run with nothing checked.
+        assert "Pass rate" not in output
+
+    def test_checked_assertions_render_pass_rate_separately_from_metrics(self):
+        run = _make_run()
+        run.cases[0].assertion_outcome = AssertionOutcome(status="passed", missing=[])
+        output = format_run_summary(run)
+        assert "Pass rate: 1/1 (100.0%)" in output
+        assert "not-applicable (no derivable fact): 0" in output
+
+    def test_unanchored_case_among_others_counts_as_not_applicable_not_passed(self):
+        run = _make_run()
+        run.cases[0].assertion_outcome = AssertionOutcome(status="not_applicable", missing=[])
+        output = format_run_summary(run)
+        assert "No checkable cases in this run" in output
+        assert "judge-only: 1" in output
+
+    def test_category_scope_is_rendered(self):
+        run = _make_run()
+        run.category_scope = "documentation"
+        output = format_run_summary(run)
+        assert "Category scope: documentation" in output
+        assert "WARNING" not in output
+
+    def test_category_scope_missing_body_of_knowledge_warns(self):
+        run = _make_run()
+        run.category_scope = "building-alkemio"
+        run.category_scope_missing_body_of_knowledge = True
+        output = format_run_summary(run)
+        assert "WARNING" in output
+        assert "--body-of-knowledge-id" in output
+
+    def test_no_category_scope_omits_the_section(self):
+        run = _make_run()
+        output = format_run_summary(run)
+        assert "Category scope" not in output
+
+
+class TestComputeExactMatchSummary:
+    def _case(self, status: str) -> EvaluationCase:
+        return EvaluationCase(
+            index=0,
+            question="Q",
+            expected_answer="A",
+            relevant_documents=[],
+            pipeline_answer="answer",
+            scores=MetricScores(
+                faithfulness=0.8, answer_relevancy=0.7,
+                context_precision=0.6, context_recall=0.5,
+            ),
+            assertion_outcome=AssertionOutcome(status=status, missing=[]),
+            duration_seconds=1.0,
+        )
+
+    def test_tallies_each_status_into_its_own_bucket(self):
+        cases = [self._case("passed"), self._case("passed"), self._case("failed"), self._case("not_applicable")]
+        summary = compute_exact_match_summary(cases)
+        assert summary.passed == 2
+        assert summary.failed == 1
+        assert summary.not_applicable == 1
+        assert summary.checked == 3
+
+    def test_pass_rate_excludes_not_applicable_from_denominator(self):
+        cases = [self._case("passed"), self._case("not_applicable"), self._case("not_applicable")]
+        summary = compute_exact_match_summary(cases)
+        assert summary.checked == 1
+        assert summary.pass_rate == 1.0
+
+    def test_pass_rate_is_none_when_nothing_checked(self):
+        summary = compute_exact_match_summary([self._case("not_applicable")])
+        assert summary.checked == 0
+        assert summary.pass_rate is None
+
+    def test_case_with_no_outcome_at_all_counts_toward_neither_bucket(self):
+        case = EvaluationCase(
+            index=0, question="Q", expected_answer="A", relevant_documents=[],
+            error="pipeline failed", duration_seconds=1.0,
+        )
+        summary = compute_exact_match_summary([case])
+        assert summary == ExactMatchSummary(passed=0, failed=0, not_applicable=0)
 
 
 def test_comparison_accepts_complete_expert_flat_to_on_pair():
@@ -726,3 +818,91 @@ class TestFormatComparison:
         assert "current" in output
         assert "faithfulness" in output
         assert "12.5%" in output
+
+    def test_omits_exact_match_section_when_not_present(self):
+        report = ComparisonReport(baseline_id="b", current_id="c", deltas={})
+        output = format_comparison(report)
+        assert "Exact-match assertions" not in output
+
+    def test_renders_exact_match_delta_when_present(self):
+        report = ComparisonReport(
+            baseline_id="b",
+            current_id="c",
+            deltas={},
+            exact_match=ExactMatchDelta(
+                baseline_pass_rate=0.5,
+                current_pass_rate=0.75,
+                baseline_checked=4,
+                baseline_not_applicable=1,
+                current_checked=4,
+                current_not_applicable=1,
+            ),
+        )
+        output = format_comparison(report)
+        assert "Exact-match assertions" in output
+        assert "50.0%" in output
+        assert "75.0%" in output
+        assert "NOTE" not in output
+
+    def test_flags_denominator_mismatch_between_runs(self):
+        report = ComparisonReport(
+            baseline_id="b",
+            current_id="c",
+            deltas={},
+            exact_match=ExactMatchDelta(
+                baseline_pass_rate=1.0,
+                current_pass_rate=1.0,
+                baseline_checked=2,
+                baseline_not_applicable=3,
+                current_checked=4,
+                current_not_applicable=1,
+            ),
+        )
+        output = format_comparison(report)
+        assert "NOTE" in output
+        assert "not a like-for-like comparison" in output
+
+    def test_renders_na_when_a_side_has_no_checked_cases(self):
+        report = ComparisonReport(
+            baseline_id="b",
+            current_id="c",
+            deltas={},
+            exact_match=ExactMatchDelta(
+                baseline_pass_rate=None,
+                current_pass_rate=1.0,
+                baseline_checked=0,
+                baseline_not_applicable=5,
+                current_checked=2,
+                current_not_applicable=0,
+            ),
+        )
+        output = format_comparison(report)
+        assert "N/A" in output
+
+
+class TestComputeComparisonExactMatch:
+    def test_comparison_includes_exact_match_delta_computed_from_both_runs(self):
+        baseline = _make_run("baseline")
+        baseline.cases[0].assertion_outcome = AssertionOutcome(status="passed", missing=[])
+        current = _make_run("current")
+        current.cases[0].assertion_outcome = AssertionOutcome(status="failed", missing=["x"])
+
+        report = compute_comparison(baseline, current)
+
+        assert report.exact_match is not None
+        assert report.exact_match.baseline_pass_rate == 1.0
+        assert report.exact_match.current_pass_rate == 0.0
+        assert report.exact_match.baseline_checked == 1
+        assert report.exact_match.current_checked == 1
+
+    def test_comparison_exact_match_is_none_pass_rate_when_all_cases_unanchored(self):
+        baseline = _make_run("baseline")
+        current = _make_run("current")
+
+        report = compute_comparison(baseline, current)
+
+        assert report.exact_match is not None
+        assert report.exact_match.baseline_pass_rate is None
+        assert report.exact_match.current_pass_rate is None
+        assert report.exact_match.baseline_not_applicable == 0
+        assert report.exact_match.baseline_checked == 0
