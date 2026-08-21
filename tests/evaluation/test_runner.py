@@ -728,6 +728,31 @@ class TestAssertionWiring:
 
         assert run.cases[0].assertion_outcome is None
 
+    async def test_assertion_outcome_survives_a_judge_failure(self, tmp_path):
+        """The deterministic verdict must not depend on the judge succeeding.
+        A judge outage must still leave the free, offline assertion check
+        computed and attached to the case."""
+        from evaluation.runner import EvaluationRunner
+
+        invoker = AsyncMock()
+        invoker.invoke.return_value = ("Email support@alkem.io for help.", ["context"], [])
+        scorer = AsyncMock()
+        scorer.score.side_effect = ConnectionError("Judge model unreachable")
+        case = TestCase(
+            question="Q",
+            expected_answer="Contact support@alkem.io.",
+            assertions=[Assertion(kind="contains", values=["support@alkem.io"])],
+        )
+
+        run = await EvaluationRunner(invoker, scorer, tmp_path).run(
+            [case], plugin_type="guidance"
+        )
+
+        assert run.cases[0].error is not None
+        outcome = run.cases[0].assertion_outcome
+        assert outcome is not None
+        assert outcome.status == "passed"
+
 
 # ---------------------------------------------------------------------------
 # category_scope persistence and the unpointed-run warning

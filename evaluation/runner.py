@@ -179,8 +179,15 @@ class EvaluationRunner:
                 failure_count += 1
                 continue
 
+            assert answer is not None
+
+            # Pure string comparison against the derived assertions — no
+            # model, no socket, no credentials. Computed unconditionally,
+            # before the judge call, so a judge outage never erases a
+            # deterministic verdict that was already available for free.
+            assertion_outcome = evaluate_assertions(answer, tc.assertions)
+
             try:
-                assert answer is not None
                 scores_dict = await self._scorer.score(
                     question=tc.question,
                     answer=answer,
@@ -195,11 +202,6 @@ class EvaluationRunner:
                     SourceInfo(uri=s.get("uri"), title=s.get("title"), score=s.get("score"))
                     for s in sources_meta
                 ]
-
-                # Pure string comparison against the derived assertions — no
-                # model, no socket, no credentials. Separate from, never
-                # blended into, the judged RAGAS scores above.
-                assertion_outcome = evaluate_assertions(answer, tc.assertions)
 
                 cases.append(EvaluationCase(
                     index=idx,
@@ -233,6 +235,7 @@ class EvaluationRunner:
                     retrieved_contexts=contexts,
                     retrieved_sources=sources,
                     error=str(exc),
+                    assertion_outcome=assertion_outcome,
                     duration_seconds=case_duration,
                 ))
                 failure_count += 1
