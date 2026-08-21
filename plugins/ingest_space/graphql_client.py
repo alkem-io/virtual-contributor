@@ -5,14 +5,23 @@ from __future__ import annotations
 import asyncio
 import logging
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlsplit
 
 import httpx
+
+from plugins.ingest_space.link_extractor import _MIME_KIND, _detect_kind
+from plugins.url_guard import (
+    MAX_REDIRECT_HOPS as _MAX_REDIRECT_HOPS,
+    RefusalCategory,
+    guarded_fetch,
+    rewrite_target,
+)
 
 logger = logging.getLogger(__name__)
 
 MAX_RETRIES = 3
 BASE_DELAY = 1.0
+MAX_REDIRECT_HOPS = _MAX_REDIRECT_HOPS
 
 
 class GraphQLClient:
@@ -30,52 +39,18 @@ class GraphQLClient:
         self._email = email
         self._password = password
         self._session_token: str | None = None
-        # Cache the scheme/host of the GraphQL endpoint so we can rewrite
-        # foreign (e.g. production-shaped) Alkemio URIs onto our deployment.
-        parts = urlsplit(self._graphql_endpoint)
-        self._base_scheme = parts.scheme or "http"
-        self._base_netloc = parts.netloc
+        self.last_fetch_refusal: RefusalCategory | None = None
 
     def _rewrite_alkemio_uri(self, url: str) -> str:
-        """Point known Alkemio storage URIs at the configured host.
-
-        Seed data often carries prod-shaped URIs (e.g.
-        ``https://alkem.io/api/private/rest/storage/document/<id>``) even
-        on dev installations.  If the URI path looks like an Alkemio
-        internal API call, swap in our deployment's scheme+host.
-
-        Only rewrites when the host is a known Alkemio host (ends with
-        ``alkem.io``), matches the configured deployment, or is missing
-        (relative URL).  External URLs are never rewritten.
-        """
-        if not url:
-            return url
-        parts = urlsplit(url)
-        path = parts.path or ""
-        # Only rewrite if host is known Alkemio, same as our deployment,
-        # or missing (relative URL).
-        if (
-            parts.netloc
-            and parts.netloc != self._base_netloc
-            and not parts.netloc.endswith("alkem.io")
-        ):
-
-            return url
-        if path.startswith("/api/") or path.startswith("/rest/"):
-            return urlunsplit((
-                self._base_scheme,
-                self._base_netloc,
-                path,
-                parts.query,
-                parts.fragment,
-            ))
-        return url
+        """Delegate URI rewriting to the measured outbound URL policy."""
+        return rewrite_target(url, self._graphql_endpoint)
 
     async def fetch_url(
         self,
         url: str,
         *,
         max_bytes: int = 10 * 1024 * 1024,
+        link_id: str | None = None,
     ) -> tuple[bytes, str] | None:
         """Fetch an arbitrary URL using the authenticated session.
 
@@ -83,42 +58,89 @@ class GraphQLClient:
         fetch fails, the content is too large, or auth fails.  Never
         raises — callers keep ingesting other documents.
         """
-        if not self._session_token:
-            try:
-                await self.authenticate()
-            except Exception as exc:
-                logger.warning("Authentication failed for URL fetch: %s", exc)
-                return None
-
         target = self._rewrite_alkemio_uri(url)
-        target_parts = urlsplit(target)
-        headers: dict[str, str] = {}
-        if target_parts.netloc == self._base_netloc and self._session_token:
-            headers["Authorization"] = f"Bearer {self._session_token}"
-        try:
-            async with httpx.AsyncClient(
-                timeout=60.0, follow_redirects=True,
-            ) as client:
-                resp = await client.get(target, headers=headers)
-                if resp.status_code != 200:
-                    logger.info(
-                        "Link fetch returned %d for %s", resp.status_code, target,
-                    )
-                    return None
-                content_type = (
-                    resp.headers.get("content-type", "") or ""
-                ).split(";")[0].strip().lower()
-                body = resp.content
-                if len(body) > max_bytes:
-                    logger.info(
-                        "Link body too large (%d bytes) for %s — skipping",
-                        len(body), target,
-                    )
-                    return None
-                return body, content_type
-        except Exception as exc:
-            logger.warning("Failed to fetch %s: %s", target, exc)
+        self.last_fetch_refusal = None
+        result = await guarded_fetch(
+            target,
+            max_bytes=max_bytes,
+            deployment_url=self._graphql_endpoint,
+            credential_token_provider=self._credential_token,
+            content_type_policy=self._content_type_policy,
+        )
+        if result.body is None:
+            self._refuse(
+                result.reason or RefusalCategory.TRANSPORT,
+                link_id=link_id,
+                target=result.url,
+                host=result.host,
+                hops=result.hops,
+                error_type=result.error_type,
+            )
             return None
+        return result.body, result.content_type
+
+    async def _credential_token(self) -> str | None:
+        """Return the authenticated session token without deciding its scope."""
+        if not self._session_token:
+            await self.authenticate()
+        return self._session_token
+
+    @staticmethod
+    def _is_supported_content_type(content_type: str) -> bool:
+        return any(token in content_type for token in _MIME_KIND)
+
+    @staticmethod
+    def _content_type_policy(content_type: str, sniff: bytes | None) -> bool | None:
+        """Accept known extractable types; sniff only unrecognised headers."""
+        if GraphQLClient._is_supported_content_type(content_type):
+            return True
+        if content_type.startswith(("image/", "audio/", "video/", "font/")):
+            return False
+        if sniff is None:
+            return None
+        return _detect_kind(sniff, content_type) is not None
+
+    def _refuse(
+        self,
+        category: RefusalCategory,
+        *,
+        link_id: str | None,
+        target: str = "",
+        host: str = "",
+        hops: int = 0,
+        error_type: str | None = None,
+    ) -> None:
+        """Record a fetch refusal without exposing member-authored URL data."""
+        self.last_fetch_refusal = category
+        scheme = ""
+        if target:
+            try:
+                parts = urlsplit(target)
+                scheme = parts.scheme.lower()
+                host = host or (parts.hostname or "").lower()
+            except (TypeError, ValueError):
+                pass
+        logger.info(
+            "Link fetch refused: link_id=%s category=%s scheme=%s host=%s hops=%d",
+            link_id or "",
+            category.value,
+            scheme,
+            host,
+            hops,
+            extra={
+                "link_id": link_id or "",
+                "refusal_category": category.value,
+                "scheme": scheme,
+                "host": host,
+                "hops": hops,
+            },
+        )
+        if error_type:
+            logger.warning(
+                "Link fetch refusal transport detail: link_id=%s error_type=%s",
+                link_id or "",
+                error_type,
+            )
 
     async def authenticate(self) -> None:
         """Authenticate via Kratos login flow."""
