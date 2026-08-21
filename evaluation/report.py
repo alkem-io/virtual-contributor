@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import math
 import json
+import logging
 import numbers
 import statistics
 
@@ -13,6 +14,8 @@ from evaluation.assertions import AssertionOutcome
 from evaluation.case_identity import CASE_IDENTITY_VERSION
 
 from pydantic import BaseModel, Field, field_validator, model_validator
+
+logger = logging.getLogger(__name__)
 
 
 class SourceInfo(BaseModel):
@@ -273,7 +276,16 @@ def canonical_metric_scores(values: dict[str, object]) -> dict[str, float]:
     canonical: dict[str, float] = {}
     for name, value in values.items():
         mapped = METRIC_ALIASES.get(name)
-        if mapped is None or mapped in canonical:
+        if mapped is None:
+            # A column RAGAS published under a name this map does not
+            # recognise (a metric rename, a new provider score, ...) must
+            # be visible in the logs, not swallowed into a bare exception
+            # that looks the same as every other malformed record.
+            logger.warning(
+                "Unrecognised RAGAS metric column %r ignored by the canonical metric map", name
+            )
+            raise ValueError("Evaluation metrics must use exactly the canonical inventory")
+        if mapped in canonical:
             raise ValueError("Evaluation metrics must use exactly the canonical inventory")
         canonical[mapped] = finite_unit_metric(_clamp_unit_float_error(value))
     if set(canonical) != set(METRIC_NAMES):

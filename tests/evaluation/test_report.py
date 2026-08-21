@@ -462,6 +462,42 @@ def test_successful_metric_scores_require_exact_non_null_inventory():
         )
 
 
+def test_canonical_metric_scores_maps_the_real_ragas_context_precision_column(caplog):
+    """Regression guard for D-1: RAGAS 0.4.3 never publishes a column named
+    ``context_precision`` — it publishes
+    ``llm_context_precision_without_reference``. If ``METRIC_ALIASES`` stops
+    mapping that published name to the stored ``context_precision`` field,
+    this test must fail: a genuine RAGAS harvest would then always be
+    missing the metric, exactly as it silently was before the fix.
+    """
+    from evaluation.report import canonical_metric_scores
+
+    canonical = canonical_metric_scores(
+        {
+            "faithfulness": 0.9,
+            "answer_relevancy": 0.8,
+            "llm_context_precision_without_reference": 0.7,
+            "context_recall": 0.6,
+        }
+    )
+    assert canonical["context_precision"] == 0.7
+
+    # FR-025: an unrecognised RAGAS column must be logged, not silently
+    # dropped, so this class of naming drift cannot regress unnoticed again.
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="evaluation.report"):
+        with pytest.raises(ValueError):
+            canonical_metric_scores(
+                {
+                    "faithfulness": 0.9,
+                    "answer_relevancy": 0.8,
+                    "some_future_ragas_rename": 0.7,
+                    "context_recall": 0.6,
+                }
+            )
+    assert any("some_future_ragas_rename" in record.message for record in caplog.records)
+
+
 def test_metric_scores_clamp_one_ulp_float_error_at_the_unit_boundary():
     """RAGAS's un-clamped cosine-mean metrics legitimately return e.g.
     1.0000000000000007 for a well-answered case; that must not fail-close
