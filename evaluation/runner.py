@@ -12,6 +12,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from evaluation.assertions import evaluate_assertions
 from evaluation.dataset import TestCase, canonical_test_set_digest, successful_case_digest
 from evaluation.case_identity import CASE_IDENTITY_VERSION
 from evaluation.report import (
@@ -90,6 +91,7 @@ class EvaluationRunner:
         test_set_path: str = "evaluation/golden/test_set.jsonl",
         body_of_knowledge_id: str | None = None,
         corpus_revision: str | None = None,
+        category_scope: str | None = None,
     ) -> EvaluationRun:
         """Execute the full evaluation suite.
 
@@ -97,6 +99,20 @@ class EvaluationRunner:
         Failed cases are recorded but do not stop the run (FR-010).
         """
         normalized_plugin = plugin_type.lower().replace("-", "_")
+        # A category whose retrieval path is BoK-scoped, run without one, is
+        # a valid but unpointed run — warn loudly and record it rather than
+        # hard-failing.
+        category_scope_missing_body_of_knowledge = bool(
+            category_scope
+            and category_scope in {"building-alkemio", "design-thinker"}
+            and not body_of_knowledge_id
+        )
+        if category_scope_missing_body_of_knowledge:
+            logger.warning(
+                "Category %r expects --body-of-knowledge-id and none was supplied;"
+                " retrieval for this run is unpointed",
+                category_scope,
+            )
         if normalized_plugin == "expert" and (
             not isinstance(corpus_revision, str)
             or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}", corpus_revision) is None
@@ -163,6 +179,14 @@ class EvaluationRunner:
                 failure_count += 1
                 continue
 
+            assert answer is not None
+
+            # Pure string comparison against the derived assertions — no
+            # model, no socket, no credentials. Computed unconditionally,
+            # before the judge call, so a judge outage never erases a
+            # deterministic verdict that was already available for free.
+            assertion_outcome = evaluate_assertions(answer, tc.assertions)
+
             try:
                 scores_dict = await self._scorer.score(
                     question=tc.question,
@@ -188,6 +212,7 @@ class EvaluationRunner:
                     retrieved_contexts=contexts,
                     retrieved_sources=sources,
                     scores=MetricScores(**scores_dict),
+                    assertion_outcome=assertion_outcome,
                     duration_seconds=case_duration,
                 ))
                 success_count += 1
@@ -210,6 +235,7 @@ class EvaluationRunner:
                     retrieved_contexts=contexts,
                     retrieved_sources=sources,
                     error=str(exc),
+                    assertion_outcome=assertion_outcome,
                     duration_seconds=case_duration,
                 ))
                 failure_count += 1
@@ -239,6 +265,8 @@ class EvaluationRunner:
             duration_seconds=total_duration,
             aggregate=aggregate,
             cases=cases,
+            category_scope=category_scope,
+            category_scope_missing_body_of_knowledge=category_scope_missing_body_of_knowledge,
         )
 
         self._persist(run)

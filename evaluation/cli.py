@@ -13,13 +13,15 @@ from typing import cast
 
 import click
 
-from evaluation.dataset import load_test_set
+from evaluation.dataset import filter_by_category, load_test_set
 from evaluation.report import (
     format_run_summary,
     compute_comparison,
     format_comparison,
     load_comparison_run,
 )
+
+CATEGORIES = ("documentation", "building-alkemio", "design-thinker")
 
 
 def _setup_logging() -> None:
@@ -51,12 +53,31 @@ def cli():
     help="Body of knowledge ID (for expert plugin)",
 )
 @click.option("--corpus-revision", default=None, help="Immutable operator corpus/re-ingestion revision (required for Expert)")
-def run(plugin: str, label: str | None, test_set: str, body_of_knowledge_id: str | None, corpus_revision: str | None):
+@click.option(
+    "--category",
+    default=None,
+    type=click.Choice(CATEGORIES),
+    help="Restrict the run to one category. Categories exercise different"
+    " retrieval paths — building-alkemio and design-thinker also need"
+    " --body-of-knowledge-id. Omit to run all categories.",
+)
+def run(
+    plugin: str,
+    label: str | None,
+    test_set: str,
+    body_of_knowledge_id: str | None,
+    corpus_revision: str | None,
+    category: str | None,
+):
     """Run the evaluation suite against the pipeline."""
     plugin = plugin.lower().replace("-", "_")
     if plugin == "expert" and not corpus_revision:
         raise click.UsageError("Expert evaluation requires --corpus-revision")
-    asyncio.run(_run_evaluation(plugin, label, Path(test_set), body_of_knowledge_id, corpus_revision))
+    asyncio.run(
+        _run_evaluation(
+            plugin, label, Path(test_set), body_of_knowledge_id, corpus_revision, category
+        )
+    )
 
 
 async def _run_evaluation(
@@ -65,6 +86,7 @@ async def _run_evaluation(
     test_set_path: Path,
     body_of_knowledge_id: str | None,
     corpus_revision: str | None,
+    category: str | None = None,
 ) -> None:
     from core.config import BaseConfig
     from evaluation.metrics import create_metrics
@@ -79,6 +101,17 @@ async def _run_evaluation(
         sys.exit(1)
 
     click.echo(f"Loaded {len(test_cases)} test cases from {test_set_path}")
+
+    if category is not None:
+        test_cases = filter_by_category(test_cases, category)
+        if not test_cases:
+            click.echo(
+                f"Category {category!r} is valid but selects zero cases in this"
+                f" test set — this is a dataset problem, not a typo.",
+                err=True,
+            )
+            sys.exit(1)
+        click.echo(f"Scoped to category {category!r}: {len(test_cases)} cases")
 
     # Initialize pipeline
     # The explicit CLI selection wins over blank, generic, or conflicting env.
@@ -129,6 +162,7 @@ async def _run_evaluation(
             test_set_path=str(test_set_path),
             body_of_knowledge_id=body_of_knowledge_id,
             corpus_revision=corpus_revision,
+            category_scope=category,
         )
         click.echo("")
         click.echo(format_run_summary(evaluation_run))
