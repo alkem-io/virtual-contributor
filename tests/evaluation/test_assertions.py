@@ -104,6 +104,24 @@ def test_enumeration_requires_trailing_period():
     assert assertions == []
 
 
+def test_enumeration_strips_embedded_typographic_quoting_from_derived_value():
+    """An enumeration item can embed the operator's quoting around a
+    sub-phrase; the derived assertion value must check the fact, not the
+    operator's punctuation choice — corr-vc-4 / spec-vc-6."""
+    answer = 'Brainstorming, "How might we" statements, affinity diagramming, 6 Thinking Hats, and dot voting.'
+    assertions = derive_assertions(answer)
+    contains_all = next(a for a in assertions if a.kind == "contains_all")
+    assert "How might we statements" in contains_all.values
+    assert '"How might we" statements' not in contains_all.values
+
+
+def test_enumeration_strips_curly_quotes_from_derived_value():
+    answer = "Brainstorming, “How might we” statements, affinity diagramming, dot voting, prototyping."
+    assertions = derive_assertions(answer)
+    contains_all = next(a for a in assertions if a.kind == "contains_all")
+    assert "How might we statements" in contains_all.values
+
+
 # ---------------------------------------------------------------------------
 # evaluate_assertions
 # ---------------------------------------------------------------------------
@@ -148,6 +166,42 @@ def test_evaluation_collapses_whitespace():
     assert outcome.status == "passed"
 
 
+def test_answer_without_operators_quoting_passes_contains_all():
+    """A semantically correct pipeline answer that omits the operator's
+    typographic quoting around a listed fact must still pass — corr-vc-4 /
+    spec-vc-6. Only case and whitespace were ever supposed to be forgiven;
+    this closes the gap where the operator's punctuation was silently
+    required too."""
+    assertions = [
+        Assertion(
+            kind="contains_all",
+            values=["Brainstorming", "How might we statements", "affinity diagramming"],
+        )
+    ]
+    outcome = evaluate_assertions(
+        "The techniques are Brainstorming, How might we statements, and affinity diagramming.",
+        assertions,
+    )
+    assert outcome.status == "passed"
+    assert outcome.missing == []
+
+
+def test_quoted_ui_label_contains_rule_is_unaffected_either_direction():
+    """The `contains` rule that legitimately keys off a quoted UI string
+    stores the phrase without quotes (unchanged: _QUOTE_RE's capture group
+    already excludes them), and an answer may state the phrase with or
+    without quotes — the quoted content is the fact, the punctuation never
+    is, in either direction."""
+    assertions = derive_assertions('Click "Explore Spaces" from the menu.')
+    assert assertions == [Assertion(kind="contains", values=["Explore Spaces"])]
+
+    unquoted = evaluate_assertions("Click Explore Spaces from the menu.", assertions)
+    assert unquoted.status == "passed"
+
+    quoted = evaluate_assertions('Click "Explore Spaces" from the menu.', assertions)
+    assert quoted.status == "passed"
+
+
 def test_paren_aware_item_matches_verbatim_in_pipeline_answer():
     assertions = [
         Assertion(kind="contains_all", values=["Admin (manages settings, membership)", "Member"])
@@ -165,17 +219,42 @@ def test_paren_aware_item_matches_verbatim_in_pipeline_answer():
 
 def test_module_imports_and_evaluates_with_no_credentials_configured():
     """The module must work standing alone: import it fresh and evaluate,
-    with nothing resembling a config or environment lookup in the process."""
-    import importlib
+    with nothing resembling a config or environment lookup in the process.
 
-    import evaluation.assertions as assertions_module
+    Loaded under a private module name via importlib.util rather than
+    importlib.reload()'d in place: reload() replaces the Assertion/
+    AssertionOutcome classes on the shared `evaluation.assertions` module
+    object that evaluation/report.py and evaluation/dataset.py already hold
+    references to, so any later isinstance() check against those imported
+    names would fail against the new-identity reloaded classes. A private
+    load proves the same "no credentials needed" property without leaving
+    that cross-test pollution behind.
+    """
+    import importlib.util
+    import sys
 
-    reloaded = importlib.reload(assertions_module)
-    outcome = reloaded.evaluate_assertions(
-        "support@alkem.io",
-        [reloaded.Assertion(kind="contains", values=["support@alkem.io"])],
+    probe_name = "evaluation._assertions_fresh_import_probe"
+    spec = importlib.util.spec_from_file_location(
+        probe_name,
+        sys.modules["evaluation.assertions"].__file__,
     )
-    assert outcome.status == "passed"
+    assert spec is not None and spec.loader is not None
+    fresh_module = importlib.util.module_from_spec(spec)
+    # Pydantic resolves the module's `from __future__ import annotations`
+    # forward refs (AssertionKind) by looking the module up in sys.modules,
+    # so it must be registered there — under its own private name, never
+    # overwriting "evaluation.assertions" — before exec_module runs.
+    sys.modules[probe_name] = fresh_module
+    try:
+        spec.loader.exec_module(fresh_module)
+
+        outcome = fresh_module.evaluate_assertions(
+            "support@alkem.io",
+            [fresh_module.Assertion(kind="contains", values=["support@alkem.io"])],
+        )
+        assert outcome.status == "passed"
+    finally:
+        del sys.modules[probe_name]
 
 
 def test_module_does_not_import_network_or_credential_modules():

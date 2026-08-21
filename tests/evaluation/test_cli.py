@@ -369,3 +369,65 @@ def test_run_omitting_category_defaults_to_none(monkeypatch) -> None:
     result = CliRunner().invoke(cli, ["run", "--plugin", "guidance"])
     assert result.exit_code == 0, result.output
     assert captured["category"] is None
+
+
+def test_category_scope_reaches_evaluation_runner_run(monkeypatch, tmp_path) -> None:
+    """The tests above only pin that --category reaches _run_evaluation's own
+    argument. They never exercise what _run_evaluation does with it, so a
+    typo that drops the value before EvaluationRunner.run(category_scope=...)
+    would leave the suite green. Drive the real _run_evaluation body and
+    assert the value actually lands on the runner call."""
+    from core.container import Container
+    from core.ports.knowledge_store import KnowledgeStorePort
+    from core.ports.llm import LLMPort
+    from plugins.guidance.plugin import GuidancePlugin
+    from tests.conftest import MockKnowledgeStorePort, MockLLMPort
+    from tests.evaluation.test_report import _make_run
+
+    captured: dict[str, object] = {}
+
+    class FakeRunner:
+        def __init__(self, pipeline_invoker, scorer, *args, **kwargs) -> None:
+            pass
+
+        async def run(self, *_args, **kwargs):
+            captured["category_scope"] = kwargs.get("category_scope")
+            return _make_run("run", plugin_type="guidance")
+
+    def adapters(_config, container: Container, *_args) -> None:
+        llm = MockLLMPort(response="answer")
+        llm._llm = object()
+        container.register(LLMPort, llm)
+        container.register(KnowledgeStorePort, MockKnowledgeStorePort())
+
+    class Embeddings:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+    test_set = tmp_path / "cases.jsonl"
+    test_set.write_text(
+        '{"question":"q","expected_answer":"a","category":"documentation"}\n'
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_BASE_URL", "http://local")
+    monkeypatch.setattr("main._create_adapters", adapters)
+    monkeypatch.setattr("evaluation.pipeline_invoker.PluginRegistry.discover", lambda *_: GuidancePlugin)
+    monkeypatch.setattr("evaluation.runner.EvaluationRunner", FakeRunner)
+    monkeypatch.setattr("evaluation.metrics.create_metrics", lambda *_args: [])
+    monkeypatch.setattr("langchain_openai.OpenAIEmbeddings", Embeddings)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "run",
+            "--plugin",
+            "guidance",
+            "--test-set",
+            str(test_set),
+            "--category",
+            "documentation",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["category_scope"] == "documentation"
