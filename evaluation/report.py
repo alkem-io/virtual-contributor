@@ -282,7 +282,9 @@ def canonical_metric_scores(values: dict[str, object]) -> dict[str, float]:
             # be visible in the logs, not swallowed into a bare exception
             # that looks the same as every other malformed record.
             logger.warning(
-                "Unrecognised RAGAS metric column %r ignored by the canonical metric map", name
+                "Unrecognised RAGAS metric column %r is not in the canonical metric map;"
+                " rejecting this score record",
+                name,
             )
             raise ValueError("Evaluation metrics must use exactly the canonical inventory")
         if mapped in canonical:
