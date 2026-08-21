@@ -110,3 +110,40 @@ async def test_guarded_fetch_rejects_caller_controlled_transport(
             max_bytes=1024,
             **{transport_argument: object()},
         )
+
+
+async def test_guard_client_ignores_proxy_environment(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Proxy and CA environment variables cannot redirect a pinned request.
+
+    httpx trusts the environment by default, so HTTP_PROXY/HTTPS_PROXY/ALL_PROXY
+    would install proxy mounts that route around the address the guard resolved,
+    validated and pinned — and SSL_CERT_FILE would replace the trust store that
+    pinning depends on for hostname verification.
+    """
+    for variable in (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ):
+        monkeypatch.setenv(variable, "http://127.0.0.1:9")
+
+    captured: list[httpx.AsyncClient] = []
+    client_class = httpx.AsyncClient
+
+    def recording_client(**kwargs) -> httpx.AsyncClient:
+        client = client_class(**kwargs)
+        captured.append(client)
+        return client
+
+    monkeypatch.setattr(url_guard.httpx, "AsyncClient", recording_client)
+
+    async with url_guard._guarded_client():
+        pass
+
+    assert captured, "the guard did not construct a client"
+    assert captured[0]._mounts == {}, "proxy environment installed transport mounts"

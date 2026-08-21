@@ -531,6 +531,11 @@ async def _guarded_client():
         timeout=60.0,
         follow_redirects=False,
         limits=httpx.Limits(max_keepalive_connections=0),
+        # trust_env defaults to True, which reads HTTP_PROXY/HTTPS_PROXY/ALL_PROXY
+        # and SSL_CERT_FILE from the environment. A proxy mount would route around
+        # the address we validated and pinned, and environment CA trust would
+        # undermine the TLS verification that pinning relies on.
+        trust_env=False,
     ) as managed_client:
         yield managed_client
 
