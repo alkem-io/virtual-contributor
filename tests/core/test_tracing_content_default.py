@@ -7,6 +7,7 @@ from uuid import uuid4
 from langchain_core.messages import AIMessage, HumanMessage
 
 from core.config import BaseConfig
+from core.events.ingest_website import IngestWebsite
 from core.tracing import (
     FailureMode,
     handle_span,
@@ -18,6 +19,18 @@ from core.tracing_callbacks import VCTracingCallbackHandler
 
 
 CONTENT_KEYS = ("gen_ai.prompt", "gen_ai.completion", "vc.message")
+
+
+class MessageBearingIngestWebsite(IngestWebsite):
+    """An early-ACK event that carries a member message.
+
+    No shipped early-ACK event type declares one, so `getattr(event, "message")`
+    is always None in production today and the content gate at that call site is
+    unreachable. This subclass makes the gate reachable, which is the only way
+    to prove it is actually enforced.
+    """
+
+    message: str
 
 
 def _config(**values: object) -> BaseConfig:
@@ -110,17 +123,12 @@ async def test_default_early_ack_success_span_omits_future_message_content(
 ) -> None:
     import asyncio
 
-    from core.events.ingest_website import IngestWebsite, IngestWebsiteResult
+    from core.events.ingest_website import IngestWebsiteResult
+    from tests.conftest import make_ingest_website
     from tests.core.test_main_tracing import _Message, _wiring
 
-    class MessageBearingIngestWebsite(IngestWebsite):
-        message: str
-
-    event = MessageBearingIngestWebsite(
-        baseUrl="https://example.test",
-        type="website",
-        purpose="knowledge",
-        personaId="persona",
+    event = make_ingest_website(
+        model=MessageBearingIngestWebsite,
         message="future early-ACK member message",
     )
 
@@ -148,17 +156,12 @@ async def test_capture_enabled_early_ack_success_records_bounded_future_message(
 ) -> None:
     import asyncio
 
-    from core.events.ingest_website import IngestWebsite, IngestWebsiteResult
+    from core.events.ingest_website import IngestWebsiteResult
+    from tests.conftest import make_ingest_website
     from tests.core.test_main_tracing import _Message, _wiring
 
-    class MessageBearingIngestWebsite(IngestWebsite):
-        message: str
-
-    event = MessageBearingIngestWebsite(
-        baseUrl="https://example.test",
-        type="website",
-        purpose="knowledge",
-        personaId="persona",
+    event = make_ingest_website(
+        model=MessageBearingIngestWebsite,
         message="future early-ACK member message",
     )
 
