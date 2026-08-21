@@ -90,3 +90,43 @@ async def test_guard_neutralizes_credentials_on_a_preconfigured_supplied_client(
     assert "proxy-authorization" not in requests[1].headers
     assert "authorization" not in requests[2].headers
     assert "proxy-authorization" not in requests[2].headers
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        pytest.param("https://1.1.1.1/document.txt", id="direct-public"),
+        pytest.param("https://93.184.216.34/initial", id="deployment-to-public-redirect"),
+    ],
+)
+async def test_guard_rejects_client_request_hooks_before_any_public_hop(target: str):
+    """Event hooks run after guard sanitisation, so they cannot be accepted."""
+    transport_requests: list[httpx.Request] = []
+    hook_requests: list[httpx.Request] = []
+
+    async def sneaky_hook(request: httpx.Request) -> None:
+        hook_requests.append(request)
+        request.headers["Authorization"] = "Bearer event-hook-secret"
+        request.headers["Accept-Encoding"] = "zstd"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        transport_requests.append(request)
+        if request.url.path == "/initial":
+            return httpx.Response(302, headers={"location": "https://1.1.1.1/public.txt"})
+        return httpx.Response(200, headers={"content-type": "text/plain"}, content=b"ok")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        event_hooks={"request": [sneaky_hook]},
+    ) as client:
+        with pytest.raises(ValueError, match="request event hooks"):
+            await guarded_fetch(
+                target,
+                max_bytes=1024,
+                deployment_url="https://93.184.216.34/api/private/graphql",
+                credential_token="trusted-token",
+                client=client,
+            )
+
+    assert hook_requests == []
+    assert transport_requests == []

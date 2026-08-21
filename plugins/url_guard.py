@@ -595,6 +595,12 @@ async def guarded_fetch(
     Connections have no keep-alive capacity, so a TLS session opened for one
     redirect hostname can never be reused for another hostname sharing an IP.
     """
+    if client is not None and client.event_hooks.get("request"):
+        raise ValueError(
+            "Invalid guarded_fetch client configuration: request event hooks can mutate "
+            "guard-owned Authorization and Accept-Encoding headers"
+        )
+
     target = url
     redirects_followed = 0
     try:
