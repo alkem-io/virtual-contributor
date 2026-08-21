@@ -5,17 +5,16 @@ from __future__ import annotations
 import asyncio
 import logging
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlsplit
 
 import httpx
 
 from plugins.ingest_space.link_extractor import _MIME_KIND, _detect_kind
 from plugins.url_guard import (
-    FetchDecision,
     MAX_REDIRECT_HOPS as _MAX_REDIRECT_HOPS,
     RefusalCategory,
     guarded_fetch,
-    is_deployment_url,
+    rewrite_target,
 )
 
 logger = logging.getLogger(__name__)
@@ -40,46 +39,11 @@ class GraphQLClient:
         self._email = email
         self._password = password
         self._session_token: str | None = None
-        # Cache the scheme/host of the GraphQL endpoint so we can rewrite
-        # foreign (e.g. production-shaped) Alkemio URIs onto our deployment.
-        parts = urlsplit(self._graphql_endpoint)
-        self._base_scheme = parts.scheme or "http"
-        self._base_netloc = parts.netloc
         self.last_fetch_refusal: RefusalCategory | None = None
 
     def _rewrite_alkemio_uri(self, url: str) -> str:
-        """Point known Alkemio storage URIs at the configured host.
-
-        Seed data often carries prod-shaped URIs (e.g.
-        ``https://alkem.io/api/private/rest/storage/document/<id>``) even
-        on dev installations.  If the URI path looks like an Alkemio
-        internal API call, swap in our deployment's scheme+host.
-
-        Only rewrites the exact ``alkem.io`` apex or configured deployment.
-        Host-less relative URLs are never rewritten: a member-supplied relative
-        URI must not turn into an authenticated deployment request.
-        """
-        if not url:
-            return url
-        try:
-            parts = urlsplit(url)
-            host = (parts.hostname or "").lower()
-        except (TypeError, ValueError):
-            return url
-        path = parts.path or ""
-        if not host:
-            return url
-        if host != "alkem.io" and not is_deployment_url(url, self._graphql_endpoint):
-            return url
-        if path.startswith("/api/") or path.startswith("/rest/"):
-            return urlunsplit((
-                self._base_scheme,
-                self._base_netloc,
-                path,
-                parts.query,
-                parts.fragment,
-            ))
-        return url
+        """Delegate URI rewriting to the measured outbound URL policy."""
+        return rewrite_target(url, self._graphql_endpoint)
 
     async def fetch_url(
         self,
@@ -100,7 +64,7 @@ class GraphQLClient:
             target,
             max_bytes=max_bytes,
             deployment_url=self._graphql_endpoint,
-            headers_for_request=self._headers_for_request,
+            credential_token_provider=self._credential_token,
             content_type_policy=self._content_type_policy,
             client_factory=httpx.AsyncClient,
         )
@@ -116,19 +80,11 @@ class GraphQLClient:
             return None
         return result.body, result.content_type
 
-    async def _headers_for_request(
-        self,
-        _target: str,
-        decision: FetchDecision,
-    ) -> dict[str, str]:
-        """Build per-hop headers after the shared executor validates the origin."""
+    async def _credential_token(self) -> str | None:
+        """Return the authenticated session token without deciding its scope."""
         if not self._session_token:
             await self.authenticate()
-
-        headers: dict[str, str] = {}
-        if decision.is_deployment_host and self._session_token:
-            headers["Authorization"] = f"Bearer {self._session_token}"
-        return headers
+        return self._session_token
 
     @staticmethod
     def _is_supported_content_type(content_type: str) -> bool:

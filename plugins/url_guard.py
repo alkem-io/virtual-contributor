@@ -26,6 +26,7 @@ MAX_REDIRECT_HOPS = 5
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 _STREAM_CHUNK_BYTES = 64 * 1024
 _SNIFF_WINDOW_BYTES = 4 * 1024
+_SUPPORTED_ACCEPT_ENCODINGS = "gzip, deflate"
 
 
 class RefusalCategory(str, Enum):
@@ -68,6 +69,7 @@ class GuardedFetchResult:
 
 ContentTypePolicy = Callable[[str, bytes | None], bool | None]
 HeadersForRequest = Callable[[str, FetchDecision], Awaitable[dict[str, str]]]
+CredentialTokenProvider = Callable[[], Awaitable[str | None]]
 RedirectPolicy = Callable[[str], bool]
 AsyncClientFactory = Callable[..., httpx.AsyncClient]
 
@@ -142,6 +144,45 @@ def is_platform_domain(host: str | None, platform_domain: str | None) -> bool:
     candidate = _normalise_host(host)
     domain = _normalise_host(platform_domain)
     return bool(candidate and domain and (candidate == domain or candidate.endswith(f".{domain}")))
+
+
+def rewrite_target(url: str, deployment_url: str) -> str:
+    """Rewrite an Alkemio API URI onto the configured deployment origin.
+
+    Production-shaped storage URIs are valid on a non-production deployment,
+    but only the exact ``alkem.io`` apex (or the deployment itself) may be
+    rewritten.  In particular, relative URLs and lookalike domains must not
+    become authenticated deployment requests.
+    """
+    if not url:
+        return url
+    try:
+        parts = urlsplit(url)
+        host = (parts.hostname or "").lower()
+    except (TypeError, ValueError):
+        return url
+    if not host or (host != "alkem.io" and not is_deployment_url(url, deployment_url)):
+        return url
+
+    path = parts.path or ""
+    if not path.startswith(("/api/", "/rest/")):
+        return url
+    try:
+        deployment_parts = urlsplit(deployment_url)
+    except (TypeError, ValueError):
+        return url
+    return urlunsplit((
+        deployment_parts.scheme or "http",
+        deployment_parts.netloc,
+        path,
+        parts.query,
+        parts.fragment,
+    ))
+
+
+def should_attach_credentials(target: str, deployment_url: str | None) -> bool:
+    """Return whether an authenticated header is safe for this request hop."""
+    return is_deployment_url(target, deployment_url)
 
 
 def _literal_address(value: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
@@ -455,12 +496,13 @@ async def _read_bounded_body(
             if needs_sniff:
                 decode_limit = min(decode_limit, _SNIFF_WINDOW_BYTES - len(sniff))
             decoded, pending = decoder.decode(pending, decode_limit)
-            if len(decoded) > decode_limit:
+            if len(decoded) > remaining:
                 return None, RefusalCategory.SIZE
             body.extend(decoded)
 
             if needs_sniff:
-                sniff.extend(decoded)
+                sniff_remaining = _SNIFF_WINDOW_BYTES - len(sniff)
+                sniff.extend(decoded[:sniff_remaining])
                 if len(sniff) >= _SNIFF_WINDOW_BYTES:
                     policy_decision = policy(content_type, bytes(sniff))
                     if policy_decision is not True:
@@ -502,6 +544,8 @@ async def guarded_fetch(
     *,
     max_bytes: int,
     deployment_url: str | None = None,
+    credential_token: str | None = None,
+    credential_token_provider: CredentialTokenProvider | None = None,
     headers_for_request: HeadersForRequest | None = None,
     request_headers: dict[str, str] | None = None,
     content_type_policy: ContentTypePolicy | None = None,
@@ -534,9 +578,26 @@ async def guarded_fetch(
                         redirects_followed,
                     )
 
-                headers = dict(request_headers or {})
+                # The executor owns bearer eligibility.  Callers may supply
+                # ordinary per-request headers, but never an Authorization
+                # header that can bypass the per-hop deployment-origin check.
+                headers = {
+                    name: value
+                    for name, value in (request_headers or {}).items()
+                    if name.lower() != "authorization"
+                }
                 if headers_for_request:
-                    headers.update(await headers_for_request(target, decision))
+                    headers.update({
+                        name: value
+                        for name, value in (await headers_for_request(target, decision)).items()
+                        if name.lower() != "authorization"
+                    })
+                headers["Accept-Encoding"] = _SUPPORTED_ACCEPT_ENCODINGS
+                token = credential_token
+                if credential_token_provider is not None:
+                    token = await credential_token_provider()
+                if token and should_attach_credentials(target, deployment_url):
+                    headers["Authorization"] = f"Bearer {token}"
                 headers["Host"] = _host_header(target)
 
                 async with active_client.stream(

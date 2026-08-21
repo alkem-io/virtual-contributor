@@ -100,6 +100,27 @@ class TestFetchUrl:
 
         assert result == (b"%PDF-data", "application/pdf")
 
+    async def test_zstd_capable_origin_receives_only_supported_encodings(self):
+        client = _make_client()
+        client._session_token = "token-123"
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if "zstd" in request.headers["accept-encoding"]:
+                return httpx.Response(
+                    200,
+                    headers={"content-encoding": "zstd", "content-type": "text/plain"},
+                    content=b"zstd body",
+                )
+            return httpx.Response(200, headers={"content-type": "text/plain"}, content=b"ok")
+
+        with _patch_transport(handler):
+            result = await client.fetch_url(f"https://{PUBLIC_ADDRESS}/page", link_id="link-1")
+
+        assert result == (b"ok", "text/plain")
+        assert requests[0].headers["accept-encoding"] == "gzip, deflate"
+
     async def test_non_200_returns_none(self):
         client = _make_client()
         client._session_token = "token-123"
@@ -154,6 +175,31 @@ class TestFetchUrl:
             result = await client.fetch_url(f"https://{PUBLIC_ADDRESS}/download", link_id="link-1")
 
         assert result == (b"%PDF-1.7 content", content_type or "")
+
+    async def test_unknown_content_type_has_identical_outcome_across_chunk_boundaries(self):
+        client = _make_client()
+        client._session_token = "token-123"
+        payload = b"%PDF-1.7\n" + b"x" * (8_201 - len(b"%PDF-1.7\n"))
+
+        async def fetch(chunks: list[bytes]) -> tuple[tuple[bytes, str] | None, int]:
+            stream = CountingStream(chunks)
+            with _patch_transport(lambda _: httpx.Response(200, stream=stream)):
+                result = await client.fetch_url(
+                    f"https://{PUBLIC_ADDRESS}/download",
+                    link_id="link-1",
+                )
+            return result, stream.consumed
+
+        one_chunk, one_chunk_consumed = await fetch([payload])
+        many_chunks, many_chunks_consumed = await fetch([
+            payload[:100],
+            payload[100:4_096],
+            payload[4_096:6_000],
+            payload[6_000:],
+        ])
+
+        assert one_chunk == many_chunks == (payload, "")
+        assert one_chunk_consumed == many_chunks_consumed == len(payload)
 
     async def test_network_error_returns_none(self):
         client = _make_client()

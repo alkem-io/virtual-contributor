@@ -10,7 +10,13 @@ import httpx
 import pytest
 
 from plugins import url_guard
-from plugins.url_guard import RefusalCategory, check_destination, guarded_fetch
+from plugins.url_guard import (
+    RefusalCategory,
+    check_destination,
+    guarded_fetch,
+    rewrite_target,
+    should_attach_credentials,
+)
 
 
 @pytest.mark.parametrize("url", ["file:///etc/passwd", "gopher://example.com", "ftp://example.com", "data:text/plain,hello"])
@@ -170,6 +176,35 @@ def test_host_helpers_only_match_real_domain_boundaries():
     assert not url_guard.is_deployment_host("evil-deployment.example", "deployment.example")
 
 
+def test_rewrite_target_only_rewrites_exact_platform_or_deployment_api_uris():
+    deployment = "https://deployment.example/api/private/non-interactive/graphql"
+
+    assert rewrite_target(
+        "https://alkem.io/api/private/rest/storage/document/document-id?download=1#page-2",
+        deployment,
+    ) == "https://deployment.example/api/private/rest/storage/document/document-id?download=1#page-2"
+    assert rewrite_target(
+        "https://deployment.example/rest/storage/document/document-id",
+        deployment,
+    ) == "https://deployment.example/rest/storage/document/document-id"
+    assert rewrite_target("/api/private/forbidden", deployment) == "/api/private/forbidden"
+    assert rewrite_target("https://evil-alkem.io/api/private/forbidden", deployment) == (
+        "https://evil-alkem.io/api/private/forbidden"
+    )
+    assert rewrite_target("https://storage.alkem.io/api/private/forbidden", deployment) == (
+        "https://storage.alkem.io/api/private/forbidden"
+    )
+
+
+def test_should_attach_credentials_requires_exact_deployment_origin():
+    deployment = "https://deployment.example:8443/api/private/non-interactive/graphql"
+
+    assert should_attach_credentials("https://deployment.example:8443/rest/storage/document/id", deployment)
+    assert not should_attach_credentials("https://deployment.example/rest/storage/document/id", deployment)
+    assert not should_attach_credentials("http://deployment.example:8443/rest/storage/document/id", deployment)
+    assert not should_attach_credentials("https://deployment.example.evil.example:8443/rest/storage/document/id", deployment)
+
+
 async def test_deployment_origin_requires_matching_scheme_host_and_port(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -214,3 +249,62 @@ async def test_guarded_fetch_disables_connection_reuse_across_hops():
 
     assert result.body == b"ok"
     assert captured_limits[0].max_keepalive_connections == 0
+
+
+async def test_guarded_fetch_owns_authorization_header_eligibility():
+    requests: list[httpx.Request] = []
+    transport = httpx.MockTransport(
+        lambda request: requests.append(request) or httpx.Response(
+            200,
+            headers={"content-type": "text/plain"},
+            content=b"ok",
+        )
+    )
+    deployment = "https://93.184.216.34/api/private/graphql"
+
+    async with httpx.AsyncClient(transport=transport) as client:
+        result = await guarded_fetch(
+            "https://93.184.216.34/rest/storage/document/id",
+            max_bytes=1024,
+            deployment_url=deployment,
+            credential_token="trusted-token",
+            request_headers={"Authorization": "Bearer caller-token"},
+            client=client,
+        )
+        public_result = await guarded_fetch(
+            "https://1.1.1.1/document.txt",
+            max_bytes=1024,
+            deployment_url=deployment,
+            credential_token="trusted-token",
+            request_headers={"Authorization": "Bearer caller-token"},
+            client=client,
+        )
+
+    assert result.body == b"ok"
+    assert public_result.body == b"ok"
+    assert requests[0].headers["authorization"] == "Bearer trusted-token"
+    assert "authorization" not in requests[1].headers
+
+
+async def test_guarded_fetch_never_advertises_unbounded_zstd():
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if "zstd" in request.headers["accept-encoding"]:
+            return httpx.Response(
+                200,
+                headers={"content-encoding": "zstd", "content-type": "text/plain"},
+                content=b"zstd body",
+            )
+        return httpx.Response(200, headers={"content-type": "text/plain"}, content=b"ok")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await guarded_fetch(
+            "https://93.184.216.34/document.txt",
+            max_bytes=1024,
+            client=client,
+        )
+
+    assert result.body == b"ok"
+    assert requests[0].headers["accept-encoding"] == "gzip, deflate"
