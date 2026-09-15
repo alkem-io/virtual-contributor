@@ -321,8 +321,13 @@ def make_response(**overrides) -> Response:
     return Response.model_validate(defaults)
 
 
-def make_ingest_website(**overrides) -> IngestWebsite:
-    """Create a sample IngestWebsite event."""
+def make_ingest_website(model: type[IngestWebsite] = IngestWebsite, **overrides) -> IngestWebsite:
+    """Create a sample IngestWebsite event.
+
+    `model` lets a caller validate the same defaults against a subclass — the
+    tracing suite needs a message-bearing variant to exercise a gate that no
+    shipped early-ACK event type reaches yet.
+    """
     defaults = {
         "baseUrl": "https://example.com",
         "type": "website",
@@ -330,7 +335,7 @@ def make_ingest_website(**overrides) -> IngestWebsite:
         "personaId": "persona-789",
     }
     defaults.update(overrides)
-    return IngestWebsite.model_validate(defaults)
+    return model.model_validate(defaults)
 
 
 def make_ingest_body_of_knowledge(**overrides) -> IngestBodyOfKnowledge:

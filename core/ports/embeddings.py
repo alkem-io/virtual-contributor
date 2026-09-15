@@ -3,6 +3,22 @@ from __future__ import annotations
 from typing import Protocol, runtime_checkable
 
 
+class EmbeddingError(Exception):
+    """Base error for a query embedding failure that must not be retried above the adapter."""
+
+
+class EmbeddingInputError(EmbeddingError):
+    """The provider-bound query input is invalid before egress."""
+
+
+class EmbeddingPermanentError(EmbeddingError):
+    """A non-retryable provider response or unclassified failure."""
+
+
+class EmbeddingTransientError(EmbeddingError):
+    """Allow-listed transient failure after the adapter exhausts its budget."""
+
+
 @runtime_checkable
 class EmbeddingsPort(Protocol):
     """Port for text embedding generation."""

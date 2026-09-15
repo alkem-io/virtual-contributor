@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from core.ports.knowledge_store import KnowledgeStorePort, QueryResult
+from contextlib import asynccontextmanager
+
+from core.ports.knowledge_store import GetResult, KnowledgeStorePort, QueryResult
 
 
 class TracingKnowledgeStore:
@@ -15,6 +17,13 @@ class TracingKnowledgeStore:
     def __init__(self, delegate: KnowledgeStorePort) -> None:
         self._delegate = delegate
         self._captured: list[QueryResult] = []
+        self._generation_contexts: list[str] = []
+        self._generation_context_published = False
+
+    def capture_generation_context(self, blocks: list[str]) -> None:
+        """Capture the exact rendered blocks handed to the answering LLM."""
+        self._generation_contexts = list(blocks)
+        self._generation_context_published = True
 
     async def query(
         self,
@@ -42,6 +51,42 @@ class TracingKnowledgeStore:
     async def delete_collection(self, collection: str) -> None:
         await self._delegate.delete_collection(collection)
 
+    async def query_lexical(
+        self,
+        collection: str,
+        terms: list[str],
+        n_results: int = 10,
+        where: dict | None = None,
+    ) -> QueryResult:
+        """Forward lexical retrieval too; hybrid detection is structural."""
+        result = await self._delegate.query_lexical(
+            collection, terms, n_results, where=where,
+        )
+        self._captured.append(result)
+        return result
+
+    async def get(
+        self, collection: str, ids: list[str] | None = None,
+        where: dict | None = None, include: list[str] | None = None,
+    ) -> GetResult:
+        return await self._delegate.get(collection, ids, where, include)
+
+    async def delete(
+        self, collection: str, ids: list[str] | None = None,
+        where: dict | None = None,
+    ) -> None:
+        await self._delegate.delete(collection, ids, where)
+
+    @asynccontextmanager
+    async def query_embedding_scope(self):
+        """Forward the optional request-local vector scope transparently."""
+        scope = getattr(self._delegate, "query_embedding_scope", None)
+        if not callable(scope):
+            yield
+            return
+        async with scope():
+            yield
+
     def get_retrieved_contexts(self) -> list[str]:
         """Extract all document texts captured during query() calls."""
         contexts: list[str] = []
@@ -50,6 +95,23 @@ class TracingKnowledgeStore:
                 contexts.extend(doc_list)
         return contexts
 
+    def get_final_detail_contexts(self) -> list[str]:
+        """Return only the final store result used for answer detail.
+
+        Hierarchy routing makes an orienting query before detail retrieval.
+        RAGAS must score the latter, rather than treating routing overviews as
+        generation context.  Flat retrieval naturally has one captured result.
+        """
+
+        return list(self._generation_contexts)
+
+    @property
+    def generation_context_published(self) -> bool:
+        """Whether an observer published, independently of an empty value."""
+        return self._generation_context_published
+
     def clear(self) -> None:
         """Reset captured state between test cases."""
         self._captured = []
+        self._generation_contexts = []
+        self._generation_context_published = False

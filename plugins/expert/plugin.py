@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Callable
 import time
 
 from core.domain.prompts_shared import (
@@ -11,6 +12,7 @@ from core.domain.prompts_shared import (
     citation_scope_instruction,
     empty_context_instruction,
     join_document_blocks,
+    inter_block_budget_size,
     render_document_block,
     rendered_document_budget_size,
 )
@@ -19,6 +21,11 @@ from core.domain import hybrid_retrieval
 from core.events.input import Input
 from core.events.response import Response, Source
 from core.domain.retrieval_filters import FACTUAL_WHERE
+from core.domain.hierarchy_retrieval import (
+    ORIENTING_WHERE,
+    scoped_detail_where,
+    select_branches,
+)
 from core.ports.llm import LLMPort
 from core.domain.faithfulness import safe_reason as _safe_reason
 from core.ports.faithfulness import FaithfulnessValidatorPort
@@ -35,8 +42,19 @@ from core.domain.query_rewrite import (
     rewrite_query,
     should_rewrite,
 )
+from core.ports.embeddings import EmbeddingError
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class RetrievalOutcome:
+    """Aligned final retrieval rows plus the path that produced them."""
+
+    blocks: list[str]
+    result: QueryResult
+    initial_count: int
+    mode: str  # ``scoped_success`` or ``flat``
 
 
 def _apply_rerank(
@@ -103,7 +121,7 @@ def _apply_rerank(
 
 
 def _filter_and_format(
-    result: QueryResult, score_threshold: float
+    result: QueryResult, score_threshold: float, *, hierarchy: bool = False,
 ) -> tuple[list[str], QueryResult]:
     """Filter results by score threshold and render labelled document blocks.
 
@@ -140,7 +158,9 @@ def _filter_and_format(
             kept_ids.append(ids[i] if i < len(ids) else "")
 
     formatted = [
-        render_document_block(number, doc, kept_metadatas[number - 1])
+        render_document_block(
+            number, doc, kept_metadatas[number - 1], hierarchy=hierarchy,
+        )
         for number, doc in enumerate(kept_docs, start=1)
     ]
     filtered_result = QueryResult(
@@ -174,6 +194,7 @@ class ExpertPlugin:
         answering_temperature: float | None = None,
         chain_of_thought_enabled: bool = True,
         hybrid_config: Any = None,
+        hybrid_retriever: Callable[..., Any] | None = None,
         reranker: RerankerPort | None = None,
         rerank_candidate_n: int = 20,
         rerank_top_k: int = 5,
@@ -184,6 +205,12 @@ class ExpertPlugin:
         max_expansion_ratio: float = DEFAULT_MAX_EXPANSION_RATIO,
         max_history_turns: int = DEFAULT_MAX_HISTORY_TURNS,
         max_history_chars: int = DEFAULT_MAX_HISTORY_CHARS,
+        hierarchical_retrieval_enabled: bool = False,
+        hierarchy_max_branches: int = 3,
+        hierarchy_display_names_enabled: bool = False,
+        context_observer: Callable[[list[str]], None] | None = None,
+        embedding_query_max_utf8_bytes: int = 32768,
+        rewrite_max_utf8_bytes: int = 4096,
     ) -> None:
         self._llm = llm
         self._knowledge_store = knowledge_store
@@ -195,6 +222,14 @@ class ExpertPlugin:
         # None keeps retrieval exactly as it was: hybrid_retrieval.retrieve
         # reads the flag off this and falls through to the dense path.
         self._hybrid_config = hybrid_config
+        # The resolved composition supplies this from the same selector
+        # snapshot whose primitive ID is fingerprinted. Direct construction
+        # retains the historical default callable unchanged.
+        self._hybrid_retriever = (
+            hybrid_retriever
+            if hybrid_retriever is not None
+            else hybrid_retrieval.retrieve
+        )
         # Absent unless re-ranking is enabled, so an existing deployment keeps
         # exactly its current retrieval behaviour with no new code path.
         self._reranker = reranker
@@ -212,6 +247,12 @@ class ExpertPlugin:
         self._max_expansion_ratio = max_expansion_ratio
         self._max_history_turns = max_history_turns
         self._max_history_chars = max_history_chars
+        self._hierarchical_retrieval_enabled = hierarchical_retrieval_enabled
+        self._hierarchy_max_branches = hierarchy_max_branches
+        self._hierarchy_display_names_enabled = hierarchy_display_names_enabled
+        self._context_observer = context_observer
+        self._embedding_query_max_utf8_bytes = embedding_query_max_utf8_bytes
+        self._rewrite_max_utf8_bytes = rewrite_max_utf8_bytes
 
     @property
     def _retrieval_n_results(self) -> int:
@@ -378,16 +419,18 @@ class ExpertPlugin:
         bok_id = event.body_of_knowledge_id or ""
         collection = f"{bok_id}-knowledge" if bok_id else "default-knowledge"
 
-        # One decision per query, made before either path branches, so the
-        # two paths cannot drift apart in how they route.
-        profile = self._resolve_profile(event.message)
-
-        # If prompt_graph is defined, use graph execution
+        # A compatible store owns one request/task-local vector scope across
+        # Stage 1 and every selected Stage 2/flat query. Non-capable stores
+        # keep their existing stable query calls.
+        scope = getattr(self._knowledge_store, "query_embedding_scope", None)
+        if callable(scope):
+            async with scope():
+                if event.prompt_graph:
+                    return await self._handle_with_graph(event, collection)
+                return await self._handle_simple(event, collection)
         if event.prompt_graph:
-            return await self._handle_with_graph(event, collection, profile)
-
-        # Fallback: simple RAG
-        return await self._handle_simple(event, collection, profile)
+            return await self._handle_with_graph(event, collection)
+        return await self._handle_simple(event, collection)
 
     def _enforce_context_budget(
         self, docs: list[str], filtered_result: QueryResult,
@@ -408,7 +451,7 @@ class ExpertPlugin:
         total_budget_size = sum(
             rendered_document_budget_size(rendered, content)
             for rendered, content in zip(docs, raw_docs_check)
-        )
+        ) + inter_block_budget_size(len(docs))
         if total_budget_size <= budget:
             return docs, filtered_result
 
@@ -424,7 +467,8 @@ class ExpertPlugin:
         for i, doc in enumerate(docs):
             raw_content = raw_docs[i] if i < len(raw_docs) else ""
             document_budget_size = rendered_document_budget_size(doc, raw_content)
-            if accumulated + document_budget_size > budget:
+            separator_size = inter_block_budget_size(len(kept_formatted) + 1) - inter_block_budget_size(len(kept_formatted))
+            if accumulated + separator_size + document_budget_size > budget:
                 break
             kept_formatted.append(doc)
             kept_docs.append(raw_content)
@@ -434,7 +478,7 @@ class ExpertPlugin:
                 kept_metadatas.append(raw_metadatas[i])
             if i < len(raw_ids):
                 kept_ids.append(raw_ids[i])
-            accumulated += document_budget_size
+            accumulated += separator_size + document_budget_size
 
         dropped = len(docs) - len(kept_formatted)
         dropped_budget = total_budget_size - accumulated
@@ -451,9 +495,98 @@ class ExpertPlugin:
         )
         return kept_formatted, new_result
 
-    async def _handle_with_graph(
-        self, event: Input, collection: str, profile: RetrievalProfile,
-    ) -> Response:
+    async def _retrieve_pipeline(
+        self,
+        collection: str,
+        query: str,
+        profile: RetrievalProfile,
+        *,
+        where: dict | None,
+        hierarchy: bool,
+    ) -> RetrievalOutcome:
+        """Run the unchanged composed retrieval pipeline for one predicate."""
+
+        pool_n = (
+            max(profile.n_results, self._rerank_candidate_n)
+            if self._reranker is not None
+            else profile.n_results
+        )
+        result = await self._hybrid_retriever(
+            self._knowledge_store, collection, query, self._hybrid_config,
+            n_results=pool_n, where=where,
+        )
+        result = self._maybe_rerank(query, result)
+        docs, result = _filter_and_format(
+            result, profile.score_threshold, hierarchy=hierarchy,
+        )
+        docs, result = self._truncate_to_top_k(docs, result)
+        initial_count = len(docs)
+        docs, result = self._enforce_context_budget(
+            docs, result, profile.max_context_chars,
+        )
+        return RetrievalOutcome(docs, result, initial_count, "flat")
+
+    async def _retrieve_context(
+        self,
+        collection: str,
+        query: str,
+        profile: RetrievalProfile,
+    ) -> RetrievalOutcome:
+        """Use the hierarchy enhancement when it is usable, otherwise flat.
+
+        The compatibility path is deliberately invoked fresh after an unusable
+        hierarchy stage.  It is not wrapped: if the current flat retrieval
+        fails, that error remains the request's visible behaviour.
+        """
+
+        async def flat() -> RetrievalOutcome:
+            return await self._retrieve_pipeline(
+                collection, query, profile, where=FACTUAL_WHERE, hierarchy=False,
+            )
+
+        if not self._hierarchical_retrieval_enabled:
+            return await flat()
+
+        predicate = None
+        routing_failed = False
+        try:
+            routing_result = await self._knowledge_store.query(
+                collection=collection,
+                query_texts=[query],
+                n_results=self._hierarchy_max_branches * 4,
+                where=ORIENTING_WHERE,
+            )
+            branches = select_branches(
+                routing_result,
+                score_threshold=profile.score_threshold,
+                max_branches=self._hierarchy_max_branches,
+            )
+            predicate = scoped_detail_where(branches)
+        except EmbeddingError:
+            raise
+        except Exception as exc:
+            logger.warning("Hierarchy routing fallback: error_type=%s", type(exc).__name__)
+            routing_failed = True
+        if routing_failed or predicate is None:
+            return await flat()
+        try:
+            outcome = await self._retrieve_pipeline(
+                collection, query, profile, where=predicate,
+                hierarchy=self._hierarchy_display_names_enabled,
+            )
+            # A short but non-empty selected branch is an intended precision
+            # result.  Only absence of usable detail re-enters flat retrieval.
+            if outcome.blocks:
+                return RetrievalOutcome(
+                    outcome.blocks, outcome.result, outcome.initial_count, "scoped_success",
+                )
+        except EmbeddingError:
+            raise
+        except Exception as exc:
+            logger.warning("Hierarchy detail fallback: error_type=%s", type(exc).__name__)
+        return await flat()
+
+    async def _handle_with_graph(self, event: Input, collection: str) -> Response:
         from core.domain.prompt_graph import PromptGraph
 
         graph = PromptGraph.from_definition(event.prompt_graph)
@@ -470,11 +603,7 @@ class ExpertPlugin:
         # answer it ungrounded, which is the one mistake this feature is not
         # allowed to make.
         resolve_profile = self._resolve_profile
-        enforce_budget = self._enforce_context_budget
-        maybe_rerank = self._maybe_rerank
-        reranker = self._reranker
-        rerank_candidate_n = self._rerank_candidate_n
-        truncate_to_top_k = self._truncate_to_top_k
+        retrieve_context = self._retrieve_context
 
         # What retrieval actually produced, captured where it happens rather
         # than read back from the final state. The graph definition arrives on
@@ -483,7 +612,7 @@ class ExpertPlugin:
         # ``combined_knowledge_docs`` would make a real zero-context answer
         # indistinguishable from a graph that never retrieved. This closure
         # knows the difference; the final state does not.
-        retrieved: dict[str, str] = {}
+        retrieved: dict[str, object] = {}
 
         async def retrieve_node(state: dict) -> dict:
             from opentelemetry.trace import SpanKind
@@ -513,46 +642,26 @@ class ExpertPlugin:
                 # "thanks" — so no query is made at all, not a query whose
                 # results are discarded.
                 return {"combined_knowledge_docs": ""}
-            # The profile widens or narrows retrieval; a reranker needs its
-            # candidate pool regardless, so the pool is the larger of the two.
-            pool_n = (
-                max(node_profile.n_results, rerank_candidate_n)
-                if reranker is not None
-                else node_profile.n_results
-            )
-            # #114's hybrid retrieval inside #108's span, carrying #107's
-            # factual filter through to both arms; #115 re-ranks the pool and
-            # truncates AFTER threshold filtering (order is load-bearing —
-            # truncating first once turned 5 grounded sources into 0).
+            # The same helper powers simple and graph execution, preserving
+            # hybrid fusion, re-rank, threshold, top-K and budget ordering.
             with optional_span("vc.retrieval", kind=SpanKind.CLIENT) as span:
-                result = await hybrid_retrieval.retrieve(
-                    self._knowledge_store, collection, query,
-                    self._hybrid_config, n_results=pool_n,
-                    where=FACTUAL_WHERE,
-                )
-                # Re-rank against the question actually asked at this point in
-                # the graph — the rephrased one when there is one, since that
-                # is what was retrieved on.
-                result = maybe_rerank(query, result)
-                docs, filtered_result = _filter_and_format(
-                    result, node_profile.score_threshold,
-                )
-                docs, filtered_result = truncate_to_top_k(docs, filtered_result)
-                initial_count = len(docs)
-                docs, filtered_result = enforce_budget(
-                    docs, filtered_result, node_profile.max_context_chars,
+                outcome = await retrieve_context(
+                    collection, query, node_profile,
                 )
                 if span is not None:
-                    span.set_attribute("vc.retrieval.chunks_passed", len(docs))
-                    span.set_attribute("vc.retrieval.chunks_dropped_budget", initial_count - len(docs))
-                if not result.documents or not result.documents[0] or not docs:
+                    span.set_attribute("vc.retrieval.chunks_passed", len(outcome.blocks))
+                    span.set_attribute("vc.retrieval.chunks_dropped_budget", outcome.initial_count - len(outcome.blocks))
+                if not outcome.result.documents or not outcome.result.documents[0] or not outcome.blocks:
                     mark_empty_retrieval()
             # #109: numbered blocks, so the model can cite [Document N].
-            knowledge = join_document_blocks(docs)
+            knowledge = join_document_blocks(outcome.blocks)
+            if self._context_observer is not None:
+                self._context_observer(outcome.blocks)
             # #117: captured where retrieval happens — the graph's state
             # schema is caller-supplied and drops undeclared keys, so the
             # closure, not the state, carries what was actually retrieved.
             retrieved["context"] = knowledge
+            retrieved["outcome"] = outcome
             # The expert state schema expects ``combined_knowledge_docs``
             # — that's what the answer_question node reads via its
             # ``{combined_knowledge_docs}`` prompt variable.  ``sources``
@@ -615,8 +724,13 @@ class ExpertPlugin:
         # flag every answer from every non-RAG graph, and prompt graphs are
         # configurable per space.
         if "context" in retrieved:
-            self._validate_faithfulness(answer=answer, context=retrieved["context"])
-        sources = self._extract_sources(final_state)
+            self._validate_faithfulness(answer=answer, context=str(retrieved["context"]))
+        outcome = retrieved.get("outcome")
+        sources = (
+            self._build_sources(outcome.result)
+            if isinstance(outcome, RetrievalOutcome) and outcome.mode == "scoped_success"
+            else []
+        )
 
         return Response(
             result=answer,
@@ -635,6 +749,15 @@ class ExpertPlugin:
         was searched for literally. Guidance's condense prompt is reused rather
         than a new one invented — its wording is plugin-neutral.
         """
+        # Rejecting an oversized original is the embedding adapter's job, but
+        # it must not first be copied to an LLM rewrite provider.
+        if len(event.message.encode("utf-8")) > self._embedding_query_max_utf8_bytes:
+            return event.message
+        # The rewrite model is an egress boundary in its own right.  Apply its
+        # smaller limit before policy/prompt construction, not merely to the
+        # returned candidate.
+        if len(event.message.encode("utf-8")) > self._rewrite_max_utf8_bytes:
+            return event.message
         if not should_rewrite(event.message, event.history, self._rewrite_policy):
             return event.message
         from plugins.guidance.prompts import condense_prompt
@@ -642,7 +765,7 @@ class ExpertPlugin:
         history_text = "\n".join(
             f"{h.role}: {h.content}" for h in recent_history(event.history, self._max_history_turns, self._max_history_chars)
         )
-        return await rewrite_query(
+        candidate = await rewrite_query(
             self._llm,
             [{
                 "role": "human",
@@ -653,44 +776,33 @@ class ExpertPlugin:
             event.message,
             max_expansion_ratio=self._max_expansion_ratio,
         )
+        return event.message if len(candidate.encode("utf-8")) > self._rewrite_max_utf8_bytes else candidate
 
-    async def _handle_simple(
-        self, event: Input, collection: str, profile: RetrievalProfile,
-    ) -> Response:
+    async def _handle_simple(self, event: Input, collection: str) -> Response:
         """Simple RAG without graph execution."""
         from opentelemetry.trace import SpanKind
 
         from core.tracing import mark_empty_retrieval, optional_span
 
         question = await self._resolve_question(event)
+        profile = self._resolve_profile(question)
         if profile.retrieve:
-            pool_n = (
-                max(profile.n_results, self._rerank_candidate_n)
-                if self._reranker is not None
-                else profile.n_results
-            )
             with optional_span("vc.retrieval", kind=SpanKind.CLIENT) as span:
-                result = await hybrid_retrieval.retrieve(
-                    self._knowledge_store, collection, question,
-                    self._hybrid_config, n_results=pool_n,
-                    where=FACTUAL_WHERE,
-                )
-                result = self._maybe_rerank(question, result)
-                docs, result = _filter_and_format(result, profile.score_threshold)
-                docs, result = self._truncate_to_top_k(docs, result)
-                initial_count = len(docs)
-                docs, result = self._enforce_context_budget(
-                    docs, result, profile.max_context_chars,
+                outcome = await self._retrieve_context(
+                    collection, question, profile,
                 )
                 if span is not None:
-                    span.set_attribute("vc.retrieval.chunks_passed", len(docs))
-                    span.set_attribute("vc.retrieval.chunks_dropped_budget", initial_count - len(docs))
-                if not result.documents or not result.documents[0] or not docs:
+                    span.set_attribute("vc.retrieval.chunks_passed", len(outcome.blocks))
+                    span.set_attribute("vc.retrieval.chunks_dropped_budget", outcome.initial_count - len(outcome.blocks))
+                if not outcome.result.documents or not outcome.result.documents[0] or not outcome.blocks:
                     mark_empty_retrieval()
+            docs, result = outcome.blocks, outcome.result
         else:
             docs = []
             result = QueryResult(documents=[[]], metadatas=[[]], distances=[[]], ids=[[]])
         knowledge = join_document_blocks(docs)
+        if self._context_observer is not None:
+            self._context_observer(docs)
 
         from plugins.expert.prompts import combined_expert_prompt
         prompt = combined_expert_prompt.format(

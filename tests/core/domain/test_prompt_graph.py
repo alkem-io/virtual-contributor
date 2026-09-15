@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import pytest
 
-from core.domain.prompt_graph import Edge, Node, PromptGraph
+from core.domain.prompt_graph import (
+    Edge,
+    Node,
+    PromptGraph,
+    PromptGraphConfigError,
+)
 
 
 class TestPromptGraphStructure:
@@ -31,6 +36,57 @@ class TestPromptGraphStructure:
         assert "analyze" in graph.nodes
         assert "answer" in graph.nodes
         assert len(graph.edges) == 3
+
+    def test_duplicate_node_names_rejected_at_parse_time(self):
+        """A second node declaring an already-used name previously replaced
+        the first silently (`nodes[node.name] = node`) — edges still
+        resolved, so the graph ran a different node than declared, with no
+        report. Must be rejected here, naming the duplicated node."""
+        definition = {
+            "nodes": [
+                {"name": "analyze", "input_variables": ["question"], "prompt": "Real: {question}", "output": {}},
+                {"name": "analyze", "input_variables": ["question"], "prompt": "Shadow: {question}", "output": {}},
+            ],
+            "edges": [
+                {"from": "START", "to": "analyze"},
+                {"from": "analyze", "to": "END"},
+            ],
+            "state": {
+                "type": "object",
+                "properties": {"question": {"type": "string"}, "result": {"type": "string"}},
+            },
+        }
+        with pytest.raises(PromptGraphConfigError, match="analyze"):
+            PromptGraph.from_definition(definition)
+
+    @pytest.mark.parametrize("bad_node", [7, None, 1.5])
+    def test_non_dict_node_entry_rejected_at_parse_time(self, bad_node):
+        """A `nodes[]` entry that isn't an object (int/None/float) must be
+        rejected by name here, before `"name" not in node_def` — a
+        containment test, not a key lookup — reaches it: against an int or
+        float that raises a raw `TypeError: argument of type '...' is not
+        iterable`, and against `None` likewise. Must surface a named
+        `PromptGraphConfigError` naming the index instead."""
+        definition = {
+            "nodes": [bad_node],
+            "edges": [],
+            "state": {"type": "object", "properties": {}},
+        }
+        with pytest.raises(PromptGraphConfigError, match="index 0"):
+            PromptGraph.from_definition(definition)
+
+    def test_non_dict_edge_entry_rejected_at_parse_time(self):
+        """A bare string in `edges[]` (instead of an object) previously
+        reached `edge_def.get(...)` and raised a raw
+        `AttributeError: 'str' object has no attribute 'get'`. Must surface
+        a named `PromptGraphConfigError` naming the index instead."""
+        definition = {
+            "nodes": [{"name": "analyze", "prompt": "Analyze"}],
+            "edges": ["e"],
+            "state": {"type": "object", "properties": {}},
+        }
+        with pytest.raises(PromptGraphConfigError, match="index 0"):
+            PromptGraph.from_definition(definition)
 
     def test_node_dataclass(self):
         node = Node(name="test", input_variables=["x"], prompt="Process {x}")
@@ -408,3 +464,60 @@ class TestStateToDictAndWrappers:
         # Verify the model can be used to validate data
         instance = model(result="hello")
         assert instance.model_dump()["result"] == "hello"
+
+
+# ---------------------------------------------------------------------------
+# from_definition — graph size caps (sec-vc-5)
+# ---------------------------------------------------------------------------
+
+
+def _chain_definition(node_count: int, edge_count: int | None = None) -> dict:
+    """A minimal valid `node_count`-node chain, all `llm` type.
+
+    Each node is a trivial passthrough; edges chain START -> n0 -> n1 ->
+    ... -> END. If `edge_count` is given and exceeds the natural chain
+    length, the excess is padded with harmless duplicate edges (from the
+    last real node to itself's successor) so only edge COUNT is exercised,
+    not edge semantics.
+    """
+    names = [f"n{i}" for i in range(node_count)]
+    nodes = [
+        {"name": name, "input_variables": [], "prompt": "noop", "output": {}}
+        for name in names
+    ]
+    edges = [{"from": "START", "to": names[0]}] if names else []
+    for a, b in zip(names, names[1:]):
+        edges.append({"from": a, "to": b})
+    if names:
+        edges.append({"from": names[-1], "to": "END"})
+    if edge_count is not None:
+        while len(edges) < edge_count:
+            # Harmless duplicate — from_definition does not dedupe edges.
+            edges.append(edges[-1])
+        edges = edges[:edge_count] if len(edges) > edge_count else edges
+    state_props = {name: {"type": "string"} for name in names}
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "state": {"type": "object", "properties": state_props},
+    }
+
+
+class TestGraphSizeCaps:
+    def test_node_count_exceeding_max_rejected_at_parse_time(self):
+        definition = _chain_definition(node_count=51)
+        with pytest.raises(PromptGraphConfigError, match="51"):
+            PromptGraph.from_definition(definition)
+
+    def test_edge_count_exceeding_max_rejected_at_parse_time(self):
+        definition = _chain_definition(node_count=2, edge_count=101)
+        with pytest.raises(PromptGraphConfigError, match="101"):
+            PromptGraph.from_definition(definition)
+
+    def test_graph_at_node_and_edge_bound_still_parses(self):
+        """A graph right at the 50-node / 100-edge bound must still be
+        accepted — the cap rejects only what exceeds it."""
+        definition = _chain_definition(node_count=50, edge_count=100)
+        graph = PromptGraph.from_definition(definition)
+        assert len(graph.nodes) == 50
+        assert len(graph.edges) == 100

@@ -254,3 +254,106 @@ async def test_cancelled_optional_span_stays_unset(traced_exporter) -> None:
     )
     assert span.status.status_code.name == "UNSET"
     assert "vc.failure_mode" not in span.attributes
+
+
+def test_failed_root_span_omits_message_when_content_capture_is_enabled() -> None:
+    from core.tracing import FailureMode, record_failure
+    from opentelemetry import trace
+    span = trace.INVALID_SPAN
+    record_failure(span, RuntimeError("secret"), FailureMode.unknown)
+    assert span is trace.INVALID_SPAN
+
+
+def test_safe_failure_projection_omits_exception_message_and_stacktrace() -> None:
+    from core.tracing import FailureMode, record_failure
+    from opentelemetry import trace
+    span = trace.INVALID_SPAN
+    record_failure(span, RuntimeError("secret"), FailureMode.unknown)
+    assert span is trace.INVALID_SPAN
+
+
+def test_recording_span_failure_projection_redacts_attributes_events_and_status(traced_exporter) -> None:
+    secret = "member@example.test"
+    config = _config(tracing_capture_content=True)
+    with handle_span(config, object(), "expert") as span:
+        record_failure(span, RuntimeError(secret), FailureMode.unknown, config=config)
+    shutdown_tracing()
+    finished = traced_exporter.get_finished_spans()[0]
+    assert finished.status.status_code.name == "ERROR"
+    assert finished.attributes["exception.type"] == "RuntimeError"
+    assert secret not in str(finished.attributes) + str(finished.events) + str(finished.status)
+
+
+def test_recording_span_failure_projection_omits_exception_stacktrace(traced_exporter) -> None:
+    config = _config(tracing_capture_content=True)
+    with handle_span(config, object(), "expert") as span:
+        record_failure(span, RuntimeError("trace secret"), FailureMode.unknown, config=config)
+    shutdown_tracing()
+    finished = traced_exporter.get_finished_spans()[0]
+    assert all(event.name != "exception" for event in finished.events)
+    assert "stacktrace" not in str(finished.attributes) + str(finished.events)
+
+
+def test_capture_enabled_warns_naming_exported_data(caplog) -> None:
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    endpoint = "http://collector.warning.invalid/v1/traces"
+    reset_tracing_for_tests()
+    caplog.set_level("WARNING")
+    config = _config(
+        tracing_enabled=True,
+        tracing_otlp_endpoint=endpoint,
+        tracing_otlp_headers="authorization=Bearer warn-secret",
+        tracing_capture_content=True,
+        tracing_content_max_chars=777,
+    )
+    try:
+        assert configure_tracing(config, span_exporter=InMemorySpanExporter()) is True
+        warnings = [record for record in caplog.records if record.levelname == "WARNING"]
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        for value in (
+            "gen_ai.prompt",
+            "gen_ai.completion",
+            "vc.message",
+            "member messages",
+            "prompts",
+            "model completions",
+            "777",
+        ):
+            assert value in message
+        assert endpoint not in message
+        assert "warn-secret" not in message
+    finally:
+        reset_tracing_for_tests()
+
+
+def test_capture_default_does_not_warn(caplog) -> None:
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    reset_tracing_for_tests()
+    caplog.set_level("WARNING")
+    try:
+        assert configure_tracing(
+            _config(
+                tracing_enabled=True,
+                tracing_otlp_endpoint="http://collector.internal/v1/traces",
+            ),
+            span_exporter=InMemorySpanExporter(),
+        )
+        assert all("gen_ai.prompt" not in record.getMessage() for record in caplog.records)
+    finally:
+        reset_tracing_for_tests()
+
+
+def test_capture_on_without_configure_does_not_warn(caplog) -> None:
+    reset_tracing_for_tests()
+    caplog.set_level("WARNING")
+    try:
+        assert configure_tracing(_config(tracing_capture_content=True)) is False
+        assert configure_tracing(
+            _config(tracing_enabled=True, tracing_capture_content=True)
+        ) is False
+        assert all("gen_ai.prompt" not in record.getMessage() for record in caplog.records)
+    finally:
+        reset_tracing_for_tests()

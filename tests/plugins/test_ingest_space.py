@@ -17,6 +17,7 @@ from plugins.ingest_space.space_reader import (
     read_body_of_knowledge,
     read_knowledge_base_tree,
 )
+from plugins.url_guard import RefusalCategory
 from tests.conftest import (
     MockEmbeddingsPort,
     MockKnowledgeStorePort,
@@ -44,7 +45,7 @@ def _mock_graphql_client():
 
 
 def _default_stats():
-    return {"fetched": 0, "skipped": 0}
+    return {"fetched": 0, "skipped": 0, "refused": 0}
 
 
 class TestSpaceReader:
@@ -881,7 +882,7 @@ class TestLinkFetching:
 
         call_count = 0
 
-        async def side_effect(url):
+        async def side_effect(url, **_):
             nonlocal call_count
             call_count += 1
             if "good" in url:
@@ -904,6 +905,22 @@ class TestLinkFetching:
 
         assert stats["fetched"] == 1
         assert stats["skipped"] == 1
+
+    async def test_refused_fetch_increments_refused_counter(self):
+        gc = _mock_graphql_client()
+        gc.fetch_url = AsyncMock(return_value=None)
+        gc.last_fetch_refusal = RefusalCategory.DESTINATION
+        stats = _default_stats()
+
+        documents = []
+        await _process_space(
+            self._link_space(), documents, set(),
+            graphql_client=gc, stats=stats, depth=0,
+        )
+
+        assert stats["fetched"] == 0
+        assert stats["skipped"] == 0
+        assert stats["refused"] == 1
 
 
 class TestKnowledgeBaseReader:

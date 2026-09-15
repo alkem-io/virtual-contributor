@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import pytest
 
+from core.domain.routing import RetrievalProfile
+from core.ports.query_router import RouteClass, RoutingDecision
 from plugins.expert.plugin import ExpertPlugin
 from tests.conftest import MockKnowledgeStorePort, MockLLMPort, make_input
 from tests.plugins._rewrite_fixtures import (
@@ -51,6 +53,47 @@ class TestExpertResolvesFollowUpsBeforeRetrieval:
         assert llm.n == 1
 
 
+async def test_history_rewrite_exact_utf8_cap_calls_provider() -> None:
+    llm, store = CountingLLM(), MockKnowledgeStorePort()
+    question = "abcd"
+    await ExpertPlugin(llm=llm, knowledge_store=store, rewrite_max_utf8_bytes=4).handle(
+        make_input(message=question, history=HISTORY)
+    )
+    # The exact-boundary original is eligible for rewrite; its oversized
+    # candidate is then safely rejected in favour of the original.
+    assert llm.n == 2 and store.query_calls[0][1] == [question]
+
+
+async def test_history_rewrite_over_utf8_cap_skips_provider() -> None:
+    llm, store = CountingLLM(), MockKnowledgeStorePort()
+    question = "abcde"
+    await ExpertPlugin(llm=llm, knowledge_store=store, rewrite_max_utf8_bytes=4).handle(
+        make_input(message=question, history=HISTORY)
+    )
+    assert llm.n == 1 and store.query_calls[0][1] == [question]
+
+
+async def test_multibyte_history_rewrite_over_cap_skips_provider() -> None:
+    llm, store = CountingLLM(), MockKnowledgeStorePort()
+    question = "ééé"
+    await ExpertPlugin(llm=llm, knowledge_store=store, rewrite_max_utf8_bytes=5).handle(
+        make_input(message=question, history=HISTORY)
+    )
+    assert llm.n == 1 and store.query_calls[0][1] == [question]
+
+
+async def test_oversized_rewrite_candidate_falls_back_to_bounded_original() -> None:
+    class _Oversized(CountingLLM):
+        async def invoke(self, messages, **kwargs):
+            self.n += 1
+            return "x" * 20 if self.n == 1 else "answer"
+    llm, store = _Oversized(), MockKnowledgeStorePort()
+    await ExpertPlugin(llm=llm, knowledge_store=store, rewrite_max_utf8_bytes=4).handle(
+        make_input(message="four", history=HISTORY)
+    )
+    assert llm.n == 2 and store.query_calls[0][1] == ["four"]
+
+
 class TestExpertHonoursTheGate:
     @pytest.mark.parametrize("message", CONVERSATIONAL[:3])
     async def test_conversational_turns_skip_the_rewrite(self, message: str) -> None:
@@ -70,6 +113,74 @@ class TestExpertHonoursTheGate:
             rewrite_policy=SkipConversational(),
         ).handle(make_input(message="show me those", history=HISTORY))
         assert store.query_calls[0][1] == [RESOLVED]
+
+
+@pytest.mark.parametrize("gate_enabled", [False, True])
+async def test_ambiguous_acknowledgement_is_rewritten_then_reclassified_for_width(
+    gate_enabled: bool,
+) -> None:
+    """Routing must classify the factual rewrite, never the raw ``ok``."""
+    class Router:
+        def classify(self, message: str) -> RoutingDecision:
+            route = RouteClass.COMPLEX if message == RESOLVED else RouteClass.CONVERSATIONAL
+            return RoutingDecision(route, "test")
+
+    class Gate:
+        def should_skip_rewrite(self, message: str) -> bool:
+            # The gate may be on, but ambiguous acknowledgements stay eligible.
+            return gate_enabled and message == "thanks!"
+
+    table = {
+        RouteClass.CONVERSATIONAL: RetrievalProfile(False, 0, 0.3, 100),
+        RouteClass.COMPLEX: RetrievalProfile(True, 7, 0.3, 100),
+    }
+    store = MockKnowledgeStorePort()
+    await ExpertPlugin(
+        llm=CountingLLM(), knowledge_store=store, query_router=Router(),
+        routing_table=table, rewrite_policy=Gate(),
+    ).handle(make_input(message="ok", history=HISTORY))
+    assert store.query_calls[0][1] == [RESOLVED]
+    assert store.query_calls[0][2] == 7
+
+
+@pytest.mark.parametrize("graph", [False, True])
+async def test_router_classifies_only_the_resolved_retrieval_query(graph: bool) -> None:
+    """The discarded raw follow-up must never influence routing."""
+    class CountingRouter:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def classify(self, message: str) -> RoutingDecision:
+            self.calls.append(message)
+            return RoutingDecision(RouteClass.MODERATE, "test")
+
+    router = CountingRouter()
+    plugin = ExpertPlugin(
+        llm=CountingLLM(), knowledge_store=MockKnowledgeStorePort(),
+        query_router=router,
+    )
+    if graph:
+        await TestExpertGraphPath()._run(plugin, "and the other one?")
+    else:
+        await plugin.handle(make_input(message="and the other one?", history=HISTORY))
+    assert router.calls == [RESOLVED]
+
+
+async def test_unambiguous_small_talk_still_has_zero_retrieval_calls() -> None:
+    class Router:
+        def classify(self, message: str) -> RoutingDecision:
+            return RoutingDecision(RouteClass.CONVERSATIONAL, "test")
+
+    class Gate:
+        def should_skip_rewrite(self, message: str) -> bool:
+            return True
+
+    store = MockKnowledgeStorePort()
+    await ExpertPlugin(
+        llm=CountingLLM(), knowledge_store=store, query_router=Router(),
+        rewrite_policy=Gate(),
+    ).handle(make_input(message="thanks!", history=HISTORY))
+    assert store.query_calls == []
 
 
 class TestExpertGraphPath:

@@ -3,27 +3,30 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
-import math
 import re
 import statistics
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from evaluation.dataset import TestCase
+from evaluation.assertions import evaluate_assertions
+from evaluation.dataset import TestCase, canonical_test_set_digest, successful_case_digest
+from evaluation.case_identity import CASE_IDENTITY_VERSION
 from evaluation.report import (
     AggregateMetrics,
     EvaluationCase,
     EvaluationRun,
     MetricScores,
     SourceInfo,
+    canonical_metric_scores,
 )
 
 logger = logging.getLogger(__name__)
 
-METRIC_NAMES = ["faithfulness", "answer_relevancy", "context_precision", "context_recall"]
+METRIC_NAMES = ("faithfulness", "answer_relevancy", "context_precision", "context_recall")
 
 
 class Scorer:
@@ -54,16 +57,17 @@ class Scorer:
         dataset = EvaluationDataset(samples=[sample])
 
         result = await asyncio.to_thread(evaluate, dataset=dataset, metrics=self._metrics)
-        df = result.to_pandas()
-
-        scores: dict[str, float] = {}
-        for name in METRIC_NAMES:
-            if name in df.columns:
-                val = df[name].iloc[0]
-                numeric = float(val) if val is not None else 0.0
-                scores[name] = numeric if math.isfinite(numeric) else 0.0
-
-        return scores
+        # RAGAS 0.4.3 deliberately combines the input dataset and scores in
+        # ``to_pandas()``.  Its native ``scores`` member is the score-only
+        # record inventory, so read it directly rather than mistaking dataset
+        # columns for metrics.
+        score_records = getattr(result, "scores", None)
+        if not isinstance(score_records, list) or len(score_records) != 1:
+            raise ValueError("RAGAS evaluation result must contain exactly one score record")
+        record = score_records[0]
+        if not isinstance(record, dict):
+            raise ValueError("RAGAS score record must be an object")
+        return canonical_metric_scores({str(name): value for name, value in record.items()})
 
 
 class EvaluationRunner:
@@ -85,12 +89,54 @@ class EvaluationRunner:
         plugin_type: str,
         label: str | None = None,
         test_set_path: str = "evaluation/golden/test_set.jsonl",
+        body_of_knowledge_id: str | None = None,
+        corpus_revision: str | None = None,
+        category_scope: str | None = None,
     ) -> EvaluationRun:
         """Execute the full evaluation suite.
 
         Processes each test case sequentially, capturing responses and scores.
         Failed cases are recorded but do not stop the run (FR-010).
         """
+        normalized_plugin = plugin_type.lower().replace("-", "_")
+        # A category whose retrieval path is BoK-scoped, run without one, is
+        # a valid but unpointed run — warn loudly and record it rather than
+        # hard-failing.
+        category_scope_missing_body_of_knowledge = bool(
+            category_scope
+            and category_scope in {"building-alkemio", "design-thinker"}
+            and not body_of_knowledge_id
+        )
+        if category_scope_missing_body_of_knowledge:
+            logger.warning(
+                "Category %r expects --body-of-knowledge-id and none was supplied;"
+                " retrieval for this run is unpointed",
+                category_scope,
+            )
+        if normalized_plugin == "expert" and (
+            not isinstance(corpus_revision, str)
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}", corpus_revision) is None
+        ):
+            raise ValueError("Expert evaluation requires a safe corpus revision")
+        # The public identity is a pre-egress gate.  Snapshot validated
+        # primitives now; never reread a mutable invoker after case work.
+        if normalized_plugin == "expert":
+            identity = getattr(self._invoker, "evaluation_identity", None)
+            fingerprint = getattr(self._invoker, "composition_fingerprint", None)
+            mode = getattr(identity, "hierarchy_mode", None)
+            invariant = getattr(identity, "invariant_composition_fingerprint", None)
+            full = getattr(identity, "full_composition_fingerprint", None)
+            from plugins.expert.composition import expert_full_composition_fingerprint
+            if (
+                mode not in {"flat", "hierarchical"}
+                or not isinstance(invariant, str)
+                or not isinstance(full, str)
+                or fingerprint != invariant
+                or full != expert_full_composition_fingerprint(invariant, mode)
+            ):
+                raise ValueError("Expert evaluation identity is incomplete or contradictory")
+        else:
+            fingerprint = mode = invariant = full = None
         run_start = time.monotonic()
         ts = datetime.now(timezone.utc)
         ts_str = ts.strftime("%Y%m%dT%H%M%S")
@@ -133,6 +179,14 @@ class EvaluationRunner:
                 failure_count += 1
                 continue
 
+            assert answer is not None
+
+            # Pure string comparison against the derived assertions — no
+            # model, no socket, no credentials. Computed unconditionally,
+            # before the judge call, so a judge outage never erases a
+            # deterministic verdict that was already available for free.
+            assertion_outcome = evaluate_assertions(answer, tc.assertions)
+
             try:
                 scores_dict = await self._scorer.score(
                     question=tc.question,
@@ -158,6 +212,7 @@ class EvaluationRunner:
                     retrieved_contexts=contexts,
                     retrieved_sources=sources,
                     scores=MetricScores(**scores_dict),
+                    assertion_outcome=assertion_outcome,
                     duration_seconds=case_duration,
                 ))
                 success_count += 1
@@ -180,6 +235,7 @@ class EvaluationRunner:
                     retrieved_contexts=contexts,
                     retrieved_sources=sources,
                     error=str(exc),
+                    assertion_outcome=assertion_outcome,
                     duration_seconds=case_duration,
                 ))
                 failure_count += 1
@@ -191,7 +247,17 @@ class EvaluationRunner:
             id=run_id,
             timestamp=ts.isoformat(),
             label=label,
-            plugin_type=plugin_type,
+            plugin_type="expert" if normalized_plugin == "expert" else plugin_type,
+            composition_fingerprint=fingerprint,
+            composition_identity_version=7 if normalized_plugin == "expert" else None,
+            case_identity_version=CASE_IDENTITY_VERSION if normalized_plugin == "expert" else None,
+            hierarchy_mode=mode,
+            test_set_digest=canonical_test_set_digest(test_cases) if normalized_plugin == "expert" else None,
+            body_of_knowledge_digest=hashlib.sha256((body_of_knowledge_id or "").encode("utf-8")).hexdigest() if normalized_plugin == "expert" else None,
+            corpus_revision=corpus_revision if normalized_plugin == "expert" else None,
+            successful_case_digests=[successful_case_digest(test_cases[c.index]) for c in cases if c.error is None] if normalized_plugin == "expert" else None,
+            invariant_composition_fingerprint=invariant,
+            full_composition_fingerprint=full,
             test_set_path=test_set_path,
             test_case_count=total,
             success_count=success_count,
@@ -199,6 +265,8 @@ class EvaluationRunner:
             duration_seconds=total_duration,
             aggregate=aggregate,
             cases=cases,
+            category_scope=category_scope,
+            category_scope_missing_body_of_knowledge=category_scope_missing_body_of_knowledge,
         )
 
         self._persist(run)

@@ -115,6 +115,26 @@ class TestGuidancePlugin:
         llm_prompt = plugin._llm.calls[-1][0]["content"]
         assert "[Document 1 · test · origin: test]" in llm_prompt
 
+    async def test_guidance_context_excises_identity_bearing_legacy_aliases(self):
+        """Guidance inherits the shared renderer's excision structurally
+        through its render_document_block() call site — a legacy alias equal
+        to the passage's own stable hierarchy id must not reach the prompt."""
+        store = MockKnowledgeStorePort()
+        store.collections["alkem.io-knowledge"] = [
+            {
+                "id": "doc-1",
+                "document": "guidance passage",
+                "metadata": {"spaceId": "sentinel-guidance-id", "source": "space:sentinel-guidance-id"},
+            },
+        ]
+        plugin = GuidancePlugin(
+            llm=MockLLMPort(response='{"answer": "ok"}'),
+            knowledge_store=store,
+        )
+        await plugin.handle(make_input())
+        prompt = plugin._llm.calls[-1][0]["content"]
+        assert "sentinel-guidance-id" not in prompt
+
     async def test_history_condensation(self, plugin):
         event = make_input(
             history=[

@@ -10,6 +10,7 @@ the lexical arm fails.
 from __future__ import annotations
 
 import logging
+import json
 
 import pytest
 
@@ -38,7 +39,7 @@ class _ExplodingCollection:
     def query(self, **kwargs):
         raise ValueError(
             f"Expected where document to have exactly one operator, got "
-            f"{kwargs.get('where_document')}"
+            f"{kwargs}"
         )
 
 
@@ -100,3 +101,41 @@ class TestOtherOperationsStillLogDetail:
 
         logged = "\n".join(r.getMessage() for r in caplog.records)
         assert "Expected where document" in logged
+
+    async def test_filtered_dense_query_redacts_branch_id_but_keeps_type(self, adapter, caplog):
+        branch_id = "private-branch-identifier"
+        with caplog.at_level(logging.WARNING):
+            with pytest.raises(ValueError):
+                await adapter.query(
+                    collection="c", query_texts=["anything"],
+                    where={"subspaceId": {"$eq": branch_id}},
+                )
+        logged = "\n".join(record.getMessage() for record in caplog.records)
+        assert branch_id not in logged
+        assert "ValueError" in logged
+
+    @pytest.mark.parametrize(
+        ("error", "type_name"),
+        [
+            (RuntimeError("private-branch-identifier"), "RuntimeError"),
+            (json.JSONDecodeError("private-branch-identifier", "{", 0), "JSONDecodeError"),
+        ],
+    )
+    async def test_filtered_retry_errors_redact_branch_id_and_keep_retry_state(
+        self, error, type_name, caplog,
+    ):
+        attempts = 0
+
+        def explode():
+            nonlocal attempts
+            attempts += 1
+            raise error
+
+        with caplog.at_level(logging.WARNING):
+            with pytest.raises(type(error)):
+                await ChromaDBAdapter._retry(explode, redact_errors=True)
+        logged = "\n".join(record.getMessage() for record in caplog.records)
+        assert attempts == 3
+        assert "private-branch-identifier" not in logged
+        assert type_name in logged
+        assert "attempt 1 failed, retrying" in logged

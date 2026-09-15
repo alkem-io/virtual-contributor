@@ -1,0 +1,38 @@
+How do I create an account on Alkemio?	Click the sign-up link, accept the Terms of Use and Privacy Policy, and connect via LinkedIn, Microsoft, GitHub, or email.
+How do I find a Space on Alkemio?	Click the menu button next to your profile picture, select "Explore Spaces", and use the search bar or filters.
+What are the first steps I should take after signing up?	Fill out your profile, learn about the platform structure, join a Space, and introduce yourself in the Welcome Space.
+How do I create my own Space on Alkemio?	Go to your profile, click the gear icon, navigate to the Account tab, and click "+" in the Hosted Spaces box.
+What is the difference between a Space and a Subspace on Alkemio?	A Space is the main collaboration environment; a Subspace is a focused area within a Space for a specific topic or project.
+What is a profile on Alkemio and how do I set it up?	A profile is your personal page showing your skills and contributions; set it up by adding your photo, bio, skills, and interests.
+How do I create a Subspace within my Space?	Go to the Topics section and click "+ Create Subspace".
+What is a Virtual Contributor and how does it work?	An AI agent trained on knowledge you provide, which you interact with by tagging it in a post.
+How do I add a Virtual Contributor to my Space?	Go to the Community section and use "Invite Virtual Contributor".
+What is the Innovation Flow feature?	A feature that guides members through structured phases of an innovation process within a Subspace.
+How do I use the whiteboard feature in Alkemio?	Add a whiteboard as additional content to a Post for real-time visual collaboration.
+Can I embed external content using iFrames in Alkemio?	Yes, using an iFrame in a Post — only whitelisted sites are supported.
+How do Video Calls work within Alkemio?	Alkemio uses Jitsi as its built-in video conferencing tool, accessible via the video icon in your Space or Subspace.
+What are Templates and how can I use them in my Space?	Pre-built structures for posts, whiteboards, and workflows that standardize collaboration and save time.
+How do I create and manage Events in my Space?	Only admins can create events by clicking "+" in the Events block and filling in the details.
+What are Posts and how do I make them look visually appealing?	Posts are the main way to share content; make them appealing using text formatting, headers, images, and embedded media.
+How do I use the Search feature to find content or people?	Enter a keyword in the search bar to find content or people within a Space or across the entire platform.
+What are Updates and how do I send them to my community?	Broadcast messages to all Space members; sent by admins or leads via Settings > "Updates from the leads".
+How do I invite people to join my Space?	Go to the Community section and use "Invite people to this Space".
+How do I manage join requests for my Space?	Approve or decline requests in the Community or Settings section of the Space.
+How can I activate and engage my community on Alkemio?	Post regular updates, create Subspaces around relevant topics, host events, and invite Virtual Contributors.
+What tools does Alkemio provide for multi-stakeholder collaboration?	Whiteboards, posts, memos, innovation flows, events, video calls, virtual contributors, templates, knowledge base, and updates.
+What are the different roles that can be assigned and what do they mean?	Admin (manages settings and membership), Lead (guides community and posts updates), Member (participates in collaboration).
+How can I train my own Virtual Contributor?	Create a VC based on a Subspace, a custom knowledge base (Word, PDF, Excel), or by linking an external AI engine.
+What kinds of questions or tasks can a Virtual Contributor help with?	Answering questions, summarizing content, exploring ideas, and giving feedback — based on its training knowledge.
+How can Alkemio help with aligning a consortium?	By providing a shared Space where members can collaborate, share updates, align on goals, and track progress.
+Can Alkemio be used to build an innovation hub?	Yes, through structured Spaces, guided innovation flows, community tools, and virtual contributors.
+How does Alkemio support guiding a cohort or coordinating a movement?	Through Spaces and Subspaces to organize activities, share resources, and keep participants aligned via updates and events.
+Is Alkemio suitable for universities, businesses, and cities?	Yes, it is designed for any context requiring multi-stakeholder collaboration around shared goals.
+What is the Alkemio Foundation and what is its mission?	A foundation based in The Hague that acts as purpose guarantor of the Alkemio platform, supporting changemakers in collective action.
+What does it mean that Alkemio is steward-owned?	The company is governed to stay true to its mission, with control remaining with those committed to the purpose rather than profit.
+Is Alkemio open source?	Alkemio is Open Source - all its code is licensed under EUPL v1.2. Only operational artifacts are closed source - IaC etc.
+How does Alkemio put the public interest first?	Through steward-ownership, not selling user data, being open source, and focusing on societal collaboration over profit.
+What does "Public Interest Technology" mean in the context of Alkemio?	Technology built and governed with society's needs first, rather than shareholder profits.
+Is Alkemio a European technology company?	Yes, based in the Netherlands with AI services hosted in Sweden, EU.
+What platform promises does Alkemio make to its users?	Not selling user data, being open source, giving each Space control over its data, and governing in the public interest.
+How can I contact Alkemio support?	support@alkem.io
+Where can I find tutorials for using Alkemio?	In the "How to…" section of the Alkemio documentation.

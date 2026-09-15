@@ -365,3 +365,20 @@ class TestPluginTypeResolution:
         from main import _PluginTypeProbe
 
         assert _PluginTypeProbe.model_config == BaseConfig.model_config
+
+
+def test_embedding_retry_and_deadline_limits_are_validated() -> None:
+    with pytest.raises(ValueError):
+        BaseConfig(llm_base_url="http://local", embeddings_max_attempts=6)
+    with pytest.raises(ValueError):
+        BaseConfig(llm_base_url="http://local", embeddings_attempt_timeout_seconds=46, embeddings_total_deadline_seconds=45)
+
+
+def test_rewrite_utf8_cap_cannot_exceed_embedding_input_cap() -> None:
+    with pytest.raises(ValueError):
+        BaseConfig(llm_base_url="http://local", embeddings_query_max_utf8_bytes=4, query_rewrite_max_utf8_bytes=5)
+
+
+def test_embedding_limit_defaults_are_bounded() -> None:
+    config = BaseConfig(llm_base_url="http://local")
+    assert 1 <= config.embeddings_max_attempts <= 5 and config.embeddings_attempt_timeout_seconds <= config.embeddings_total_deadline_seconds <= config.pipeline_timeout

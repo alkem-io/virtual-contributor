@@ -178,6 +178,31 @@ class TestEmbedStep:
         assert EmbedStep(embeddings_port=embeddings).name == "embed"
 
 
+async def test_embed_step_recovers_from_transient_document_decode_error(monkeypatch):
+    """The real ingest step sees the adapter's recovered document vector."""
+    import json
+    from unittest.mock import AsyncMock, patch
+
+    from core.adapters.openai_compatible_embeddings import OpenAICompatibleEmbeddingsAdapter
+
+    adapter = OpenAICompatibleEmbeddingsAdapter("k", "http://x", "model")
+    response = type("Response", (), {
+        "raise_for_status": lambda self: None,
+        "json": lambda self: {"data": [{"embedding": [.1]}]},
+    })()
+    with patch("httpx.AsyncClient") as cls:
+        client = cls.return_value.__aenter__.return_value
+        client.post = AsyncMock(side_effect=[json.JSONDecodeError("bad", "{", 0), response])
+        monkeypatch.setattr("core.adapters.openai_compatible_embeddings.BASE_DELAY", 0)
+        context = PipelineContext(
+            collection_name="c", documents=[],
+            chunks=[Chunk(content="document", metadata=DocumentMetadata(document_id="d", source="s"), chunk_index=0)],
+        )
+        await EmbedStep(adapter).execute(context)
+    assert context.errors == [] and context.chunks[0].embedding == [.1]
+    assert client.post.await_count == 2
+
+
 # ---------------------------------------------------------------------------
 # T024: DocumentSummaryStep tests
 # ---------------------------------------------------------------------------

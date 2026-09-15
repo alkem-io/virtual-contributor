@@ -19,6 +19,7 @@ from typing import Any, Protocol
 from core.domain.query_terms import extract_terms
 from core.domain.rank_fusion import reciprocal_rank_fusion
 from core.ports.knowledge_store import KnowledgeStorePort, QueryResult
+from core.ports.embeddings import EmbeddingError
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +137,10 @@ async def retrieve(
                 collection=collection, terms=terms, n_results=n_results,
                 where=where,
             )
+        except EmbeddingError:
+            # A typed query-embedding failure is a terminal retrieval
+            # boundary, even when the dense arm was deliberately muted.
+            raise
         except Exception as exc:
             logger.warning(
                 "Lexical retrieval failed for collection %s (%s) with the "
@@ -163,6 +168,8 @@ async def retrieve(
         raise dense_result
 
     if isinstance(lexical_result, BaseException):
+        if isinstance(lexical_result, EmbeddingError):
+            raise lexical_result
         # The exception type, not its message: a store error can echo the
         # member's own query terms back into the log.
         logger.warning(

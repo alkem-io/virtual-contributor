@@ -9,6 +9,7 @@ from dataclasses import dataclass
 import pytest
 
 from core.domain.hybrid_retrieval import retrieve
+from core.ports.embeddings import EmbeddingInputError, EmbeddingPermanentError, EmbeddingTransientError
 from core.ports.knowledge_store import QueryResult
 from tests.conftest import MockKnowledgeStorePort
 
@@ -206,3 +207,21 @@ class TestMutedArms:
         out = await retrieve(store, "c", "traefik ingress config",
                              _Settings(hybrid_dense_weight=0.0))
         assert out.ids[0] == []
+
+
+@pytest.mark.parametrize("error_type", [EmbeddingInputError, EmbeddingPermanentError, EmbeddingTransientError])
+async def test_hybrid_lexical_embedding_error_propagates_unchanged(error_type):
+    error = error_type("typed")
+    store = _FakeStore(lexical_error=error)
+    with pytest.raises(error_type) as raised:
+        await retrieve(store, "c", "traefik ingress", _Settings())
+    assert raised.value is error
+
+
+@pytest.mark.parametrize("error_type", [EmbeddingInputError, EmbeddingPermanentError, EmbeddingTransientError])
+async def test_lexical_only_embedding_error_propagates_unchanged(error_type):
+    error = error_type("typed")
+    store = _FakeStore(lexical_error=error)
+    with pytest.raises(error_type) as raised:
+        await retrieve(store, "c", "traefik ingress", _Settings(hybrid_dense_weight=0.0))
+    assert raised.value is error

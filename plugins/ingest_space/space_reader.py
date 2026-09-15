@@ -10,6 +10,7 @@ from dataclasses import dataclass, replace
 
 from core.domain.ingest_pipeline import Document, DocumentMetadata, DocumentType
 from plugins.ingest_space.link_extractor import extract_text
+from plugins.url_guard import RefusalCategory
 
 logger = logging.getLogger(__name__)
 
@@ -123,15 +124,15 @@ async def read_space_tree(graphql_client, space_id: str) -> list[Document]:
 
     documents: list[Document] = []
     seen: set[str] = set()
-    stats = {"fetched": 0, "skipped": 0}
+    stats = {"fetched": 0, "skipped": 0, "refused": 0}
     await _process_space(
         space, documents, seen, graphql_client=graphql_client,
         stats=stats, depth=0,
     )
     logger.info(
         "Space tree: emitted %d unique documents "
-        "(link bodies fetched=%d, skipped=%d)",
-        len(documents), stats["fetched"], stats["skipped"],
+        "(link bodies fetched=%d, skipped=%d, refused=%d)",
+        len(documents), stats["fetched"], stats["skipped"], stats["refused"],
     )
     return documents
 
@@ -153,7 +154,7 @@ async def read_knowledge_base_tree(graphql_client, kb_id: str) -> list[Document]
 
     documents: list[Document] = []
     seen: set[str] = set()
-    stats = {"fetched": 0, "skipped": 0}
+    stats = {"fetched": 0, "skipped": 0, "refused": 0}
     await _process_space(
         space_shaped, documents, seen,
         graphql_client=graphql_client, stats=stats, depth=0,
@@ -161,8 +162,8 @@ async def read_knowledge_base_tree(graphql_client, kb_id: str) -> list[Document]
     )
     logger.info(
         "Knowledge base tree: emitted %d unique documents "
-        "(link bodies fetched=%d, skipped=%d)",
-        len(documents), stats["fetched"], stats["skipped"],
+        "(link bodies fetched=%d, skipped=%d, refused=%d)",
+        len(documents), stats["fetched"], stats["skipped"], stats["refused"],
     )
     return documents
 
@@ -476,7 +477,9 @@ async def _process_callout(
             if uri or link_title or link_desc:
                 fetched_text: str | None = None
                 if uri:
-                    fetched = await graphql_client.fetch_url(uri)
+                    fetched = await graphql_client.fetch_url(
+                        uri, link_id=link.get("id"),
+                    )
                     if fetched is not None:
                         body, content_type = fetched
                         fetched_text = extract_text(body, content_type)
@@ -489,7 +492,13 @@ async def _process_callout(
                         else:
                             stats["skipped"] += 1
                     else:
-                        stats["skipped"] += 1
+                        if isinstance(
+                            getattr(graphql_client, "last_fetch_refusal", None),
+                            RefusalCategory,
+                        ):
+                            stats["refused"] += 1
+                        else:
+                            stats["skipped"] += 1
 
                 parts = []
                 if fetched_text:

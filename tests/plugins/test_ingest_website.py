@@ -9,6 +9,7 @@ import pytest
 
 from core.domain.ingest_pipeline import Chunk
 from core.events.ingest_website import IngestWebsiteResult
+from plugins import url_guard
 from plugins.ingest_website.crawler import CrawlError, _is_same_domain, _normalize_url, _should_skip_url, crawl
 from plugins.ingest_website.html_parser import extract_text, extract_title, remove_cross_page_boilerplate
 from plugins.ingest_website.plugin import IngestWebsitePlugin
@@ -18,6 +19,19 @@ from tests.conftest import (
     MockLLMPort,
     make_ingest_website,
 )
+
+
+@pytest.fixture(autouse=True)
+def _resolve_crawler_test_hosts(monkeypatch: pytest.MonkeyPatch):
+    """Keep MockTransport crawler tests independent of the system resolver."""
+    original_resolver = url_guard.resolve_host
+
+    async def resolve_host(host: str) -> list[str]:
+        if host == "example.com":
+            return ["93.184.216.34"]
+        return await original_resolver(host)
+
+    monkeypatch.setattr(url_guard, "resolve_host", resolve_host)
 
 
 class TestCrawler:
@@ -47,6 +61,11 @@ def _mock_response(html: str, status: int = 200, content_type: str = "text/html"
     return httpx.Response(status, headers={"content-type": content_type}, text=html)
 
 
+def _logical_url(request: httpx.Request) -> str:
+    """Rebuild the authority a pinned request presents to virtual hosting."""
+    return f"{request.url.scheme}://{request.headers['host']}{request.url.raw_path.decode()}"
+
+
 class TestCrawlFunction:
     """Tests for the crawl() async function with mocked HTTP transport."""
 
@@ -54,9 +73,10 @@ class TestCrawlFunction:
     def _patch_transport(handler):
         """Patch httpx.AsyncClient to use a mock transport handler."""
         transport = httpx.MockTransport(handler)
+        client_class = httpx.AsyncClient
         return patch(
-            "plugins.ingest_website.crawler.httpx.AsyncClient",
-            return_value=httpx.AsyncClient(transport=transport),
+            "plugins.url_guard.httpx.AsyncClient",
+            side_effect=lambda **kwargs: client_class(transport=transport, **kwargs),
         )
 
     async def test_single_page(self):
@@ -73,7 +93,7 @@ class TestCrawlFunction:
         }
 
         def handler(request: httpx.Request) -> httpx.Response:
-            url = str(request.url)
+            url = _logical_url(request)
             return _mock_response(pages.get(url, "<html></html>"))
 
         with self._patch_transport(handler):
@@ -146,6 +166,72 @@ class TestCrawlFunction:
         with self._patch_transport(lambda req: _mock_response(html)):
             results = await crawl("https://example.com", page_limit=10)
         assert len(results) == 1  # Only the root page
+
+    async def test_relative_links_resolve_against_the_post_redirect_url(self):
+        """A redirected page's relative hrefs must resolve against its final URL, not its pre-redirect URL."""
+        pages = {
+            "https://example.com/": _html_page("Home", "Home page", ["https://example.com/docs"]),
+            "https://example.com/docs/en/": _html_page("Docs", "Docs page", ["intro"]),
+            "https://example.com/docs/en/intro": _html_page("Intro", "Intro page"),
+        }
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = _logical_url(request)
+            if url == "https://example.com/docs":
+                return httpx.Response(301, headers={"location": "https://example.com/docs/en/"})
+            return _mock_response(pages.get(url, "<html></html>"))
+
+        with self._patch_transport(handler):
+            results = await crawl("https://example.com", page_limit=10)
+
+        urls = {r["url"] for r in results}
+        assert "https://example.com/docs/en/intro" in urls
+        assert "https://example.com/intro" not in urls
+
+    async def test_redirected_page_visited_directly_is_not_crawled_twice(self):
+        """A link that points straight at a redirect's final URL must not duplicate the redirected page."""
+        pages = {
+            "https://example.com/": _html_page(
+                "Home", "Home page", ["https://example.com/docs", "https://example.com/docs/en/"]
+            ),
+            "https://example.com/docs/en/": _html_page("Docs", "Docs page"),
+        }
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = _logical_url(request)
+            if url == "https://example.com/docs":
+                return httpx.Response(301, headers={"location": "https://example.com/docs/en/"})
+            return _mock_response(pages.get(url, "<html></html>"))
+
+        with self._patch_transport(handler):
+            results = await crawl("https://example.com", page_limit=10)
+
+        # Results carry the normalized URL, which has no trailing slash.
+        docs_urls = [r["url"] for r in results if r["url"] == "https://example.com/docs/en"]
+        assert len(docs_urls) == 1
+
+    async def test_redirect_to_private_address_is_refused_before_the_crawler_requests_it(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        async def resolve_host(host: str) -> list[str]:
+            assert host == "public.example"
+            return ["93.184.216.34"]
+
+        monkeypatch.setattr(url_guard, "resolve_host", resolve_host)
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(302, headers={"location": "http://169.254.42.42/metadata"})
+
+        with self._patch_transport(handler):
+            results = await crawl("https://public.example", page_limit=5)
+
+        assert results == []
+        assert len(requests) == 1
+        assert requests[0].url.host == "93.184.216.34"
+        assert requests[0].headers["host"] == "public.example"
 
 
 class TestHTMLParser:
@@ -389,9 +475,10 @@ class TestCrawlerRedirectURL:
     @staticmethod
     def _patch_transport(handler):
         transport = httpx.MockTransport(handler)
+        client_class = httpx.AsyncClient
         return patch(
-            "plugins.ingest_website.crawler.httpx.AsyncClient",
-            return_value=httpx.AsyncClient(transport=transport, follow_redirects=True),
+            "plugins.url_guard.httpx.AsyncClient",
+            side_effect=lambda **kwargs: client_class(transport=transport, **kwargs),
         )
 
     async def test_records_redirect_url(self):
