@@ -1,12 +1,1067 @@
 # CHANGELOG
 
 
+## v0.4.0 (2026-09-15)
+
+### Chores
+
+- Merge main (v0.3.0 release commits) back into develop before promotion
+  ([`214892b`](https://github.com/alkem-io/virtual-contributor/commit/214892b5476e7a4fa94eeb554f5e8bfc485c9acd))
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+
+
 ## v0.3.0 (2026-08-14)
+
+### Bug Fixes
+
+- **054**: Close SSRF in ingest link fetching via a shared outbound URL guard
+  ([#125](https://github.com/alkem-io/virtual-contributor/pull/125),
+  [`1907e28`](https://github.com/alkem-io/virtual-contributor/commit/1907e285060a2d68f67a118d4f8701aca097882f))
+
+* fix(054): close SSRF in ingest link fetching via a shared outbound URL guard
+
+Member-supplied link URIs were fetched with no scheme allowlist, no host or IP denylist, and
+  redirects followed, and the response body was embedded into a knowledge base readable through
+  ordinary VC answers. Probes reached the Scaleway metadata address (169.254.42.42), in-cluster
+  services, and RFC-1918 hosts.
+
+A second, worse path was found while specifying this fix: _rewrite_alkemio_uri gated on
+  netloc.endswith('alkem.io'), a raw suffix test, so 'evil-alkem.io' matched. Such a link was
+  rewritten onto the deployment host and then passed the netloc == base_netloc check that attaches
+  the Kratos session bearer — an authenticated SSRF that no IP denylist would have touched. Host
+  matching is now anchored on domain-label boundaries.
+
+The new plugins/url_guard.py validates every redirect hop rather than only the initial URI, denies
+  link-local (incl. 169.254.0.0/16), loopback and RFC-1918 by default, and connects to the validated
+  address literal while retaining Host and sni_hostname so TLS still verifies the real hostname —
+  closing the DNS-rebinding window. The 10 MiB cap is now enforced while streaming instead of after
+  the body is already buffered. ingest_website's crawler is repointed at the same guard, replacing
+  its weaker private copy.
+
+Refusals are recorded with scheme and host only, never path or query, since member-authored content
+  lives in the path.
+
+The guard deliberately lives outside plugins/ingest_space/, which the coverage omit list hides from
+  the CI floor.
+
+Closes #123 workspace#054-ingest-link-ssrf
+
+Co-Authored-By: Codex gpt-5.6-terra <noreply@openai.com>
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+* fix(054): review round 1 — close authenticated read, bound decompression, pin TLS
+
+The first pass closed direct SSRF and the lookalike-host escalation, but the security review found
+  the rewrite still applied to ANY host under the platform domain, before DNS. A member could submit
+  a fabricated subdomain (anything.alkem.io/api/private/rest/storage/document/X), have it rewritten
+  onto the deployment host, and receive the worker's Kratos bearer — an authenticated read of a
+  member-controlled path, embedded where the member reads it back. Rewrite-with-credentials is now
+  restricted to the platform apex or the exact deployment origin; every other host under the domain
+  is treated as ordinary external input.
+
+This is the contained fix. It does NOT implement the deeper remediation the review recommends —
+  never deriving credential authority from member-authored URLs at all, binding authenticated
+  storage retrieval to trusted contribution data instead. That is an architectural change and is
+  recorded as an open decision, not silently deferred.
+
+Also from the review: - The credential and exemption checks ignored scheme and port, so with a base
+  of localhost:3000 a probe to localhost:8080 was credentialed. All three now have to match. - The
+  incremental size cap counted compressed bytes, so a 20 KB gzip expanding to 20 MiB peaked at 51.8
+  MiB against a 100 KB limit. Decoded bytes are now bounded during streaming. - One httpx pool was
+  shared across redirect hops, so two hostnames resolving to the same address reused the first TLS
+  connection without verifying the second hostname. Keep-alive is disabled across hops. - The
+  crawler discarded the validated address and still followed redirects itself; it now uses the same
+  pinned per-hop executor. - That executor moved into plugins/url_guard.py: redirect handling,
+  credential gating, pinning and size enforcement were all sitting in a file the coverage omit list
+  hides from the CI floor, so a regression there could not lower coverage.
+
+Two tests could not fail and now can: weakening the deployment-host check to a suffix compare leaked
+  a bearer to evil-deployment.example while all 2148 tests passed, and the hop-count assertion
+  imported its own bound from the module under test, so raising the limit to 50 stayed green.
+
+Fixes a real regression the pre-filter introduced: responses with application/octet-stream, an empty
+  header, or no content-type were refused outright, though extraction previously recovered them by
+  magic-byte sniffing — a PDF linked from a CDN would have silently degraded to metadata-only.
+
+workspace#054-ingest-link-ssrf
+
+* fix(054): review round 2 — stop advertising zstd, decouple sniff window, measure credential logic
+
+The security re-review moved from fail to conditional: every critical and high finding was closed
+  and verified by execution. These are the three mediums it left, two of which were availability
+  regressions the first fix introduced.
+
+Accept-Encoding advertised gzip, deflate and zstd while the bounded decoder handled only the first
+  two, so any compliant origin selecting zstd failed the fetch outright — a systematic ingestion and
+  crawl failure. We now advertise only what we can bound, rather than adding a decompressor
+  dependency to keep the promise. The decoded-size limit is unchanged.
+
+The 4 KiB magic-byte sniff window was conflated with the full body cap, so an 8,201-byte PDF with no
+  Content-Type was refused as oversized when it arrived in one chunk but accepted when split at
+  4,096 — ingestion depending on how a server frames its response. The window now bounds only what
+  is inspected; the body cap is enforced separately and unchanged.
+
+The rewrite boundary and the bearer condition were still in graphql_client.py, which the coverage
+  omit list hides from the CI floor, so a regression in either could not lower coverage. Both are
+  now pure functions in the measured url_guard module, and the executor derives credentials from
+  them instead of trusting caller-supplied headers — it strips any inbound Authorization and
+  attaches the bearer only for the exact deployment origin.
+
+The apex storage URI still rewrites to the deployment and still carries the bearer; that positive
+  case is covered, since over-blocking it would break all seed-data ingestion.
+
+* fix(054): review round 3 — the guard owns its encoding header and its credentials
+
+Two API-hardening findings from the final security review. Neither is reachable from an in-tree
+  caller today — the crawler sends only a User-Agent and ingest-space uses the token provider — but
+  a future caller could reach both, and a security residual is not something to ship as tracked
+  debt.
+
+Round 2 pinned Accept-Encoding to what the bounded decoder can actually read, and both live paths
+  emitted exactly that. A caller passing a lower-case accept-encoding was merged rather than
+  overridden, though, serializing as "zstd, gzip, deflate" — so a compliant origin could still
+  select an encoding we cannot decode and ingestion would fail. Header names are case-insensitive;
+  the filtering now is too, across both caller header APIs.
+
+Stripping a caller's Authorization header was also not enough: a caller-supplied AsyncClient carries
+  credentials through its own default headers or auth=, which bypassed per-origin scoping entirely.
+  A deployment-to-public redirect sent the trusted bearer on the first hop and then the client's
+  default bearer to a public target on the second. Requests now neutralize client-default
+  Authorization and Proxy-Authorization and use a no-op auth, so the only credential that can leave
+  is the one the guard itself attaches for the exact deployment origin.
+
+The apex storage URI still rewrites to the deployment and still carries its bearer, and both
+  existing callers still work.
+
+* fix(054): refuse supplied clients whose request hooks can undo the guard
+
+The closing security review traced the last two findings to a single root cause: a caller-supplied
+  client's request event hook runs after the guard sanitizes, immediately before transport. Through
+  that one path a hook placed "Authorization: Bearer event-hook-secret" on a public hop and rewrote
+  Accept-Encoding to zstd after the allowlist had been set — so the guard sanitized the request and
+  then handed it to something that could undo the sanitization.
+
+A guarded fetch now refuses a supplied client that carries a request event hook, before anything can
+  leave. Rejecting is smaller and more honest than racing the hook: the guard cannot promise
+  per-origin credential scoping over a client that can mutate requests after it. No in-tree caller
+  supplies request hooks — the crawler passes only a User-Agent and keepalive settings, ingest-space
+  uses the token provider — so nothing legitimate is affected.
+
+Regressions cover a hook attempting both the credential and the encoding override, on a direct
+  public request and on a deployment-to-public redirect.
+
+The review re-confirmed the rest of the guard in the same pass: exact-origin bearer attachment,
+  apex-only rewriting with subdomains and lookalikes blocked, validated-address pinning with logical
+  Host and SNI, per-hop redirect validation with a hop limit, and raw and decoded body caps. Sixteen
+  concurrent guarded calls kept correct credential scope, and a caller's client is left unmutated
+  after a request, with User-Agent and cookies intact.
+
+* fix(054): the guard owns its transport — remove the caller-supplied client
+
+Round 4 rejected supplied clients carrying a request event hook. The security review then bypassed
+  that six ways, all reaching public transport with the bearer and/or an unsupported encoding: a
+  hook added later from an awaited call, a response hook installing a request hook mid-redirect, a
+  response hook making its own follow-up, subclasses overriding send and build_request, a transport
+  wrapper, and a hooked client returned by the factory.
+
+The diagnosis was that the check inspects mutable state once, before any await, so it cannot
+  constrain what the object does afterwards. Rejecting hooked clients was treating a symptom: the
+  real problem is that the guard accepted a caller-supplied client at all, and every bypass is a
+  variant of the caller owning the transport the guard is trying to police.
+
+So the parameter is gone, along with client_factory. The guard always builds its own client — 60s
+  timeout, no automatic redirects, no keepalive. Passing either argument is now a TypeError, and a
+  test asserts that, so re-introducing the boundary fails loudly rather than silently re-opening the
+  hole. Round 4's rejection and its two tests are deleted: with no caller-supplied client they
+  tested an input that can no longer exist.
+
+The only caller that passed a client was the crawler, and it built that client with
+  max_keepalive_connections=0 — so the one reason to share a client, connection reuse, did not
+  apply. Its effective settings are preserved.
+
+* fix(054): stop the guard-owned client trusting the environment
+
+httpx trusts the environment by default, so HTTP_PROXY, HTTPS_PROXY and ALL_PROXY installed proxy
+  mounts on the guard's own client — routing requests around the address it had just resolved,
+  validated and pinned. SSL_CERT_FILE would likewise replace the trust store that pinning relies on
+  for hostname verification, so environment-controlled CA trust could undermine TLS on the same
+  path.
+
+The client is now constructed with trust_env=False. The regression test asserts no mounts are
+  installed with all six proxy variables set; removing the flag makes it fail.
+
+* fix(054): CodeRabbit triage — guard the Host header, cover the streaming path
+
+Three review findings on PR #125, all valid.
+
+The guard sets its own validated Host header, which is how pinned-address connect keeps virtual
+  hosting working, but `host` was missing from the guard-owned set — so a caller-supplied Host
+  survived the filter and rode alongside it. Two Host headers on a path whose whole purpose is
+  pinning the destination is at best a rejected request. It is now guard-owned like authorization
+  and accept-encoding, with the casing matrix asserting exactly one validated Host reaches
+  transport.
+
+Every MockTransport test built responses with `content=`, which httpx decodes eagerly, so the size
+  cap and the bounded gzip/deflate decoder were asserted through a path that is not the production
+  path. Added AsyncByteStream tests that drive `aiter_raw`: a gzip bomb refused as SIZE, one-chunk
+  and multi-chunk delivery yielding identical outcomes, and a legitimate compressed body under the
+  cap still succeeding.
+
+The crawler resolved relative hrefs against the pre-redirect URL, so a page served after a 301 built
+  its links from the old path, and the redirect target was never marked visited — the same page
+  could be crawled twice. Links now resolve against the post-redirect URL and the final URL is
+  recorded.
+
+That last fix needed a second correction the review did not name: joining against the *normalized*
+  final URL reproduces the bug it fixes. `_normalize_url` strips the trailing slash, and urljoin
+  reads a slashless final segment as a file, so "intro" on `/docs/en/` resolved to `/docs/intro`.
+  The join now uses the raw URL and normalization stays for identity only.
+
+---------
+
+Co-authored-by: Codex gpt-5.6-terra <noreply@openai.com>
+
+Co-authored-by: Claude Opus 5 <noreply@anthropic.com>
+
+- **evaluation**: Assert golden sources are already NFC instead of normalizing them
+  ([#130](https://github.com/alkem-io/virtual-contributor/pull/130),
+  [`35dbb39`](https://github.com/alkem-io/virtual-contributor/commit/35dbb3914e975e7055d2d777b0ff8e2a2389c1e2))
+
+CodeRabbit triage follow-up to PR #129, both findings addressed.
+
+The byte-fidelity guard normalized the vendored TSV fields to NFC before comparing them with the
+  shipped JSONL. That only proves the two agree after folding, which is not the guarantee the test
+  claims: a source file arriving in decomposed form would be silently accepted while the shipped
+  dataset carried different code points from the operator's own file. The test now asserts each raw
+  source field is already NFC and compares the raw values.
+
+Proven by a single-variable control rather than by reading. Injecting a composable character,
+  rebuilding so the shipped JSONL carries it composed, and then decomposing ONLY the source leaves
+  the two differing solely in normalization form. Against that input the old guard reports 8 passed;
+  the new one fails with "cat3-design-thinker.tsv: expected_answer is not NFC-normalized at source".
+
+Worth recording for anyone re-testing this: the shipped data currently contains NO composable
+  characters at all, so running unicodedata.normalize("NFD", ...) over the vendored TSVs is a no-op
+  and a green result there proves nothing. An earlier attempt that injected the character AND
+  decomposed in one step was also confounded -- it changed the text, so the old guard failed on the
+  content comparison rather than on normalization, which does not isolate the variable. The gap this
+  closes is therefore latent, not live: today's dataset could not have been fooled, but nothing
+  would have noticed if a future edit introduced an accented character in decomposed form.
+
+Also correct the unrecognised-metric-column warning, which said the column was "ignored by the
+  canonical metric map" immediately before raising. Nothing is ignored -- the whole score record is
+  rejected. An operator reading the old line would conclude the run continued without that metric.
+
+Sources re-verified sha256-identical to the operator originals after the control experiment;
+  test_set.jsonl unchanged at 71 cases.
+
+Gate: 2266 passed, coverage 94.36%, ruff clean, pyright 0 errors on CI scope.
+
+Co-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>
 
 ### Chores
 
 - Merge main (v0.2.0 release commits) back into develop before promotion
   ([`c2638cc`](https://github.com/alkem-io/virtual-contributor/commit/c2638cc58287c1c694a5ec64a5eff8e9281d5efd))
+
+### Features
+
+- **050**: Two-stage hierarchical retrieval for the Expert plugin
+  ([#120](https://github.com/alkem-io/virtual-contributor/pull/120),
+  [`26fd697`](https://github.com/alkem-io/virtual-contributor/commit/26fd69797107e0327f17e66e0cf9199b07ae2bd1))
+
+* feat(expert): add hierarchical two-stage retrieval
+
+* fix(expert): harden hierarchical retrieval fallback
+
+* test(expert): close hierarchical review gaps
+
+* fix(expert): harden hierarchy routing controls
+
+* test(expert): verify graph generation context boundary
+
+* test(expert): cover graph context removal matrix
+
+* fix(prompts): sanitize metadata by utf8 bytes
+
+* fix(expert): align evaluation composition evidence
+
+* docs(expert): clarify hierarchical retrieval rollout
+
+* docs(expert): distinguish hierarchy rollbacks
+
+* fix(expert): complete review remediation
+
+* fix(expert): complete R3 retrieval remediation
+
+* fix(expert): complete R4 convergence remediation
+
+* fix(expert): complete R5 convergence remediation
+
+* fix(expert): complete R6 convergence remediation
+
+* fix(expert): complete R7 convergence remediation
+
+* fix(evaluation): close round-eight review gaps
+
+Refs #19
+
+* fix(evaluation): close round-nine review gaps
+
+* fix(050): T157-T159 render-boundary hierarchy-ID excision, complete RabbitMQ handshake log
+  boundary, fixed queue markers (ADR-050-R11)
+
+workspace#050-vc-two-stage-retrieval
+
+* fix(050): T161-T164 non-inheritable log-suppression window, unconditional space-alias excision,
+  reproducible selectors, comment sweep (ADR-050-R12)
+
+* fix(retrieval): keep space/subspace overview content answerable in Stage 2
+
+DETAIL_WHERE excluded embeddingType=="overview", but overview rows are primary content (a
+  space/subspace description kept whole), not a derived Stage-1-only artifact like summary. That
+  made a branch's own description permanently unreachable once Stage 1 had routed to it. Drop the
+  overview exclusion so Stage 2 mirrors FACTUAL_WHERE's exclusion set (summary + legacy
+  bodyOfKnowledgeSummary) plus the branch scope clause. Updates the cascading two-stage retrieval
+  test fixtures/assertions to match: the scoped branch's own overview row is now a valid, rankable
+  content row.
+
+finding: corr-vc-1
+
+* fix(embeddings): retry mid-stream disconnects, proxy errors, and truncated bodies
+
+The transient allow-list omitted httpx.RemoteProtocolError and httpx.ProxyError (both sit under
+  httpx.TransportError but outside NetworkError/TimeoutException) and json.JSONDecodeError (a
+  truncated or non-JSON body on an otherwise-successful response). Any of the three failed the query
+  embedding call permanently after one attempt instead of spending the configured retry budget,
+  inconsistent with the store adapter's own retry rule for the same decode error. Adds the three
+  exception types to _transient() and a parametrized regression test covering all three.
+
+finding: corr-vc-3
+
+* test(rabbitmq): give the handshake-window regression tests real teeth
+
+The two "task created during handshake, visible after it returns" tests created a trivial task,
+  awaited it inside the suppression window, then emitted the log record from the main task afterward
+  -- so they passed under both the correct level-based mechanism and the defective (reverted)
+  ContextVar mechanism, providing zero regression protection. Rewrite both with an asyncio.Event
+  gate so the record is genuinely emitted from inside the task that was created during the window,
+  after the window has closed -- the shape that actually distinguishes non-inheritable logger-level
+  state from inheritable ContextVar state.
+
+Also adds the missing control: importing (and reloading) the adapter module twice must leave
+  logging.Handler.filter identical to a fresh stdlib reference, proving the suppression mechanism
+  never rebinds the stdlib class.
+
+finding: spec-vc-r2-1
+
+* refactor(expert): delegate routing-table construction to the legacy builder
+
+plugins/expert/composition.py reimplemented _build_routing_table alongside main._build_routing_table
+  with no test asserting the two stay equivalent -- a silent behavioral fork risk. Have the
+  composition selector's routing_table target call main._build_routing_table directly, the same
+  delegation pattern the rewrite selector already uses via _build_rewrite_policy.
+  ResolvedExpertComposition.__getattr__ resolves the same attribute reads (routing_simple_n_results,
+  routing_complex_n_results, routing_complex_context_chars) the legacy builder makes against a
+  BaseConfig, so the resolved authority stands in for it directly with no adapter object needed.
+
+finding: qual-vc-3
+
+* docs: state hierarchy rollout gates by requirement, not by gate ID
+
+README.md, plugins/expert/README.md, and .env.example named the required human gates by
+  workflow-internal identifiers (RG-05, RG-05P, RG-06, SC-009) and carried review-round bookkeeping
+  paragraphs -- neither belongs in shipped repository documentation, which should describe what a
+  reader must obtain, not which internal review process issues it. Restate each gate by what it
+  actually requires: a documented provider-processing/data-minimization approval before display
+  names may be enabled, a paired flat/hierarchical RAGAS evaluation on a reviewed query set before
+  hierarchical retrieval is enabled, and the full test suite as the regression gate. Drop the
+  review-round-sequencing paragraphs entirely.
+
+finding: qual-vc-4
+
+* Revert "fix(retrieval): keep space/subspace overview content answerable in Stage 2"
+
+FR-004, US2-AS1, and C-02's Expected proof all state, unamended, that Stage 2 must exclude overview
+  rows. Dropping that exclusion inverted a frozen requirement without an amendment to
+  spec.md/contracts/clauses.md and without recording a ruling in the ADR. Restore the exclusion so
+  DETAIL_WHERE matches the spec as written; a future change proposing the opposite behavior needs
+  the amendment landed first.
+
+This reverts commit e59f5aafaa61b1d8433e7aff87a6597b6f15d1e0.
+
+finding: spec-vc-r3-1
+
+* Revert "docs: state hierarchy rollout gates by requirement, not by gate ID"
+
+This documentation rewrite landed after the C-74 independent gate audit passed against f630afd, so
+  its scope was never audited, and it directly reverses ADR-050-R12's recorded ruling that
+  README.md, plugins/expert/README.md, and .env.example retain the RG-05/RG-05P/RG-06/ SC-009 gate
+  identifiers -- the operational linkage those files exist to provide is what C-73 item 2 attests is
+  present. Restore the gate names; a change to that ruling needs to amend the ADR and C-73 first,
+  not land silently under an unrelated finding trailer.
+
+This reverts commit ba80f160bbab1cb05413183d16d10390e490375a.
+
+finding: spec-vc-r3-2
+
+* Revert "refactor(expert): delegate routing-table construction to the legacy builder"
+
+This refactor landed after the C-74 independent gate audit passed against f630afd, giving it no
+  independent scope review, and its own commit trailer identifies it as qual-vc-3 -- advisory debt
+  ADR-050-R12 explicitly recorded as deferred, not allocated to this run. Reopen it as a separately
+  allocated, separately audited task instead of carrying it in under the trailer of debt the ADR
+  says was left untouched.
+
+This reverts commit 5c2547302e64e64efd9e494d5ec02b30d7d3fc99.
+
+* Revert "fix(embeddings): retry mid-stream disconnects, proxy errors, and truncated bodies"
+
+This fix landed after the C-74 independent gate audit passed against f630afd, so its behavior change
+  to the FR-040/FR-031 embeddings retry allow-list has no clause binding it and no independent scope
+  review -- the audit's attestation names f630afd, not this commit. Reopen this as a separately
+  allocated, separately audited task rather than carrying a production retry-policy change in under
+  an audit that never saw it.
+
+This reverts commit 2e16a4db8702ef4d925def1fe8233c64dede3fb4.
+
+* fix(evaluation): absorb float round-off at the RAGAS metric domain boundary
+
+RAGAS's un-clamped cosine-mean metrics (e.g. ResponseRelevancy) can legitimately return a value a
+  few ULPs outside [0, 1] for a well-answered case, e.g. 1.0000000000000007. finite_unit_metric's
+  strict [0,1] domain check then raised, EvaluationRunner recorded the case as a failure, and
+  compute_comparison's failure-free requirement invalidated the whole paired flat-vs-hierarchical
+  experiment over a one-ULP float artifact.
+
+Clamp values within a small tolerance of the unit boundary before the domain check runs; NaN/inf and
+  genuine outliers still fail closed.
+
+finding: corr-vc-r2-3
+
+* test(main): give the reject-failure containment tests real assertions
+
+The three *_reject_failure_is_contained_without_sensitive_chain tests -- the only named mitigation
+  for the high-security-privacy risk that a failed message.reject() must not leak the original or
+  settlement exception into logs -- had zero assertions and passed unchanged whether or not the
+  guard actually sanitized the log line. Assert every error record carries no exc_info and that
+  neither the rendered log text nor any record argument contains the sentinel exception values, per
+  T107.
+
+Verified by mutation: reverting the two reject-failure guards in main.py to re-serialize the live
+  exception (%r + exc_info=True) now fails all three tests; with the real guards in place they pass.
+
+finding: qual-vc-r2-1
+
+* test(expert): mechanically derive the composition allowlist instead of restating it
+
+_BEHAVIOR_FIELDS/_PLUMBING_FIELDS is a hand-maintained allowlist that both defines the Expert
+  composition fingerprint and reconstructs the runtime config. A live Expert knob wired into
+  main._compose_expert_dependencies but omitted from the allowlist is silently reverted to its class
+  default and stays invisible to the fingerprint -- a false RG-05 paired-experiment delta with no
+  mechanical guard.
+
+Add a test that instruments every BaseConfig field access made while composing an Expert plugin's
+  constructor kwargs from the live wiring path, and asserts each access lands on a field the
+  resolved authority (behavior union plumbing) already carries. A future field that is wired but not
+  allowlisted now fails at test time instead of silently defaulting.
+
+finding: qual-vc-r2-2
+
+* Revert "Revert "fix(retrieval): keep space/subspace overview content answerable in Stage 2""
+
+Reinstates the overview-inclusive DETAIL_WHERE per the recorded operator ruling
+  (forge/checkpoints/operator-ruling-fr004-overview-inclusion.md): better retrieval prevails; the
+  spec is amended to match the behavior, not the code to the frozen text.
+
+* fix(050): closing-run residuals — embeddings transient retry, identifier sweep, real upper-clamp
+  test
+
+* fix(050): address CodeRabbit round-1 findings on PR #120
+
+- evaluation/report.py: wrap float() in finite_unit_metric so an OverflowError from an arbitrarily
+  large JSON integer is converted to ValueError and fails closed at the vc-eval compare boundary -
+  main.py: terminal discard log now reports the actual attempt count and the forced-terminal bypass
+  instead of always claiming max_retries attempts (static message shape, no dynamic endpoint values)
+  - tests/evaluation/test_dataset.py: digest stability test now compares independently constructed
+  equal cases - tests/evaluation/test_report.py: README doc tests resolve paths from __file__ via
+  pathlib (no cwd dependence, no leaked handles); the embedding-safety-control mismatch test now
+  derives a real per-control invariant fingerprint so each parametrized field drives the rejection -
+  tests/evaluation/test_tracing.py: detail-context boundary tests assert the discriminating
+  retrieved-vs-generation split - tests/plugins/test_expert_composition.py: rename
+  dormant-embeddings test to match its (correct) inequality assertion -
+  tests/plugins/test_expert_hybrid.py: drop unused nonlocal provider_attempts (F824)
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+
+---------
+
+Co-authored-by: Claude Fable 5 <noreply@anthropic.com>
+
+- **052**: Libra-flow workshop flow in the generic plugin via configuration
+  ([#122](https://github.com/alkem-io/virtual-contributor/pull/122),
+  [`2920c83`](https://github.com/alkem-io/virtual-contributor/commit/2920c83e1c0a91e9c646d62e552d18d12ea7e099))
+
+* feat: declarative conditional edges + retrieve/echo prompt-graph nodes
+
+Extends PromptGraph (core/domain/prompt_graph.py) with: - Declarative conditional edges {from, on,
+  map, default?} compiled onto LangGraph's add_conditional_edges, matched by case-insensitive string
+  form; unmatched value with no default raises PromptGraphConfigError naming node/field/value. -
+  Type-keyed node dispatch (Node.type, default "llm"): a "retrieve" node fills its collection/query
+  templates in a single literal-substitution pass over flow state (member-derived values never
+  re-interpreted as template syntax) and queries a host-injected retriever callback; an "echo" node
+  copies a state field verbatim into the result with zero LLM calls. - PromptGraph stays port-free:
+  the retriever is an injected async callable, supplied by the plugin, at compile time.
+
+All new branches are additive; expert's name-keyed special-node injection is checked before type
+  dispatch so a node named "retrieve" with no `type` field is unaffected. Every pre-existing
+  prompt_graph/generic/expert test passes unmodified.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+
+* feat: generic engine executes prompt-graph payloads (workspace#052-libra-flow-config)
+
+GenericPlugin gains an optional knowledge_store dependency and honours event.prompt_graph before its
+  history-condensation step (BEFORE, since the graph's own nodes analyse the whole bounded
+  conversation raw — condensing first would destroy multi-turn slot-filling). The graph path seeds
+  the same expert-parity initial state (messages, conversation, current_question, bok_id,
+  description, display_name) and reads the same answer/response-field contract (final_answer ->
+  result, human/ result/knowledge language passthrough, sources always []).
+
+A retrieve-bearing payload with no knowledge store configured raises a config error at compile time
+  rather than silently skipping retrieval. Config-error and runtime exceptions are not caught here —
+  they propagate to the caller's existing standard error-response path.
+
+Invocations without a promptGraph payload are entirely unaffected; every pre-existing generic test
+  passes unmodified.
+
+* feat: ship workshop-design prompt-graph payload, test-executed (workspace#052-libra-flow-config)
+
+Adds docs/prompt-graphs/workshop-design.json — the libra-flow workshop-design flow (slot-filling
+  completeness check, clarifying question, refine-vs-generate routing, BoK-grounded
+  generation/refinement) expressed entirely as declarative PromptGraph configuration: zero
+  workshop-specific engine or plugin code.
+
+tests/plugins/test_workshop_payload.py json.loads the shipped file itself (not a copy) and drives
+  all three conversation paths through GenericPlugin with a scripted LangChain chat-model double and
+  a mock knowledge store, asserting routing, the slot-filled retrieve query, and final answers —
+  plus a structured-output recovery case (a check_input reply missing the required `complete` field
+  recovers to the safe clarify path via the existing best-effort field recovery).
+
+Closes alkem-io/virtual-contributor#102
+
+* docs: document declarative prompt-graph JSON shape + ADR (workspace#052-libra-flow-config)
+
+docs/prompt-graphs/README.md documents every node type (llm/retrieve/ echo), both edge forms
+  (plain/conditional), the state-schema drop rule, the generic engine's graph-path initial-state
+  seeding and answer contract, invocation payload fields, an authoring guide, and a full walkthrough
+  of the shipped workshop flow. Cross-checked field-for-field against from_definition's accepted
+  keys — no undocumented accepted field, no documented unaccepted field.
+
+docs/adr/0019 records the Option 2 vs Option 3 decision (declarative type-keyed nodes + injected
+  retriever + conditional-edge default/END semantics vs landing the flow on the expert engine),
+  following the repo's existing ADR registry format.
+
+docker-compose.yaml: generic service gains VECTOR_DB_*/EMBEDDINGS_* env and a chromadb dependency,
+  mirroring expert's block, so the shipped payload is runnable locally.
+
+* docs: document required userID field in prompt-graph Invocation table
+
+Router.parse_event raises a Pydantic ValidationError for a missing userID because Input.user_id has
+  no default. The Invocation table previously omitted it, so a configurator following only the
+  documented fields could not construct a message the engine would parse. Document it as a required,
+  platform-supplied field (US3-AS1).
+
+* fix(security): never log raw LLM response on structured-parse failure
+
+The retrieve/echo prompt-graph nodes' structured-output parse-failure warning logged the raw LLM
+  response text, which can be a near-verbatim restatement of member conversation content flowing
+  into stdout/Elastic. Log only the exception class and response length, matching main.py's
+  error_type-only redaction idiom. Adds a caplog-based regression test proving the raw text never
+  reaches the log while error_type=/ response_chars= still do (workspace#052-libra-flow-config).
+
+* fix(security): scope retrieve-node collection server-side, budget joined docs
+
+Two related tenancy/availability gaps in the declarative retrieve node:
+
+- collection_template previously accepted any template variable, letting a payload's caller-supplied
+  name point a knowledge-store query at another tenant's collection. It may now reference only the
+  engine-seeded bok_id variable (sourced exclusively from Input.bodyOfKnowledgeID); any other
+  variable is rejected at parse time, before any store query is possible. Defense in depth:
+  plugins/generic/plugin.py's retriever closure now also ignores the graph's rendered collection
+  argument entirely and always queries the collection computed server-side from
+  Input.bodyOfKnowledgeID (the same pattern plugins/expert/plugin.py already uses), closing the
+  residual gap where an upstream payload node could overwrite the bok_id state value before the
+  retrieve node runs.
+
+- The retrieve node joined documents into state with no context budget, unlike every other retrieval
+  path. It now enforces the repo's existing 20_000-char max_context_chars idiom, dropping trailing
+  documents once the budget is spent (a single oversized document is still returned alone rather
+  than dropped to empty).
+
+docs/prompt-graphs/README.md documents both behaviours. Tests prove a payload cannot address an
+  arbitrary collection (parse-time rejection + state-overwrite defense in depth) and that oversized
+  retrieval results are truncated to budget (workspace#052-libra-flow-config).
+
+* fix(engine): fail loudly on malformed prompt-graph constructs
+
+Adds compile-time and parse-time PromptGraphConfigError guards to core/domain/prompt_graph.py so a
+  malformed payload never escapes as a bare KeyError/TypeError or a silent state-merge drop, per
+  workspace#052-libra-flow-config:
+
+- compile(): a retrieve node's output_key (or an echo node's implicit "result") not declared in the
+  state schema now raises immediately, naming the node and the missing key, instead of silently
+  dropping the result on state merge. - from_definition(): checked lookups for a node's required
+  "name", a retrieve node's collection_template/query_template, and an echo node's source, each
+  raising a named PromptGraphConfigError instead of a bare KeyError/TypeError. - Conditional edges:
+  a missing "on" field, a non-string map key or target, and two conditional edges sharing the same
+  source node are now rejected at parse time, before LangGraph's own raw ValueError would otherwise
+  surface on the second add_conditional_edges call.
+
+* fix(generic): fail before any LLM call when the store can't embed
+
+GenericPlugin's knowledge-store gate for a retrieve-bearing graph payload was presence-only: a store
+  constructed with no embeddings provider (the docker-compose default when VECTOR_DB_HOST is set but
+  EMBEDDINGS_API_KEY/EMBEDDINGS_ENDPOINT are empty) passed compile and failed late, inside
+  ChromaDBAdapter._embed_query, only after earlier LLM nodes in the graph had already run and been
+  paid for.
+
+Adds a usability probe in plugins/generic/plugin.py that checks the store can actually embed
+  (unwrapping runtime decorators like TracedKnowledgeStore via _delegate) before any node runs,
+  raising a named PromptGraphConfigError naming the missing capability. Kept deliberately scoped to
+  the generic plugin's graph-entry point rather than gating KnowledgeStorePort registration in
+  main.py: expert, ingest_space, and ingest_website all declare knowledge_store as a required
+  constructor parameter, so a registration-level gate would change their container resolution
+  behaviour at startup instead of only the generic plugin's retrieve-node path.
+
+Part of workspace#052-libra-flow-config.
+
+* fix(workshop-design): require check_input's slots so recovery fills defaults
+
+check_input's output schema in the shipped workshop-design payload only required "complete"; the
+  five extraction slots (role, duration, workshop_type, purpose, audience_size) and "question" were
+  nullable and not required. A complete:true reply carrying a null slot parsed cleanly with the null
+  intact, so it reached _make_retrieve_node's template-variable fill with a None value and raised
+  PromptGraphConfigError there instead — burning the LLM calls already made, and repeating on every
+  RabbitMQ retry. A complete:false reply with question null/omitted parsed cleanly too, echoing a
+  blank response with nothing logged.
+
+Making all six fields required and non-nullable in check_input's output schema means a reply
+  carrying a null (or omitted) slot now fails PydanticOutputParser.parse() and lands in the engine's
+  existing best-effort recovery, which fills a safe type default instead of leaving None — the
+  engine's None check in _make_retrieve_node is unchanged.
+
+workspace#052-libra-flow-config.
+
+* test(fix): give US1 conditional-routing branches distinct observable output
+
+All three branch nodes in tests/core/domain/test_prompt_graph_conditional.py echoed the same `value`
+  state field, so every routing assertion passed even with the path_map inverted or the conditional
+  edge dropped entirely — a tautology across US1-AS1/AS2 and the default/none-key/plain-edge-skip
+  scenarios in the same file. `next` and `ask` now each echo their own marker field
+  (next_marker/ask_marker), seeded with distinct recognizable values, so final["result"] names which
+  branch actually ran.
+
+Sanity-checked by temporarily inverting the router's true/false lookup in-process: 5 of the file's
+  tests failed as expected, confirming the new assertions discriminate; the source file was restored
+  unchanged (git diff clean) before this commit.
+
+* test(fix): assert extract->retrieve->refine order and prompt grounding
+
+US2-AS3's refine-path test only counted LLM/store calls, never the actual interleaving — a payload
+  rewired to retrieve before extracting still passed with the same call counts. Neither the AS2
+  (generate) nor AS3 (refine) test checked that a retrieved document actually reaches the generating
+  node's LLM prompt, so an output_key that silently drops on state merge (LangGraph's own foot-gun
+  this repo works around elsewhere) left every assertion green while the model received empty
+  knowledge_docs.
+
+Both scripted doubles (ScriptedChatModel, LoggingKnowledgeStore) now append to one shared EVENT_LOG
+  list; the refine test asserts the exact sequence llm:1,llm:2,llm:3,store:1,llm:4, and both tests
+  assert a seeded marker document's text appears in the final LLM call's prompt content.
+
+Verified by mutation, restored before commit (git diff clean on
+  docs/prompt-graphs/workshop-design.json): rewiring retrieve-before-extract broke the EVENT_LOG
+  assertion; renaming retrieve_generate's output_key to an undeclared state key made the
+  marker-in-prompt assertion fail.
+
+* test(fix): add R-2 injection case without a positional-format token
+
+The sole R-2 (template injection) test's hostile fixture contains `{0}`, which makes a naive
+  fail-open two-pass re-interpretation ("format the already-filled query a second time") raise —
+  positional args are never supplied — rather than silently leak. That let the test pass green even
+  against a fail-open two-pass implementation, the exact defect R-2 exists to catch.
+
+Added a second hostile case whose value contains only a resolvable variable reference (`{bok_id}`)
+  and a self-escaping `{{nested}}`, no positional token. A second format pass over this text has no
+  escape hatch: it happily substitutes the real bok_id value into what should be inert member-typed
+  text — a cross-field leak. Asserts the literal placeholder text survives and the real value is
+  never substituted into it.
+
+Verified by mutation (monkeypatched _make_retrieve_node to a fail-open two-pass implementation, not
+  committed): the original hostile-brace test still passed; the new resolvable-var-reference test
+  failed, showing the leaked value in the query.
+
+* fix(prompt-graph): type-validate n_results/map, bound graph recursion
+
+n_results and a conditional edge's map are now type-checked at parse time (bool/float/string
+  rejected, non-dict map rejected) instead of dying with a bare TypeError/AttributeError deep in
+  main.py's generic error handler.
+
+Every graph run now passes an explicit, small recursion_limit to ainvoke/ astream instead of relying
+  on LangGraph's default of 10007. An accidentally cyclic conditional edge (never detected at parse
+  time, since detection would require analyzing runtime-only routing values) previously could run an
+  LLM node for up to the pipeline's multi-hour timeout while blocking the RabbitMQ consumer behind
+  it; it now fails in well under a second.
+
+* fix(prompt-graph): configurable retrieve budget + node/edge count caps
+
+spec-vc-r2-3: the retrieve node's context budget was a hard-coded 20,000 chars, silently dropping
+  trailing documents on the shipped workshop-design.json's own n_results=10 retrieve nodes at the
+  repo's default 2500-char ingest chunk size (~25,000 chars, 3 of 10 docs lost). Add a
+  payload-settable Node.max_context_chars (validated int in [1000, 60000] at parse time), keep
+  20,000 as the default, set 30,000 on both workshop-design.json retrieve nodes so their full result
+  set survives whole, and name the node + kept/dropped counts in the truncation warning.
+
+sec-vc-5: from_definition capped neither node nor edge count, so a large fan-out payload could
+  trigger one LLM/retrieve invocation per node within a single LangGraph superstep. Add parse-time
+  caps (50 nodes / 100 edges) raising PromptGraphConfigError with the offending count before any
+  node is compiled.
+
+workspace#052-libra-flow-config
+
+* fix(prompt-graph): raise retrieve context ceiling to match deployed 9000-char chunk size
+
+The retrieve-node max_context_chars ceiling (60,000) and the shipped workshop-design.json budget
+  (30,000) were sized for the repo's default ingest chunk size (2,500 chars), not the deployed one
+  (9,000 chars, per the infra-ops configMap CHUNK_SIZE, core/domain/routing.py, and docs/adr/0016).
+  At the deployed chunk size a full n_results=10 result set is ~90,018 chars, which the old ceiling
+  made unfixable by any in-range payload override — only 3 of 10 retrieved docs survived the join
+  budget in production.
+
+Raise the ceiling to 120,000 and set both workshop-design.json retrieve nodes to max_context_chars:
+  95000 so the full result set survives with margin. Correct the README's field-table range and
+  rationale prose to state the real deployed chunk size, and re-pin the shipped-payload survival
+  regression test at 9000-char chunks (this test was added by this branch, confirmed via git log
+  before editing).
+
+Refs workspace#052-libra-flow-config.
+
+* fix(prompt-graph): reject format spec/conversion on collection_template's bok_id field
+
+The collection_template allowlist compared format-field NAMES only, so
+  "{bok_id:.0}victim-bok-knowledge" or "{bok_id!r}..." passed parse-time validation while rendering
+  to a different string than the plain identifier. Harmless today because the generic plugin ignores
+  the rendered value, but nothing should depend on that staying true given the collection scoping is
+  a tenancy boundary.
+
+Reject any collection_template field with a non-empty format spec or a conversion
+  (str.Formatter().parse gives (literal, field, spec, conversion); require spec in (None, "") and
+  conversion is None), raising PromptGraphConfigError naming the node. Add tests for '{bok_id:.0}x'
+  and '{bok_id!r}' rejection plus the legit '{bok_id}-knowledge' still passing. Update the README
+  field table to match the tightened enforcement.
+
+* fix(prompt-graph): reject positional {} fields and duplicate node names at parse time
+
+An auto-numbered `{}` field parses to field_name "" — falsy, so the `if name` filter dropped it from
+  discovered variables entirely. That let `collection_template: "{}-knowledge"` pass the bok_id-only
+  allowlist and then blow up as a raw IndexError/ValueError at format_map time instead of a named
+  PromptGraphConfigError. Now rejected by name, for both collection_template and query_template.
+
+A second node declaring an already-used name silently replaced the first (`nodes[node.name] =
+  node`); edges still resolved, so the graph ran a different node than declared with no report. Now
+  rejected as a PromptGraphConfigError naming the duplicate.
+
+Referenced by workspace#052-libra-flow-config.
+
+* fix(generic): fail loudly on retrieve node with empty bodyOfKnowledgeID, no shared collection
+  fallback
+
+collection_name = f"{bok_id}-knowledge" if bok_id else "default-knowledge" meant a BoK-less persona
+  whose payload contains a retrieve node silently read a collection shared across every such persona
+  instead of failing. Now: when the compiled graph has a retrieve node and Input.bodyOfKnowledgeID
+  is empty, raise PromptGraphConfigError before collection_name is constructed and before any LLM
+  call. A graph with no retrieve node is unaffected.
+
+Also strengthens the existing state-overwrite tenancy test: the prior "poison" node was an echo
+  node, which can only ever write to `result` (hardcoded in _make_echo_node) — it could never
+  actually overwrite bok_id, so the assertion passed whether or not the plugin's server-side scoping
+  existed. The poison node is now a retrieve node whose output_key is bok_id, so it genuinely
+  overwrites the state value; mutation-checked by temporarily making the plugin honour the
+  retriever's collection argument, confirming the strengthened test fails, then reverting.
+
+* docs(prompt-graphs): document positional-field rejection, unique node names, and no bok_id
+  fallback
+
+Updates docs/prompt-graphs/README.md to match the parse-time positional {} field rejection, unique
+  node name requirement, and the removal of the "default-knowledge" fallback for a retrieve-bearing
+  payload with an empty bodyOfKnowledgeID.
+
+* fix(prompt-graph): reject explicit-index positional fields, not just bare {}
+
+The parse-time guard only checked field_name == "" (the bare {} case), letting an explicit-index
+  field like {0} through — its field_name is the truthy string "0", which also happens to collide
+  with a state key an upstream node can produce (e.g. output_key: "0"). query_template has no
+  allowlist, so this was reachable at runtime and blew up as the raw str.format_map ValueError this
+  guard exists to eliminate. Now reject any field whose name is not a valid Python identifier, which
+  covers digit-only indices and any other non-identifier form while still accepting named variables
+  and the {{}} escaped-literal case.
+
+* fix(generic): guard hoisted retrieve-node scan against malformed node entries
+
+Hoisting has_retrieve_node out of the knowledge-store branch made it run unconditionally over the
+  raw payload, calling .get() on every nodes[] entry. A malformed entry (e.g. a bare string like
+  "load" instead of a dict) previously fell through to from_definition's named "missing a required
+  'name' field" rejection; now it raised a raw AttributeError from the hoisted scan itself, losing
+  the construct-naming guarantee for that input. Filter to dict entries only so malformed entries
+  are conservatively treated as non-retrieve and left for from_definition to reject by name, with or
+  without a knowledge store configured.
+
+* fix(prompt-graph): reject non-dict node/edge entries at parse time
+
+A malformed nodes[]/edges[] entry (bare string, int, None, float) previously reached a containment
+  test or a bare .get() call. Against a string that "not in" test happens to pass by coincidence for
+  some values (e.g. "load") and fail for others (e.g. "myname", where it then indexes the string and
+  raises a raw TypeError); against a non-string scalar or a non-dict edge it raises a raw
+  TypeError/AttributeError either way, losing the named PromptGraphConfigError guarantee.
+
+Add explicit isinstance(..., dict) checks at the top of both loops in from_definition, naming the
+  construct and its index. Re-point the existing malformed-node regression test at "myname" (the
+  case the substring coincidence let through unverified) and add cases for non-dict scalars and a
+  non-dict edge, confirmed by mutation check to fail with a raw TypeError absent the guard.
+
+* docs(prompt-graphs): document {0} rejection and the identifier narrowing
+
+Two drift fixes against the shipped code:
+
+- query_template's row still said only a bare {} is rejected; the code (bb811d6) also rejects an
+  explicit index like {0}. Mirror collection_template's wording on both rows. - The isidentifier()
+  guard also rejects named non-identifier state keys (e.g. user-name) that the state model and
+  format_map both accept fine today. The guard stays (safer default for an externally-editable
+  payload surface) but the narrowing is now documented on the query_template row, so it reads as an
+  intentional template-syntax constraint rather than an oversight.
+
+No behaviour change; no shipped payload is affected.
+
+---------
+
+Co-authored-by: Claude Fable 5 <noreply@anthropic.com>
+
+- **055**: Make tracing content capture opt-in
+  ([#126](https://github.com/alkem-io/virtual-contributor/pull/126),
+  [`7c8dbb0`](https://github.com/alkem-io/virtual-contributor/commit/7c8dbb0def20999a67b5048354467ce6640a1edd))
+
+* feat(055): make tracing content capture opt-in
+
+tracing_capture_content defaulted to true, so enabling tracing at all began exporting member
+  messages, prompts and model completions to the OTLP collector. An operator turning on tracing for
+  latency debugging also, without a separate decision, started persisting member conversation
+  content in a trace store governed by different access controls than space membership —
+  personal-data egress that was opt-out rather than opt-in (SOC 2 CC6.1 and privacy criteria,
+  ISO/IEC 27001 A.5.34, A.8.15).
+
+The default is now false. Span and metric tracing stay fully useful with it off: durations, token
+  and model diagnostics, exception.type and vc.failure_mode all still flow, because record_failure
+  is type-only and independent of the flag.
+
+The issue named two content attributes; there are three. Besides gen_ai.prompt and gen_ai.completion
+  in the tracing callbacks, main.py writes vc.message — the member's own inbound message — at two
+  call sites. A fix scoped to the issue text would have passed its tests and still exported member
+  messages. All three are covered by the suppression tests.
+
+Enabling capture now emits a startup warning naming exactly which attributes will be exported and
+  their character bound. A silent true is what created this; a silent re-enable would recreate it.
+  The warning is static apart from that bound, so it cannot leak the collector endpoint or its
+  headers.
+
+No deployed environment sets any TRACING_* variable today (infra-ops and dev-orchestration both
+  checked), so this changes no live behaviour. An operator running an unmanaged deployment with
+  tracing on will stop capturing content on upgrade — the intended direction, stated here and in the
+  PR.
+
+Closes #124 workspace#055-tracing-content-optin
+
+Co-Authored-By: Codex gpt-5.6-terra <noreply@openai.com>
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+* test(055): pin the early-ACK content gate and the warning's plain-language half
+
+Review found two assertions that could not fail.
+
+The early-ACK vc.message gate at main.py:669 was pinned by no test: replacing it with a raw
+  set_attribute left the whole suite green, while the identical gate at :804 was caught by three
+  tests. It is latent today — the event types routed through early-ACK declare no message field —
+  but the code comment says the line exists for future message-bearing events, so a regression there
+  would export member content with capture off and CI would stay quiet. Two cases now cover it,
+  default-off and capture-on, and the mutation fails both.
+
+The warning test asserted the three OTel attribute keys and the character bound but not the
+  plain-language half, so dropping "member messages, prompts, and model completions" kept the suite
+  green. An operator reading three opaque keys does not learn that member conversation content is
+  leaving the service, which is the whole reason the warning exists. The wording is now asserted
+  alongside the existing endpoint and header non-leak checks.
+
+workspace#055-tracing-content-optin
+
+* test(055): build the early-ACK fixtures through the event factory
+
+Both early-ACK tests hand-rolled the same event, duplicating the subclass definition and every
+  default the repo's factory already owns. The subclass is now defined once at module scope with a
+  docstring explaining why it exists — no shipped early-ACK event type declares a message field, so
+  the content gate at that call site is unreachable without one, and unreachable code cannot be
+  proven enforced.
+
+make_ingest_website gains a `model` parameter so a caller can validate the same defaults against a
+  subclass. That is smaller than a bespoke factory and keeps the defaults in one place, which was
+  the point of the convention.
+
+---------
+
+Co-authored-by: Codex gpt-5.6-terra <noreply@openai.com>
+
+Co-authored-by: Claude Opus 5 <noreply@anthropic.com>
+
+- **056**: Replace the RAG golden evaluation dataset with 71 product-authored cases
+  ([#129](https://github.com/alkem-io/virtual-contributor/pull/129),
+  [`0b5c552`](https://github.com/alkem-io/virtual-contributor/commit/0b5c55226712c852b3b470c8713acc7d97771b5b))
+
+* feat(056): replace the golden set with 71 product-authored cases
+
+The old evaluation/golden/test_set.jsonl was a golden set in name only: 15 LLM-authored records
+  committed once in April 2026 and never run again, whose reference answers were fluent marketing
+  prose and whose 11 cited source URLs all 404 today. Grading LLM output against LLM-written
+  references measures fluency agreement, not correctness, so the set could not answer the one
+  question an evaluation suite exists to answer.
+
+Replaced with 71 cases authored by product across three categories that exercise three different
+  retrieval paths: documentation (38, the guidance plugin's three collections), building-alkemio (8,
+  expert/BoK) and design-thinker (25, the prompt-graph path). The answers are short checkable facts
+  rather than prose, which is what makes them gradeable.
+
+16 flaky cases were dropped rather than split into stable/volatile halves: they asserted live counts
+  (22 Subspaces, 69 people) and the existence of specific Subspaces and posts. Frozen live data
+  produces false alarms, and a suite that cries wolf gets ignored. The cost is real and recorded:
+  category 2 falls from 24 cases to 8 and its survivors overlap category 1, so body-of-knowledge
+  coverage is largely lost until those answers are regenerated against live data.
+
+The three source TSVs are vendored under evaluation/golden/source/ and the dataset is built from
+  them by scripts/build_golden_set.py. They previously existed only in a gitignored workspace path,
+  which meant the authoritative input was invisible to CI and absent from a fresh clone -- exactly
+  the unreproducible provenance that made the original 15 records worthless.
+
+relevant_documents becomes optional. It was required (min_length=1), and the new cases carry no
+  URLs; fabricating them to satisfy a validator would have re-created the dead-link problem. Nothing
+  consumes the field today.
+
+evaluation/assertions.py derives deterministic exact-match assertions from the expected answers by
+  rule, never by hand-annotation, so they stay correct when an answer is edited. 16 of 71 cases
+  qualify. A broader rule was tried and rejected: it reached 40 cases by manufacturing assertions
+  out of prose fragments, which is the fluency-matching this dataset exists to escape, reintroduced
+  as a deterministic check that is confidently wrong for free. Coverage was traded for honesty
+  deliberately. The layer is a floor under the RAGAS metrics, not a replacement: 55 of 71 cases
+  still need the judge.
+
+Verified: all 71 questions and answers are byte-identical to the operator's source, including
+  U+2014, U+2026 and U+2122; categories match; no duplicates. Gate: 2219 passed (up from 2193),
+  coverage 94.36%, ruff clean, pyright 0 errors on CI's scope.
+
+workspace#056-golden-evaluation-dataset
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+
+* feat(evaluation): scope runs by category and report exact-match assertions
+
+Add a --category option on the run command so a single category (documentation, building-alkemio,
+  design-thinker) can be evaluated in isolation, since each exercises a different retrieval path and
+  two of them need --body-of-knowledge-id. An unknown category is rejected by Click before the test
+  set loads; a known category that selects zero cases fails with its own message before the pipeline
+  is constructed. A category expecting a body-of-knowledge id that is not supplied is recorded and
+  warned about rather than treated as a hard failure.
+
+Wire the existing pure-string-comparison assertion layer into the runner and report: every
+  successful case now carries an assertion_outcome, and the run/comparison reports surface a pass
+  rate computed only from checked cases. Cases with no derivable assertions are counted as
+  not-applicable, never folded into the pass rate or treated as passing, and the exact-match numbers
+  are always rendered in a section separate from the judged RAGAS metrics.
+
+* fix(evaluation): log unrecognised RAGAS metric columns instead of silently dropping them
+
+canonical_metric_scores already mapped RAGAS's published llm_context_precision_without_reference
+  column to the stored context_precision field, but an unmatched column raised a bare ValueError
+  with no trace of which name it saw. Log a WARNING with the offending column name before raising,
+  so a future RAGAS metric rename (the exact class of bug that left context_precision silently
+  absent from every run) is visible in the logs rather than indistinguishable from any other
+  malformed score record.
+
+Adds a regression test proving the mapping is load-bearing: it exercises the real
+  llm_context_precision_without_reference column, asserts the WARNING log fires on an unrecognised
+  column, and was verified red against a deliberately broken METRIC_ALIASES before being restored.
+
+* test(evaluation): guard golden-set byte fidelity against the vendored TSVs
+
+The build script's NFC-only normalization and first-tab-only split are the sole defense against
+  silently rewriting the operator's exact wording (e.g. NFKC would turn "How to..." into "How to..."
+  and drop the em dash/trademark sign), and nothing in tests/ previously read either the vendored
+  TSVs or the shipped test_set.jsonl to catch a regression there.
+
+Adds tests/evaluation/test_golden_set.py, independently re-parsing the three vendored TSVs and
+  asserting: every question/expected_answer pair is byte-identical to the shipped JSONL;
+  per-category counts (documentation=38, building-alkemio=8, design-thinker=25, total=71);
+  U+2014/U+2026/U+2122 are literally present; all questions are unique; every shipped case's
+  assertions match derive_assertions(expected_answer) exactly; no case carries relevant_documents;
+  and evaluations/ holds only .gitkeep so a faked baseline run can never be committed unnoticed.
+
+Verified red: reapplying NFC->NFKC in scripts/build_golden_set.py and rebuilding the golden set
+  fails two assertions in this file (the em-dash case's smart-quote text differs, and the ellipsis
+  literal-presence check fails); reapplying the tab-split mutation and rebuilding is a genuine no-op
+  on this dataset, since no vendored row contains a second tab character, and the test correctly
+  stays green. Both mutations were reverted before committing.
+
+* fix(evaluation): keep the deterministic assertion verdict when the judge fails
+
+evaluate_assertions() was called inside the same try block as the RAGAS judge call, after it, so a
+  judge-model failure raised before that line ever ran and every case fell back to
+  assertion_outcome=None. That erased a free, offline, credential-free verdict that had already been
+  computable from the pipeline answer alone, defeating the whole point of having a layer that
+  survives a judge outage.
+
+Compute assertion_outcome right after the invoker succeeds, before the scorer call, and thread it
+  into both the success and scoring-failure EvaluationCase branches. The invoker-failure branch is
+  untouched: with no pipeline answer there is nothing to check, so assertion_outcome correctly stays
+  None there.
+
+* fix(evaluation): strip typographic quoting from derived enumeration values
+
+An enumeration item can embed the operator's typographic quoting around a sub-phrase (e.g. '"How
+  might we" statements'), but that quoting marks how the operator wrote the fact, not the fact
+  itself. A pipeline answer that states the same fact without the quotes was failing an assertion it
+  should pass.
+
+Strip ASCII and curly double-quote punctuation from both the derived assertion value and the
+  pipeline answer being compared, so the quoting style is never load-bearing in either direction.
+
+* test(evaluation): cover the typographic-quote fix and --category plumbing
+
+Adds the quote-stripping coverage for the derivation and evaluation changes (enumeration items with
+  embedded ASCII/curly quotes; the `contains` rule keying off a quoted UI label still passes both
+  quoted and unquoted forms).
+
+Also replaces the assertions-module reload smoke test with a private, non-polluting module load.
+  importlib.reload() was rewriting the Assertion/AssertionOutcome classes in place on the shared
+  evaluation.assertions module object, which evaluation/report.py and evaluation/dataset.py already
+  hold references to via `from ... import`. Once EvaluationCase started attaching assertion_outcome
+  on every code path, a session where the reload test ran first left a later EvaluationCase
+  construction failing Pydantic's isinstance check against the pre-reload class identity — an
+  order-dependent failure only visible once the fix above made that field always populated.
+
+Adds a regression test proving --category reaches EvaluationRunner.run(category_scope=...), not just
+  _run_evaluation's own argument; a one-token mutation back to category_scope=None goes red under
+  it.
+
+---------
+
+Co-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>
 
 
 ## v0.2.0 (2026-08-04)
