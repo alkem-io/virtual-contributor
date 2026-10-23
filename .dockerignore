@@ -25,3 +25,5 @@ tests/
 !README.md
 docker-compose.yaml
 Dockerfile
+
+.forge-evidence/

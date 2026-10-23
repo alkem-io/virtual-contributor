@@ -2,9 +2,9 @@
 # Build: docker build -t alkemio/virtual-contributor .
 # Run:   docker run -e PLUGIN_TYPE=generic alkemio/virtual-contributor
 #
-# Matched Python 3.13 pair (workspace#026-distroless-runtime-images):
+# Matched Python 3.13 pair:
 #   builder  python:3.13.7-slim-trixie@sha256:5f55cdf0c5d9dc1a415637a5ccc4a9e18663ad203673173b8cda8f8dcacef689
-#   runtime  gcr.io/distroless/python3-debian13:nonroot@sha256:0e52dfee02b1aba142e77b004f6ea11210b79456b51f10d70e9bd631cbc21d98
+#   runtime  gcr.io/distroless/python3-debian13:nonroot@sha256:727eccc5d83f11273c954652667b5b5a1c66120bd4cfb884e879ab77dcdf966a
 # Both resolve to interpreter major.minor 3.13 (builder 3.13.7, distroless
 # runtime 3.13.5 at pin time) — the ABI-relevant tag (cp313) matches, which is
 # what the compiled extensions in poetry.lock are built against. Re-verify
@@ -52,7 +52,7 @@ RUN poetry install --no-interaction --no-ansi --only main --no-root
 RUN python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')" > /venv/PYTHON_VERSION
 
 # --- Runtime stage (distroless, non-root, no shell/package manager) ---
-FROM gcr.io/distroless/python3-debian13:nonroot@sha256:0e52dfee02b1aba142e77b004f6ea11210b79456b51f10d70e9bd631cbc21d98
+FROM gcr.io/distroless/python3-debian13:nonroot@sha256:727eccc5d83f11273c954652667b5b5a1c66120bd4cfb884e879ab77dcdf966a
 
 WORKDIR /app
 
