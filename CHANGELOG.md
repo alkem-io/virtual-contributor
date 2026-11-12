@@ -1,6 +1,19 @@
 # CHANGELOG
 
 
+## v0.5.0 (2026-11-12)
+
+### Features
+
+- **091**: Refresh Python dependencies and the distroless runtime
+  ([#133](https://github.com/alkem-io/virtual-contributor/pull/133),
+  [`92ed8fc`](https://github.com/alkem-io/virtual-contributor/commit/92ed8fc22c6fae154b252707c6ffe92c63fa25a4))
+
+* fix: remediate contributor dependencies and distroless runtime
+
+* fix: refresh matched Python builder to patched upstream release
+
+
 ## v0.4.0 (2026-09-15)
 
 ### Chores
